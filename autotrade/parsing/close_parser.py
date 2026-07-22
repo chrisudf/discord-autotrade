@@ -1,0 +1,775 @@
+"""CLOSE 信号解析
+
+设计基于 6/14-6/18 真实样本（详见对话 review）：
+- 20 条 close-ish 消息中 40% 是复盘/计划噪音，必须先过滤
+- 70% 的可执行信号是 "trimmed/Selling X%"（部分平），不是全平
+- 几乎所有 close 信号都不带 strike → symbol 级匹配
+- "NOW" 在 close 信号里既可能是 ServiceNow 也可能是副词
+  → 必须用 open_symbols 白名单消歧
+
+返回结构：
+    {
+        "kind": "CLOSE" | "BULK_TRIM",
+        "symbols": [...],   # BULK_TRIM 时空
+        "pct": int,         # 卖出百分比 1-100
+        "matched": str,     # debug 用
+    }
+    或 None（噪音/无法定位 symbol）
+
+中文 fallback：
+- 历史数据：63% 双语对子中文先到，但 100% 配对率（gap<60s 内英文必到）
+- 实际链路：parse_close → 先 EN 路径 → 失败 fallback 到 ZH 路径
+- 双发场景靠 listener 的 CLOSE fingerprint dedup（symbols+pct+kind）兜底
+- ZH 路径只用 $SYMBOL + 白名单裸 ticker 两档
+  → KC 翻译中文公司名（亚马逊/微软等）抓不到 → 静默 None → 1-3s 后 EN 版本兜底
+  → 兜底失败时 log [zh_unrecognized] warning 便于事后排查
+
+TODO（实测调整）：
+- enrich 长段多 symbol 列表（"Trimmed the following:\n$APLD ...\n$CRWV ..."）
+  当前 parser 会把所有 $XXX 都返回，需要进一步按行拆分各自的 pct
+- "stop moved to entry" / "stops to BE" 是元信号，不是 close（应跳过，已在 RECAP）
+- ACTION_DONE 里的 "took" 单独看可能误触（"took the trade"），暂依赖 RECAP_MARKERS 兜底
+- 若 [zh_unrecognized] warning 频繁，再考虑数据驱动的中文名→ticker 自动学习
+  （EN 版本成功时关联同时段 ZH 文本里的未知中文名）
+
+风险 / 已知漏接（不修，列在这供日后参考）：
+- **无 symbol 的 follow-up close**：例如 "BANG! Out half @ 8.05 💰"
+  这种"承接上一条 trim 信号"的 close 没 ticker，要靠"最近交易"上下文判断。
+  当前一律 return None。修这个等于引入"最近持仓"状态机：要决定时间窗、
+  并发开仓如何选、多语言双发去重——容易引入更严重的"错平别的仓位"风险。
+  当前判断：宁可丢这种 follow-up（前一条 trim 通常已经触发了），
+  也不要 close 错仓位。
+- **CLOSE 误平的代价 > OPEN 误触发**：风控对 OPEN 有 max_price/qty/熔断兜底，
+  但 CLOSE 一旦匹配到 open_symbols 就直接挂卖单。改 close parser 前请
+  把 symbols 必须 in open_symbols 这一硬约束保留住。
+"""
+import re
+from typing import Optional
+
+from autotrade.utils.logger import logger
+
+
+# 复盘/计划标记 —— 出现任一即跳过
+# 注意：必须先于 ACTION 检测，因为 "scaled some yesterday" 含 "scaled" 但不动手
+RECAP_MARKERS = [
+    "yesterday", "this morning", "earlier today",
+    "(so far)", "so far,",  # PnL 复盘 "(so far) the account"，不拦 "so far before FOMC"
+    "the plan", "my plan", "here's my plan",
+    "have an order", "will be ", "going to ",
+    "out of 4", "out of 5",  # PnL 复盘 "2 losing out of 4"
+    # 7/17 "Weekly recap, 7/13: $GOOGL 1,200%+ ..." 被当 BULK close 解析出
+    # 7 个 symbol，扇出 3 条 runner-preserve TG。ZH 版"每周回顾"早就在
+    # ZH_RECAP_MARKERS 里，EN 一直漏
+    "weekly recap", "recap,", "recap:",
+    # watchlist 帖本质是 recap——语料回放发现内文带 "lock in gains" 建议的
+    # watchlist 会被 lock-in 动词路由成 CLOSE，这里统一拦掉
+    "watchlist",
+]
+
+# bulk action —— 不指定 symbol，对所有持仓批量 trim
+BULK_MARKERS = [
+    "all positions", "every position", "everything",
+]
+
+# 当前动作（gerund / 完成时）—— 真要动手的信号
+# 与 signal_parser 的 STRONG/WEAK_CLOSE_RE 保持同步，否则 detect_action 说 CLOSE
+# 但这里 _has_action_verb 说没动词 → close_parser 返回 None（7/3 "all out TSLA" 案例）
+#
+# 多词 "out" 短语必须带词边界匹配——之前用 plain substring，
+# "overall outlook" 跨词边界含 "all out"（over[all out]look），
+# 把普通 trim 误升级成 100% 全平（实测 "Trimmed SPY ... overall outlook" 案例）。
+ACTION_VERBS = [
+    "trimming", "trimmed",
+    "trim ",                  # 祈使式 "trim SPY runner at 3.10"（7/9 实测漏接，
+                              # detect_action 的 \btrim\b 认但这里没有 → parser 拒）
+    "cutting", "cut ",        # "cut " 加空格避免匹配 "scout/circuit"
+    "selling", "sold here",
+    "closing", "closed",
+    "dumping", "dumped",
+    "scaling out",
+    "scaling down",           # 7/6 "Scaling down to 1/2 position sizing"
+    "bang!", "bang -",        # KC 的情绪触发词，通常配 trim
+    # enrich 止盈口头禅（7/17 "$XOM LOCK THEM ALL ON" / "lock them in!"）。
+    # 两词 substring 避免误伤 blocked/clock；过去式 "locked in" 是 recap，
+    # 与 detect_action 的 lock(?:ing)? 规则一致地排除
+    "lock them", "lock it", "lock in", "lock these", "locking in",
+]
+
+# "out" 短语统一走词边界 regex（勿放回 ACTION_VERBS/FULL_CLOSE_VERBS 的
+# substring 匹配——见上方 "overall outlook" 案例）
+_OUT_PHRASE_RE = re.compile(
+    r"\ball\s+out\b|\bout\s+(?:half|full|majority)\b", re.IGNORECASE,
+)
+_OUT_FULL_CLOSE_RE = re.compile(r"\ball\s+out\b|\bout\s+full\b", re.IGNORECASE)
+
+# 全平动词（pct 缺省 → 100）
+FULL_CLOSE_VERBS = ["closed", "cutting", "cut ", "dumped", "dumping"]
+
+# 提取百分比："25%" / "20 %"
+# 排除 `-15%` `+30%` 这类 PnL 标注（前面有符号/数字 → 不是 trim 比例）
+# 排除 "1% position" / "99% cash" / "2% 的仓位/头寸" 这类**仓位大小标注**
+# （7/8 实测：enrich "Closing all positions ... this is a 1% position -
+# I am 99% cash" 被读成 trim 1%，BULK 遍历全部持仓刷了 8 连 TG）
+PCT_PATTERN = re.compile(
+    r"(?<![-+\d.])(\d{1,3})\s*%"
+    r"(?!\s*(?:position\b|pos\b|sizing\b|cash\b|的?\s*仓位|的?\s*头寸|的?\s*现金))"
+)
+
+# 提取 $SYMBOL（强信号）
+DOLLAR_SYM_PATTERN = re.compile(r"\$([A-Z]{1,5})\b")
+
+# 提取裸 SYMBOL（弱信号，需 open_symbols 白名单验证）
+BARE_SYM_PATTERN = re.compile(r"\b([A-Z]{2,5})\b")
+
+# Chinese 友好版：用 lookahead/lookbehind 在字母/数字边界判定，
+# 这样 "减仓IWM" 也能正确抓 IWM（Python re 把中文当 \w，\b 在汉字-字母处不触发）
+BARE_SYM_PATTERN_ZH = re.compile(r"(?<![A-Za-z0-9])([A-Z]{2,5})(?![A-Za-z0-9])")
+
+# === "还拿着"语境排除（7/10 near-miss）===
+# "+100% on SPY closed out now and just have runners on the NVDA call swings"
+# ——"closed out" 说的是 SPY，NVDA 是**继续持有**的对象，却被抽成 close 目标
+# （雪上加霜：SPY 已平出白名单，NVDA 成了唯一命中 → 差点 100% 误平，
+# 靠"无价格参照拒卖"才躲过）。出现在这些短语里的 symbol 不进 close 目标。
+# 注意方向性："runners on SPY" 是持有（排除）；"SPY runner" 是被 trim 的
+# 对象（"trimmed 1 SPY runner @ 4.00"），不受影响。
+_HOLD_CONTEXT_TEMPLATES = (
+    r"runners?\s+on\s+(?:the\s+)?\$?{sym}\b",
+    r"hold(?:ing)?\s+(?:the\s+)?\$?{sym}\b",
+    r"keep(?:ing)?\s+(?:the\s+)?\$?{sym}\b",
+    # "All cash now besides $HOOD 1.5% position"（7/15）——besides/except
+    # 后面的 symbol 是**留着**的，close 目标是"其他所有"，不是它
+    r"(?:besides|except(?:\s+for)?)\s+(?:the\s+|my\s+)?\$?{sym}\b",
+)
+_ZH_HOLD_CONTEXT_TEMPLATES = (
+    r"保留[^\n，。]{{0,8}}{sym}",
+    r"持有[^\n，。]{{0,8}}{sym}",
+    r"留着?[^\n，。]{{0,6}}{sym}",
+    # "除了 $HOOD 1.5% 的头寸外，现在全是现金"（7/15）
+    r"除了?[^\n，。]{{0,8}}{sym}",
+)
+
+
+def _in_hold_context(sym: str, text: str, is_zh: bool = False) -> bool:
+    """symbol 是否只出现在"继续持有"语境里（runners on X / 保留X）。
+
+    ZH 路径同时检查该 ticker 的中文名（"仅保留英伟达" 也要能排除 NVDA）。
+    """
+    templates = _ZH_HOLD_CONTEXT_TEMPLATES if is_zh else _HOLD_CONTEXT_TEMPLATES
+    names = [sym]
+    if is_zh:
+        names += [n for n, t in ZH_NAME_TO_TICKER.items() if t == sym]
+    for cand in names:
+        for t in templates:
+            if re.search(t.format(sym=re.escape(cand)), text, re.IGNORECASE):
+                return True
+    return False
+
+# "N% LEFT" / "down to N% runners" / "runners only" → 卖 (100-N)%
+LEFT_PATTERN = re.compile(r"(\d{1,3})\s*%\s*(?:left|remaining)", re.I)
+
+# === 分数仓位表达（7/6 夜实测 KC 高频用法）===
+# 两种语义方向，容易搞反：
+#   "scaling out 1/3" / "selling 1/3" / "trimmed 1/2"       → 卖出 X/Y
+#   "down to 1/3 (of my position)" / "scaling down to 1/2"  → 剩 X/Y，卖 (1 - X/Y)
+# 日期防误伤（"sold my 7/13 puts"）：_fraction_pct 只认分母 2-5 且分子<分母。
+FRACTION_DOWN_TO_PATTERN = re.compile(
+    r"\bdown\s+to\s+(\d{1,2})\s*/\s*(\d{1,2})", re.I,
+)
+FRACTION_OUT_PATTERN = re.compile(
+    r"\b(?:out|trim(?:med|ming)?|sell(?:ing)?|sold|scaling\s+out)\s+"
+    r"(\d{1,2})\s*/\s*(\d{1,2})",
+    re.I,
+)
+# ZH："缩减至 1/2" / "减持到 1/3" / "剩下 1/4" → 剩余语义
+ZH_FRACTION_TO_PATTERN = re.compile(r"(?:至|到|剩下?|降至)\s*(\d{1,2})\s*/\s*(\d{1,2})")
+# ZH："减持1/3" / "卖出1/3" → 卖出语义（动词后紧跟分数）
+ZH_FRACTION_OUT_PATTERN = re.compile(
+    r"(?:减持|减仓|卖出|卖了|砍掉|砍仓|抛出|抛了)\s*了?\s*(\d{1,2})\s*/\s*(\d{1,2})"
+)
+
+
+def _fraction_pct(num: int, den: int) -> "int | None":
+    """X/Y → 百分比整数。分母 2-5 且分子<分母才当分数，否则视为日期（7/13）返 None。"""
+    if den < 2 or den > 5 or num < 1 or num >= den:
+        return None
+    return round(num * 100 / den)
+
+# KC 喊出的卖出价 —— 用来挂卖单限价，避免按 entry × 0.95 倒挂
+# 场景：
+#   `trimmed MSFT 420c @ 7.00`     ← @ + 价
+#   `trimmed IWM @ 2.45`           ← @ + 价
+#   `BANG! Trimmed another IWM here @ 2.80` ← @ + 价
+#   `trimmed TSLA 3.00`            ← 无 @，裸 X.XX
+# 排除：strike ("$420")、pct ("25%")、PnL ("-15%")、合约后缀 (420c)
+PRICE_AT_PATTERN = re.compile(r"@\s*\$?(\.?\d+(?:\.\d+)?)")
+# 裸 X.XX：必须带小数点，且前面不是 $ 或数字，后面不是 c/p/%/ 数字
+PRICE_BARE_PATTERN = re.compile(
+    r"(?<![\$\d.])(\d+\.\d{1,2})(?![cp%\d])",
+    re.IGNORECASE,
+)
+
+
+def _extract_signal_price(scope: str) -> "float | None":
+    """从 action 句 scope 抽取 KC 喊的卖出价。
+
+    返回 None → caller fallback 到 entry-based 算法
+    """
+    m = PRICE_AT_PATTERN.search(scope)
+    if m:
+        try:
+            v = float(m.group(1))
+            if 0.01 <= v <= 100:  # 期权合理价区间
+                return v
+        except ValueError:
+            pass
+    m = PRICE_BARE_PATTERN.search(scope)
+    if m:
+        try:
+            v = float(m.group(1))
+            if 0.01 <= v <= 100:
+                return v
+        except ValueError:
+            pass
+    return None
+
+
+# === KC 喊的 PnL (% 标注) ===
+# 场景：
+#   "closed NOW small day trade -15%"      → -15
+#   "Closed IREN 60c for +30%"             → +30
+#   "closed NOW at entry"                  → 0   （持平退出）
+#   "trimmed @ break even"                 → 0
+# 不同于 trim 比例 ("Selling 25%")：PnL 必须带正负号 / 或 "at entry" 之类显式标记。
+# "stop(s) at entry" 是移止损备注不是持平退出（7/8 "trimmed AAPL +20% stop at
+# entry" 被误标 pnl=0），用 lookbehind 排除。
+PNL_SIGNED_PATTERN = re.compile(r"([+\-])\s*(\d{1,3}(?:\.\d+)?)\s*%")
+AT_ENTRY_PATTERN = re.compile(
+    r"(?<!stop\s)(?<!stops\s)\bat\s+(?:entry|breakeven|break\s*even|be)\b", re.I
+)
+# 中文版："在进场位 / 在入场位 / 保本 / 平本"
+ZH_AT_ENTRY_PATTERN = re.compile(r"在\s*(?:进场|入场)位|保本|平本")
+
+
+def _extract_signal_pnl(scope: str, is_zh: bool = False) -> "float | None":
+    """从 action 句 scope 抽 KC 报告的 PnL（%）。
+
+    返回 None → 没找到（不代表 PnL 为零，而是不知道）
+    返回 0    → 显式 "at entry" / "保本"
+    返回 -15  → "-15%"
+    """
+    # 显式持平
+    if AT_ENTRY_PATTERN.search(scope):
+        return 0.0
+    if is_zh and ZH_AT_ENTRY_PATTERN.search(scope):
+        return 0.0
+
+    # 带符号 N%
+    m = PNL_SIGNED_PATTERN.search(scope)
+    if m:
+        sign = -1.0 if m.group(1) == "-" else 1.0
+        try:
+            v = float(m.group(2))
+            if 0 <= v <= 1000:  # 合理 PnL 范围（lotto +500% 也可能）
+                return sign * v
+        except ValueError:
+            pass
+    return None
+
+
+# ============================================================
+# 中文 fallback
+# ============================================================
+#
+# 不维护中文公司名→ticker 映射（亚马逊/微软等）。
+# 这类信号靠 1-3s 后到达的 EN 版本兜底；本路径主要处理：
+#   - $SYMBOL（enrich 中文版常保留 $）
+#   - 裸 ticker（IWM/SPY/QQQ 等不翻译的）+ 白名单消歧
+# ZH 抓到 action 动词但没 symbol 时 → log [zh_unrecognized] 便于事后追踪。
+
+# 复盘/计划 —— 出现即跳
+# 注意区分 "卖出了一些" (recap) vs "又减仓了一笔" (announcement)：
+# 前者必带"时"/"在 N% 时"/"昨天"等过去时间锚；后者是当下宣告
+ZH_RECAP_MARKERS = [
+    "昨天", "昨日", "今早", "今天早些", "早些时候",
+    "我的计划", "的计划是", "计划：",
+    "打算", "准备", "即将", "将要", "将把",  # 未来意图
+    "时卖出", "时减仓", "时清", "时砍", "时抛",  # "在 40% 时卖出"
+    "了一些",  # "卖出了一些" 多为复盘；与 "了一笔" / "了一份" 区分
+    "每周回顾", "观察列表", "观察名单",  # 周报/watchlist（与 EN 侧对齐）
+]
+
+# bulk action
+ZH_BULK_MARKERS = ["所有持仓", "全部持仓", "全部仓位"]
+
+# 当前动作动词
+# 7/6 加 减持 / 缩减至|缩减到（KC ZH 翻译的 "scaling out/down" 惯用词）。
+# 不加裸 "缩减"——"缩减购债" 类宏观评论会误触。
+# "减持" 理论上也可能出现在 "巴菲特减持苹果" 类新闻转述里，但风险与既有
+# 的 卖出/砍掉 相同（channel 只有 KC bot 发言 + symbol 白名单双保险），接受。
+# 7/8 加 出清（"全部出清苹果仓位"）。
+ZH_ACTION_VERBS = [
+    "减仓", "平仓", "清仓", "全平", "清空",
+    "卖出", "卖了",
+    "砍掉", "砍仓",
+    "抛出", "抛了",
+    "止盈",
+    "减持", "缩减至", "缩减到",
+    "出清",
+    "减半",   # "减半仓于2.45"（7/9 实测；"减仓" 不是它的连续子串，接不住）
+    "锁定",   # "$XOM 全部锁定"（7/17，enrich 止盈口头禅的 ZH 版）
+]
+
+# 全平动词 / 短语（pct 缺省 → 100）
+ZH_FULL_CLOSE_VERBS = ["平仓", "清仓", "全平", "清空", "全部卖出", "全部抛", "出清"]
+
+# "剩下 30%" / "剩 N%" → 卖 (100-N)%
+ZH_LEFT_PATTERN = re.compile(r"剩\s*下?\s*(\d{1,3})\s*%")
+
+
+# === 公司名 → ticker 最小映射（白名单门控）===
+# 7/7-7/8 实测：KC 平仓爱写公司名不写 ticker（"all out apple" / "减仓苹果"），
+# EN/ZH 都抽不出 symbol → 平仓信号静默丢失（AAPL 305p 僵尸仓的直接成因）。
+# 只映射高频大票，且**必须命中 open_symbols 白名单才生效**——
+# 没持仓时这些词只是行情闲聊，映射了反而会误平。
+EN_NAME_TO_TICKER = {
+    "apple": "AAPL", "tesla": "TSLA", "amazon": "AMZN", "microsoft": "MSFT",
+    "nvidia": "NVDA", "google": "GOOGL", "meta": "META", "netflix": "NFLX",
+}
+ZH_NAME_TO_TICKER = {
+    "苹果": "AAPL", "特斯拉": "TSLA", "亚马逊": "AMZN", "微软": "MSFT",
+    "英伟达": "NVDA", "谷歌": "GOOGL", "脸书": "META", "网飞": "NFLX",
+}
+
+
+# === BULK 例外抽取 ===
+# "Closing all positions outside of the $IBM $310 lotto"（7/8 实测）——
+# BULK_TRIM 不能连人家明确保留的仓位一起卖。
+# EN: outside of / except (for) / other than / besides + $TICKER
+# ZH: "$IBM ... 以外" / "除了 $IBM"
+EXCLUDE_EN_PATTERN = re.compile(
+    r"(?:outside of|except(?:\s+for)?|other than|besides)\s+(?:the\s+)?\$?([A-Z]{1,5})\b",
+    re.IGNORECASE,
+)
+EXCLUDE_ZH_PATTERN = re.compile(
+    r"\$?([A-Z]{1,5})[^\n，。]{0,15}?以外"
+    r"|除了?\s*\$?([A-Z]{1,5})"
+)
+
+
+def _extract_exclude_symbols(text: str) -> list[str]:
+    """抽 BULK 例外 symbol。EN pattern 带 IGNORECASE，要求命中的词原文全大写
+    （否则 "outside of the money" 会捕到 "money"）。"""
+    out, seen = [], set()
+    for pat in (EXCLUDE_EN_PATTERN, EXCLUDE_ZH_PATTERN):
+        for m in pat.finditer(text):
+            s = next((g for g in m.groups() if g), None)
+            if not s or not s.isupper():
+                continue
+            if s not in seen:
+                out.append(s)
+                seen.add(s)
+    return out
+
+
+def _has_recap_marker(text_lower: str) -> bool:
+    return any(m in text_lower for m in RECAP_MARKERS)
+
+
+def _has_bulk_marker(text_lower: str) -> bool:
+    return any(m in text_lower for m in BULK_MARKERS)
+
+
+def _has_action_verb(text_lower: str) -> bool:
+    return (
+        any(v in text_lower for v in ACTION_VERBS)
+        or bool(_OUT_PHRASE_RE.search(text_lower))
+    )
+
+
+def _has_full_close_verb(text_lower: str) -> bool:
+    return (
+        any(v in text_lower for v in FULL_CLOSE_VERBS)
+        or bool(_OUT_FULL_CLOSE_RE.search(text_lower))
+    )
+
+
+# 分句 scope 用：单词动词加 \b 边界；"out" 短语与 _OUT_PHRASE_RE 同边界规则
+_ACTION_RE = re.compile(
+    r"\b(?:trimming|trimmed|cutting|selling|closing|closed|dumping|dumped)\b"
+    r"|\btrim\s|\bcut\s|\bsold\s+here\b|\bscaling\s+(?:out|down)\b|bang!|\bbang\s+-"
+    r"|\ball\s+out\b|\bout\s+(?:half|full|majority)\b",
+    re.IGNORECASE,
+)
+
+
+def _action_sentences(text: str) -> str:
+    """返回包含动作动词的句子拼接。
+
+    用 . ! ? 分句，但避免在小数点处切（`@ 2.45` 必须保持完整）。
+    场景：'closed the NOW small day trade -15%. Just hanging out now after 3/3 on AMZN MSFT swings.'
+    第一句有 closed 抓 NOW；第二句是复盘，不该抓 AMZN/MSFT。
+    若没有任何句子命中（整段一句话），fallback 用整段 —— 不漏召回。
+    """
+    # 分隔符：句末 .!? 后跟空白（且 .!? 前后不是数字 → 排除小数点）
+    sentences = re.split(r"(?<!\d)[.!?](?!\d)\s+|(?<=[.!?])(?=\s)", text)
+    hit = [s for s in sentences if _ACTION_RE.search(s)]
+    return " ".join(hit) if hit else text
+
+
+def _extract_strike_hint(scope: str, symbols: list, full_text: str = "") -> tuple:
+    """从 close 文本里抽 strike + side hint。
+
+    场景背景：6/30 KC 发 "all out TSLA 420c @ 15.35"，但我们持仓是 TSLA 425c
+    （我们抄的 enrich 信号）。旧 parser 只看 symbol → 抽到 TSLA → 关掉我们 425c。
+    这次因为 420c/425c 同方向同到期日同 ITM，价差很小，意外赚了大钱。
+    下次未必有这种运气：KC 平 TSLA put 时我们的 TSLA call 也会被错平。
+
+    策略：只在文本里**显式给出 strike** 时返回 hint。无 strike → None，
+    保持旧"symbol-only"语义不变（不破坏没 strike 的 trim 消息行为）。
+
+    ⚠️ 必须 scope 没找到时**回退全文**（7/10 事故）：
+    "SPY 755c IN THE MONEY! Closed @ 4.40" 分句后 "SPY 755c" 在感叹句、
+    动作在下一句 → 只扫 scope 时 hint 丢失 → symbol-only 匹配把我们的
+    SPY **put** 当成 KC 的 755 **call** 平掉了。pattern 本身 symbol 锚定
+    （要求 "SYM 数字c/p" 紧邻），全文回退的误报风险很低。
+
+    支持的写法（symbol 在前，strike+side 紧邻）：
+      "TSLA 420c", "SPY 748c", "AMZN 255 calls", "MSFT 420put"
+      ZH: "TSLA 420c" (KC ZH 翻译里 strike 通常保留 Latin)
+
+    Args:
+        scope: 含 close action 的句子片段（优先搜索——动作句里的 hint 最可信）
+        symbols: 已抽出的 symbols 列表（用于"靠近"判断）
+        full_text: 原始全文，scope 未命中时回退
+
+    Returns:
+        (strike: float, side: "CALL"|"PUT") 或 (None, None)
+    """
+    if not symbols:
+        return (None, None)
+    # 第一个 symbol 是主对象
+    sym = symbols[0]
+    # 匹配 "SYM 数字 c/p" 或 "SYM 数字 call(s)/put(s)"，最多隔 3 个空白字符
+    pat = re.compile(
+        rf"\b{re.escape(sym)}\s+(\d+(?:\.\d+)?)\s*(c\b|p\b|calls?|puts?)",
+        re.IGNORECASE,
+    )
+    m = pat.search(scope) or (pat.search(full_text) if full_text else None)
+    if not m:
+        return (None, None)
+    strike = float(m.group(1))
+    side_raw = m.group(2).lower()
+    side = "CALL" if side_raw.startswith("c") else "PUT"
+    return (strike, side)
+
+
+def _extract_symbols(text: str, open_symbols: set[str]) -> list[str]:
+    """抽 symbol。优先 $SYMBOL；只有完全没有 $ 标记时才 fallback 到裸 SYMBOL。
+
+    设计原因：enrich 长消息里"$HOOD - NOW ITM"，NOW 在持仓白名单也会被误匹配。
+    既然作者用了 $ 标注，就只信 $ —— 这是 KC/enrich 的明确约定。
+    KC Bot 风格（"trimmed AMZN"）不带 $，才需要白名单兜底。
+
+    扫描范围限制在含 action 动词的句子内，避免抓到下一句 commentary 里的 ticker。
+    """
+    # 两遍扫描：先 action 句 scope，没抓到再 fallback 全文
+    # 场景：'$HOOD - Nobody let these go red. Selling 25% here.' —— $HOOD 在第一句，
+    # 动作在第二句，分句后 action scope 没 $HOOD，需要 fallback。
+    # 每层出结果前都过 hold-context 过滤（"runners on the NVDA" 的 NVDA 不是
+    # close 目标）；过滤后为空则继续下一层/下一个 scope。
+    def _keep(cands: list) -> list:
+        return [s for s in cands if not _in_hold_context(s, text)]
+
+    for scope in (_action_sentences(text), text):
+        found = []
+        seen = set()
+        for m in DOLLAR_SYM_PATTERN.finditer(scope):
+            s = m.group(1)
+            if s not in seen:
+                found.append(s)
+                seen.add(s)
+        kept = _keep(found)
+        if kept:
+            return kept
+        for m in BARE_SYM_PATTERN.finditer(scope):
+            s = m.group(1)
+            if s in seen:
+                continue
+            if s in open_symbols:
+                found.append(s)
+                seen.add(s)
+        kept = _keep(found)
+        if kept:
+            return kept
+        # 3. 公司名兜底（"all out apple"）——只认已持仓的映射，见 EN_NAME_TO_TICKER 注释
+        scope_lower = scope.lower()
+        for name, tick in EN_NAME_TO_TICKER.items():
+            if tick in open_symbols and tick not in seen \
+                    and re.search(rf"\b{name}\b", scope_lower):
+                found.append(tick)
+                seen.add(tick)
+        kept = _keep(found)
+        if kept:
+            return kept
+    return []
+
+
+def _extract_pct(text: str, text_lower: str) -> int:
+    """提取卖出百分比。
+
+    规则（优先级从上到下）：
+    - "30% LEFT" / "30% remaining" → 卖 70%
+    - "down to 1/3" → 剩 1/3，卖 67%（剩余语义，先查——
+      "Scaling out more. Down to 1/3" 两个方向的词都在，剩余语义才是对的）
+    - "scaling out 1/3" / "sold 1/2" → 卖 33% / 50%
+    - "Selling 25%" → 卖 25%
+    - 无数字：FULL_CLOSE_VERBS → 100%，否则 33%（trim 默认）
+
+    扫描范围限制在 action 句内，避免抓到 commentary 里的 PnL %。
+    PCT_PATTERN 已经排除了 -N% / +N%（PnL 标注）。
+
+    TODO: KC "trimmed @ price" 没有 %，默认 33% 是经验值，实测后调
+    """
+    scope = _action_sentences(text)
+
+    left_m = LEFT_PATTERN.search(scope)
+    if left_m:
+        n = int(left_m.group(1))
+        return max(1, min(100, 100 - n))
+
+    # 分数：先 action 句 scope，没有再全文兜底。
+    # KC 惯用两句式 "Scaling out more. Down to 1/3 of my position."——
+    # 分数落在 action 句外，只扫 scope 会漏（7/6 实测误判成默认 33）。
+    # 全文兜底安全性：recap 已在上层整条过滤；symbols / signal_price
+    # 仍然严格限 scope（那两个扫全文才有错平/错价风险，pct 没有）。
+    for search_space in (scope, text):
+        m = FRACTION_DOWN_TO_PATTERN.search(search_space)
+        if m:
+            frac = _fraction_pct(int(m.group(1)), int(m.group(2)))
+            if frac is not None:
+                return max(1, min(100, 100 - frac))
+        m = FRACTION_OUT_PATTERN.search(search_space)
+        if m:
+            frac = _fraction_pct(int(m.group(1)), int(m.group(2)))
+            if frac is not None:
+                return max(1, min(100, frac))
+
+    pct_m = PCT_PATTERN.search(scope)
+    if pct_m:
+        n = int(pct_m.group(1))
+        return max(1, min(100, n))
+
+    # 显式份额短语：比 33% 默认值语义更强，但弱于明确的数字 %
+    # "out half" = 卖一半；"out majority/most" = 卖大部分（75% 经验值，实测调整）
+    if re.search(r"\bout\s+half\b", scope, re.I):
+        return 50
+    if re.search(r"\bout\s+(?:majority|most)\b", scope, re.I):
+        return 75
+
+    return 100 if _has_full_close_verb(text_lower) else 33
+
+
+def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
+    """英文路径（原 parse_close 逻辑）。"""
+    text_lower = text.lower()
+    if _has_recap_marker(text_lower):
+        logger.info(f"[close_parser] EN skip (recap): {text[:80]}")
+        return None
+    if not _has_action_verb(text_lower):
+        return None
+
+    scope_en = _action_sentences(text)
+    signal_price = _extract_signal_price(scope_en)
+    signal_pnl_pct = _extract_signal_pnl(scope_en, is_zh=False)
+
+    if _has_bulk_marker(text_lower):
+        pct = _extract_pct(text, text_lower)
+        if pct == 33:
+            # 无显式比例："closing/closed all positions" 是全清语义 → 100；
+            # "trimming all positions" 保持 bulk 默认 50
+            pct = 100 if re.search(r"\bclos(?:e|ing|ed)\b", text_lower) else 50
+        exclude = _extract_exclude_symbols(text)
+        logger.info(f"[close_parser] EN BULK_TRIM pct={pct} exclude={exclude}")
+        return {"kind": "BULK_TRIM", "symbols": [], "pct": pct, "hint_strike": None, "hint_side": None,
+                "exclude_symbols": exclude,
+                "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
+                "matched": text[:120], "lang": "en"}
+
+    symbols = _extract_symbols(text, open_symbols)
+    if not symbols:
+        return None
+    pct = _extract_pct(text, text_lower)
+    hint_strike, hint_side = _extract_strike_hint(scope_en, symbols, full_text=text)
+    logger.info(
+        f"[close_parser] EN CLOSE symbols={symbols} pct={pct} "
+        f"strike={hint_strike} side={hint_side} "
+        f"price={signal_price} pnl={signal_pnl_pct} text={text[:80]}"
+    )
+    return {"kind": "CLOSE", "symbols": symbols, "pct": pct,
+            "hint_strike": hint_strike, "hint_side": hint_side,
+            "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
+            "matched": text[:120], "lang": "en"}
+
+
+# ---- 中文 helpers ----
+
+def _has_zh_recap(text: str) -> bool:
+    return any(m in text for m in ZH_RECAP_MARKERS)
+
+
+def _has_zh_action(text: str) -> bool:
+    return any(v in text for v in ZH_ACTION_VERBS)
+
+
+def _has_zh_bulk(text: str) -> bool:
+    return any(m in text for m in ZH_BULK_MARKERS)
+
+
+def _has_zh_full_close(text: str) -> bool:
+    return any(v in text for v in ZH_FULL_CLOSE_VERBS)
+
+
+def _zh_action_sentences(text: str) -> str:
+    """按中文句号 / 英文句号切，留含动作动词的句子。
+
+    `.` 在数字之间不切（如 '@ 2.45'）。中文 `。！？` 总是切。
+    """
+    sents = re.split(r"[。！？]|(?<!\d)[.!?](?!\d)", text)
+    hit = [s for s in sents if any(v in s for v in ZH_ACTION_VERBS)]
+    return " ".join(hit) if hit else text
+
+
+def _extract_zh_symbols(text: str, open_symbols: set[str]) -> list[str]:
+    """中文版 symbol 抽取：$SYMBOL → 裸 ticker 白名单。
+
+    两遍扫描：先在 action 句 scope 找，没找到再 fallback 全文（同 EN 路径）。
+    用 BARE_SYM_PATTERN_ZH 避免汉字-字母边界 \b 失效。
+
+    不处理中文公司名（亚马逊→AMZN 之类）—— 这类信号靠 EN 版本兜底。
+    """
+    def _keep(cands: list) -> list:
+        return [s for s in cands if not _in_hold_context(s, text, is_zh=True)]
+
+    for scope in (_zh_action_sentences(text), text):
+        found = []
+        seen = set()
+        # 1. $SYMBOL（enrich 中文版常保留）
+        for m in DOLLAR_SYM_PATTERN.finditer(scope):
+            s = m.group(1)
+            if s not in seen:
+                found.append(s); seen.add(s)
+        kept = _keep(found)
+        if kept:
+            return kept
+        # 2. 裸 ticker + 白名单消歧（IWM/SPY/QQQ 等不被翻译的）
+        for m in BARE_SYM_PATTERN_ZH.finditer(scope):
+            s = m.group(1)
+            if s in seen:
+                continue
+            if s in open_symbols:
+                found.append(s); seen.add(s)
+        kept = _keep(found)
+        if kept:
+            return kept
+        # 3. 中文公司名兜底（"减仓苹果"）——只认已持仓的映射
+        for name, tick in ZH_NAME_TO_TICKER.items():
+            if tick in open_symbols and tick not in seen and name in scope:
+                found.append(tick); seen.add(tick)
+        kept = _keep(found)
+        if kept:
+            return kept
+    return []
+
+
+def _extract_zh_pct(text: str) -> int:
+    """中文版百分比抽取。优先级同 EN：剩余% → 一半 → 剩余分数 → 卖出分数 → N%。"""
+    scope = _zh_action_sentences(text)
+
+    left_m = ZH_LEFT_PATTERN.search(scope)
+    if left_m:
+        n = int(left_m.group(1))
+        return max(1, min(100, 100 - n))
+
+    # 中文数词分数："减仓一半" / "减半仓" → 50%。
+    # 7/10 实测："减仓一半" 落到默认 33，和 EN 孪生 "out half"=50 指纹
+    # 不匹配 → dedup 失效多发一条 TG。
+    if "一半" in scope or "减半" in scope:
+        return 50
+
+    # 分数：先 scope 后全文兜底（同 EN 版 _extract_pct 的两句式问题）
+    for search_space in (scope, text):
+        m = ZH_FRACTION_TO_PATTERN.search(search_space)
+        if m:
+            frac = _fraction_pct(int(m.group(1)), int(m.group(2)))
+            if frac is not None:
+                return max(1, min(100, 100 - frac))
+        m = ZH_FRACTION_OUT_PATTERN.search(search_space)
+        if m:
+            frac = _fraction_pct(int(m.group(1)), int(m.group(2)))
+            if frac is not None:
+                return max(1, min(100, frac))
+
+    pct_m = PCT_PATTERN.search(scope)
+    if pct_m:
+        return max(1, min(100, int(pct_m.group(1))))
+
+    return 100 if _has_zh_full_close(text) else 33
+
+
+def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
+    """中文 fallback 路径。"""
+    if _has_zh_recap(text):
+        logger.info(f"[close_parser] ZH skip (recap): {text[:80]}")
+        return None
+    if not _has_zh_action(text):
+        return None
+
+    scope_zh = _zh_action_sentences(text)
+    signal_price = _extract_signal_price(scope_zh)
+    signal_pnl_pct = _extract_signal_pnl(scope_zh, is_zh=True)
+
+    if _has_zh_bulk(text):
+        pct = _extract_zh_pct(text)
+        if pct == 33:
+            pct = 50
+        exclude = _extract_exclude_symbols(text)
+        logger.info(f"[close_parser] ZH BULK_TRIM pct={pct} exclude={exclude}")
+        return {"kind": "BULK_TRIM", "symbols": [], "pct": pct, "hint_strike": None, "hint_side": None,
+                "exclude_symbols": exclude,
+                "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
+                "matched": text[:120], "lang": "zh"}
+
+    symbols = _extract_zh_symbols(text, open_symbols)
+    if not symbols:
+        logger.warning(
+            f"[close_parser] [zh_unrecognized] ZH close intent but symbol "
+            f"not extractable (likely Chinese company name): {text[:120]}"
+        )
+        return None
+    pct = _extract_zh_pct(text)
+    hint_strike, hint_side = _extract_strike_hint(scope_zh, symbols, full_text=text)
+    logger.info(
+        f"[close_parser] ZH CLOSE symbols={symbols} pct={pct} "
+        f"strike={hint_strike} side={hint_side} "
+        f"price={signal_price} pnl={signal_pnl_pct} text={text[:80]}"
+    )
+    return {"kind": "CLOSE", "symbols": symbols, "pct": pct,
+            "hint_strike": hint_strike, "hint_side": hint_side,
+            "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
+            "matched": text[:120], "lang": "zh"}
+
+
+def parse_close(text: str, open_symbols: set[str]) -> Optional[dict]:
+    """CLOSE 信号解析（顶层 dispatcher）。
+
+    流程：
+      EN 路径 → 命中返回
+      ZH 路径 → 命中返回
+      都没命中 → None
+
+    返回 dict 多了 'lang' 字段标识哪个路径命中，方便日志和回归。
+    """
+    if not text or len(text.strip()) < 3:
+        return None
+
+    return _parse_close_en(text, open_symbols) or _parse_close_zh(text, open_symbols)

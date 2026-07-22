@@ -1,0 +1,9 @@
+{
+  "123456789012345678": {
+    "name": "example-channel",
+    "trigger_user_ids": [987654321098765432],
+    "default_qty": 1,
+    "max_price": 5.0,
+    "enabled": true
+  }
+}
