@@ -316,11 +316,43 @@ ZH_ACTION_VERBS = [
     "减持", "缩减至", "缩减到",
     "出清",
     "减半",   # "减半仓于2.45"（7/9 实测；"减仓" 不是它的连续子串，接不住）
+    # "出半"（7/23 NBIS）不进本表：裸子串会命中"冲出半年新高"类评论，
+    # 由 ZH_OUT_HALF_RE 带边界匹配后归一化成"减半"（见 _parse_close_zh 入口）
     "锁定",   # "$XOM 全部锁定"（7/17，enrich 止盈口头禅的 ZH 版）
 ]
 
 # 全平动词 / 短语（pct 缺省 → 100）
 ZH_FULL_CLOSE_VERBS = ["平仓", "清仓", "全平", "清空", "全部卖出", "全部抛", "出清"]
+
+# 移动止损子句 —— 不是卖出指令，动词判定前整句抹掉。
+# 7/23 实测："AVGO 触及下一目标 +37% ✅ 止损设在现价以锁定盈利交易"
+# （EN 孪生 "stop at entry now to secure green trade" 本来就无 EN 动词，安全；
+# ZH 版的"锁定"落在止损子句里 → 被 ZH_ACTION_VERBS 误判为 CLOSE pct=33。
+# 当晚靠 runner-preserve + 无喊价拒卖两道防线才没误卖）。
+# EN 侧对应防护见 AT_ENTRY_PATTERN 的 stop-lookbehind（7/8）。
+# 抹除范围：从"止损"起、沿"止损子句内合法字符"（汉字/数字/./%/+/-）走到头。
+# 白名单式终止（第二轮对抗评审改法）：em-dash——、省略号…、emoji、零宽空格这类
+# 分隔符无法在否定字符类里穷举，反过来枚举"子句里会出现什么"更稳——
+# "止损设在现价以锁定盈利交易"（纯汉字）、"止损位2.0"、"止损-10%" 都整段被抹，
+# 而 "止损打掉——全部卖出"、"止损上移✅全部卖出"、"止损上移到$NVDA成本线"
+# 在 —/✅/$ 处停下，真卖出动词和 $SYMBOL 都活下来。
+# 边界规则（两轮对抗评审实锤，每条都对应一个真实误伤）：
+#   1. (?<!防) 左边界——"为防止损失扩大 卖出" 里的 止损 是"防止+损失"；
+#   2. 不吃前缀 把/将——否则 recap 标记"将把"被拆掉，"我将把止损上移…若跌破
+#      就全部卖出" 这类计划类消息从 recap-skip 变成真卖单（recap 检查也已
+#      移到掩码之前，见 _parse_close_zh）；
+#   3. 真砍仓的动作动词在止损子句之外（"减仓AVGO，止损移到保本"），不受影响。
+# 已知残留：全连写"止损全部卖出"（纯汉字无分隔）仍会整段被抹——正则层面无法与
+# "止损设在现价"区分，宁可漏卖（有 EN 孪生兜底）不可误卖。
+ZH_SL_ADJUST_CLAUSE_RE = re.compile(r"(?<!防)止损[一-鿿0-9.．%％+\-]*")
+
+# "出半"（EN "out half" 的 ZH 孪生，7/23 NBIS 漏路由）——两侧都要边界：
+# 右边界：裸"出半"后不能跟汉字（"冲出半年新高"类评论，7/23 对抗评审实锤）；
+# 左边界：前面不能是汉字——"走出半V型反转 / 冲出半年" 的 出半 是"走出/冲出"
+# 的一部分，ASCII 跟随（半V/半M 形态黑话）右边界拦不住，靠左边界拦；
+# "出半仓" 变体：仓 后允许任意接续（"出半仓于2.45" 对齐 7/9 "减半仓于2.45"）。
+# 命中后归一化成既有动词"减半"（pct=50 语义现成，无需新管道）。
+ZH_OUT_HALF_RE = re.compile(r"(?<![一-鿿])出半(?:仓|(?![一-鿿]))")
 
 # "剩下 30%" / "剩 N%" → 卖 (100-N)%
 ZH_LEFT_PATTERN = re.compile(r"剩\s*下?\s*(\d{1,3})\s*%")
@@ -690,10 +722,13 @@ def _extract_zh_pct(text: str) -> int:
         n = int(left_m.group(1))
         return max(1, min(100, 100 - n))
 
-    # 中文数词分数："减仓一半" / "减半仓" → 50%。
+    # 中文数词分数："减仓一半" / "减半仓" / "卖出半仓" → 50%
+    # （"出半" 已在入口归一化成"减半"；"半仓" 只在动作动词已确认的 scope 里
+    # 评估，"卖出半仓" 因 出半 左边界让位给 卖出 动词后靠它拿到 50，
+    # 与 EN 孪生 "sold half"=50 指纹对齐）。
     # 7/10 实测："减仓一半" 落到默认 33，和 EN 孪生 "out half"=50 指纹
     # 不匹配 → dedup 失效多发一条 TG。
-    if "一半" in scope or "减半" in scope:
+    if "一半" in scope or "减半" in scope or "半仓" in scope:
         return 50
 
     # 分数：先 scope 后全文兜底（同 EN 版 _extract_pct 的两句式问题）
@@ -718,9 +753,16 @@ def _extract_zh_pct(text: str) -> int:
 
 def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
     """中文 fallback 路径。"""
+    # recap 判定必须在任何改写**之前**跑原文：掩码会拆掉"将把"这类
+    # 未来意图标记（第二轮对抗评审实锤——"我将把止损上移…若跌破就全部卖出"
+    # 原本 recap-skip，改写后变成真卖单）
     if _has_zh_recap(text):
         logger.info(f"[close_parser] ZH skip (recap): {text[:80]}")
         return None
+    # "出半(仓)" 带边界归一化成"减半"（见 ZH_OUT_HALF_RE 注释，7/23 NBIS）
+    text = ZH_OUT_HALF_RE.sub("减半", text)
+    # 移动止损备注抹掉（见 ZH_SL_ADJUST_CLAUSE_RE 注释，7/23 AVGO 误判）
+    text = ZH_SL_ADJUST_CLAUSE_RE.sub(" ", text)
     if not _has_zh_action(text):
         return None
 

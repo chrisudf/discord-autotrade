@@ -666,6 +666,12 @@ STRONG_CLOSE_RE = re.compile(
     # 是 recap，不匹配。
     r"|\block(?:ing)?\s+(?:them\s+|these\s+|it\s+|profits?\s+)?(?:all\s+)?(?:in|on)\b"
     r"|减仓|平仓|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空|减持|缩减至|缩减到|出清"
+    # 7/23 实测：enrich ZH 孪生 "$NBIS - 出半"（EN "Out half"）没进 CLOSE 路由，
+    # 落到 OPEN 解析失败。EN 侧 WEAK_CLOSE_RE 一直认 "out half"，双语不对称。
+    # 两侧边界与 close_parser.ZH_OUT_HALF_RE 保持一致（对抗评审两轮实锤）：
+    # 右边界拦"冲出半年新高"，左边界拦"走出半V型反转"（ASCII 跟随右边界拦不住），
+    # "出半仓" 变体后面允许任意接续（"出半仓于2.45"）。
+    r"|(?<![一-鿿])出半(?:仓|(?![一-鿿]))"
     r"|锁定",
     re.I,
 )
