@@ -34,7 +34,7 @@ from autotrade.notify.messages import (
     format_risk_blocked,
     format_signal_alert,
 )
-from autotrade.notify.transport import _safe_notify
+from autotrade.notify.transport import _safe_notify, notify_bg
 from autotrade.parsing.signal_parser import parse_signal
 from autotrade.policy.guards import _suspicious_long_dte
 from autotrade.policy.pricing import breakeven_exit_price, calc_limit_price
@@ -164,9 +164,12 @@ async def process_open(message, raw, cfg, cid, t0, msg_date_et):
     # TODO P3: symbol blacklist
 
     # 解析成功立即预警，带 breakeven 提示 + KC tags
+    # [7/23] 改后台发送：预警 TG round-trip（7/22 夜实测 ~1.2s）不再垫在
+    # 风控→下单前面，省下的全是滑点。消息仍必发（notify_bg 持强引用），
+    # 只是可能晚于"下单成功"通知到达。风控拒单/下单结果等通知保持同步 await。
     entry_p = signal.get("price", 0) or 0
     be_info = breakeven_exit_price(entry_p) if entry_p > 0 else None
-    await _safe_notify(format_signal_alert(
+    notify_bg(format_signal_alert(
         cfg.name,
         signal["symbol"],
         signal["strike"],
