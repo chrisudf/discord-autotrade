@@ -11,6 +11,7 @@
 查重语义（查即登记原子性、CLOSE 零成交回滚）自老模块逐字保留；
 各查重函数原有的内联"惰性清过期 + 硬上限"提取为共享 _sweep_expired()（语义等价）。
 """
+import os
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
@@ -205,3 +206,28 @@ _sized_entry_alerted: dict[str, datetime] = {}
 # 老版只写不清，长期运行 symbol 键会无限累积。open_flow 在读写前调
 # _sweep_expired(reg, now, _ADDON_ALERT_WINDOW, cap=_ALERT_THROTTLE_MAX)。
 _ALERT_THROTTLE_MAX = 200
+
+# runner-preserve 通知节流：同一仓位的"跳过 trim"TG 在窗口内只发一次。
+# 7/23 实测：AVGO 415c 单张仓一夜 6 条一模一样的 runner-preserve TG——
+# KC 每次喊 trim（02:00/02:18/02:34/03:12/03:19/03:51/05:06）都触发一条。
+# 跳过动作本身每次照常执行并留 log；这里只压 TG 重复。
+# 窗口 RUNNER_PRESERVE_ALERT_WINDOW_SEC（默认 3600s，per-call 读，改 .env 重启生效）。
+_runner_preserve_alerted: dict[str, datetime] = {}
+
+
+def runner_preserve_should_alert(pos_label: str, now: "datetime | None" = None) -> bool:
+    """查即登记（同 _is_duplicate_* 的原子语义）：窗口内同仓位第二次起返回 False。
+
+    pos_label 用 close_flow 拼的 "SYM strikeC/P" 展示串做 key——
+    与 TG 文案同粒度，同一合约不同 pct 的重复提醒一并压掉。
+    """
+    window = timedelta(
+        seconds=int(os.getenv("RUNNER_PRESERVE_ALERT_WINDOW_SEC", "3600"))
+    )
+    if now is None:
+        now = datetime.now(timezone.utc)
+    _sweep_expired(_runner_preserve_alerted, now, window, cap=_ALERT_THROTTLE_MAX)
+    if pos_label in _runner_preserve_alerted:
+        return False
+    _runner_preserve_alerted[pos_label] = now
+    return True
