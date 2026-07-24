@@ -656,7 +656,15 @@ def _extract_tags(text: str) -> list:
 #       "out half 3.22 stop at entry" → \bentry\b 命中 "stop at entry"
 #     "at/to entry" 和 "re-enter" 是 KC 高频的止损/复盘用语，不是开仓动作
 STRONG_CLOSE_RE = re.compile(
-    r"\b(closed?|sold|exit|stopped|trim(?:med|ming)?|out of|scaling\s+out)\b"
+    # 7/24 实锤：`closed?` 同时命中裸名词 close——"META 620c 4DTE @ 4.80 little
+    # day trade **into the close** for fun" 被误路由 CLOSE，一个完全可解析的开仓
+    # 信号丢失（只发了条误导性的 "CLOSE 未执行" TG）。裸 close 只在**不是**
+    # 名词/副词用法时才算平仓动词：前面不能是 the/at/into/before/near/after
+    # （"into the close"、"at close"），后面不能接 to（"close to 620" 是邻近副词）。
+    # "close TSLA here" / "want to close half" 不受影响；closed/closing 语义不变。
+    r"\b(closed"
+    r"|(?<!the\s)(?<!at\s)(?<!into\s)(?<!before\s)(?<!near\s)(?<!after\s)close(?!\s+to\b)"
+    r"|sold|exit|stopped|trim(?:med|ming)?|out of|scaling\s+out)\b"
     # "all out" 从 WEAK 提级（7/15："all out SPY -11% not adding" 里的
     # "adding" 命中 OPEN_INTENT 把 WEAK close 一票否决 → 误判 OPEN，
     # 靠 ZH 孪生"全部平仓"才兜住检测）。"going all out" 是开仓情绪，排除。

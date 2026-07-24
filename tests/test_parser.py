@@ -91,10 +91,12 @@ def test_detect_action_open_not_falsely_matched():
     # 边缘：含 "close" 字符串但显然是开仓文本
     assert detect_action("MSFT 390c 7/6 small @ 2.30") == "OPEN"
     assert detect_action("Adding $APLD 50c weeklies @ .98") == "OPEN"
-    assert detect_action("$SPY $748 calls @ $2.40 close to breakout") == "CLOSE"
-    # ^ 这条其实含 "close" 单词，会被匹配（严格 word-boundary 也覆盖）—— 允许假阳
-    #   因为运行时 close_parser 会二次校验（找不到 action verb + open_symbols 就 return None）
-    # OPEN 信号 KC 从不用 "close to breakout" 这种含 close 的表达，实测不会遇到
+    assert detect_action("$SPY $748 calls @ $2.40 close to breakout") == "OPEN"
+    # ^ [7/24 patch] 原钉死为 CLOSE(允许假阳,注释称"KC 从不用这种表达")——
+    #   7/24 "META ... into the close for fun" 实锤该假设在类级别上不成立,
+    #   一个可解析的开仓信号被误路由丢失。STRONG_CLOSE_RE 现对裸名词 close
+    #   加边界(the/at/into/before/near/after 前置、"close to" 后置都不算动词),
+    #   此文本按其本义路由 OPEN;真动词用法见 test_overnight_0724。
 
 
 def test_tag_day_trade_variants():

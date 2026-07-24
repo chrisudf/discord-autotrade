@@ -21,7 +21,12 @@ import re as _re
 # ticker 同时接受 $ 前缀和裸大写（parser 的 Pattern A 本身就是裸 ticker 语法，
 # 只认 $ 会把 "TSLA 250c 7/11 @ 1.20 好像没接住" 这类真漏检静默掉）。
 # 裸大写词（BANG/OK 等）会带来一点过报，但这只是 TG 告警闸门，宁多勿漏。
-_OPEN_TICKER_RE = _re.compile(r"\$[A-Z]{1,5}\b|\b[A-Z]{2,5}\b")
+# 7/24 实锤:ZH 机翻 "买入META 620看涨期权" 里 ticker 紧贴汉字,\b 不触发
+# (CJK 也是 \w)——裸 ticker 边界改用显式 alnum lookaround,
+# 与 _twin_of_recent_exec / close_parser.BARE_SYM_PATTERN_ZH 同款做法。
+_OPEN_TICKER_RE = _re.compile(
+    r"\$[A-Z]{1,5}\b|(?<![A-Za-z0-9])[A-Z]{2,5}(?![A-Za-z0-9])"
+)
 # ZH 方向词不带 \b（汉字间无 word boundary）。parser 已归一化 看涨/看跌期权，
 # 这里兜的是 parser 因**其他**原因失败的 ZH 信号——有方向词就该报
 # "looks like signal"，而不是掉进 sized-entry 的"无 C/P 方向"（7/14 HOOD 误报）
@@ -32,7 +37,13 @@ _OPEN_SIDE_RE = _re.compile(
 _OPEN_PRICE_RE = _re.compile(
     r"\$\.?\d+(?:\.\d+)?"
     r"|@\s*\$?\.?\d+(?:\.\d+)?"
-    r"|\.?\d+(?:\.\d+)?\s*fill(?:ed)?",
+    r"|\.?\d+(?:\.\d+)?\s*fill(?:ed)?"
+    # 7/24 实锤：ZH 机翻把 "@ 4.80" 写成 "价格4.80"（META 620看涨期权,4天到期,
+    # 价格4.80）——三件套里价格这件不认，ZH 独失败时连 looks-like-signal 的
+    # 大声告警都没有。补 价格N / N美元 两种机翻形态；仍受三件套整体门控，
+    # 不会放大闲聊误报。
+    r"|价格\s*\$?\.?\d+(?:\.\d+)?"
+    r"|\.?\d+(?:\.\d+)?\s*美元",
     _re.I,
 )
 
