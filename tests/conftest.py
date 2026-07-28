@@ -60,3 +60,13 @@ def _clear_runner_preserve_throttle():
     dedup._runner_preserve_alerted.clear()
     yield
     dedup._runner_preserve_alerted.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_envcfg_warned():
+    # envcfg 的"同一坏值只告警一次"去重集同样是模块级——断言 warning 的测试
+    # 会被先跑的测试压掉（同 _clear_runner_preserve_throttle 的坑）
+    from autotrade.utils import envcfg
+    envcfg._warned.clear()
+    yield
+    envcfg._warned.clear()

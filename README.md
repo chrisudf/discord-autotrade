@@ -91,7 +91,7 @@ autotrade/
 │   └── messages.py       全部消息模板(纯函数)
 ├── ops/                  只读运维:python -m autotrade.ops.show_today 等
 └── diag/                 活体诊断(会碰真服务,永不被 pytest 收集)
-tests/                    327 个回归测试,几乎每条对应一次真实事故的行为规格
+tests/                    425 个回归测试,几乎每条对应一次真实事故的行为规格
 ```
 
 ## 快速开始
@@ -128,7 +128,7 @@ make test                                  # 默认排除 integration 标记
 .venv311/bin/python -m pytest tests/ -q -m integration   # 需要真实服务的交互测试
 ```
 
-当前套件:329 passed / 1 skipped / 1 xfailed(xfail 为显式锁定的已知解析缺口)。
+当前套件:412 passed / 1 skipped / 1 xfailed(xfail 为显式锁定的已知解析缺口)。
 测试即规格:dedup 窗口、频道隔离、strike 过滤、runner-preserve、配额退避等
 每条防线都有对应的回归测试钉死。
 

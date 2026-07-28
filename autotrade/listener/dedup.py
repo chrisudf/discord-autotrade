@@ -11,9 +11,10 @@
 查重语义（查即登记原子性、CLOSE 零成交回滚）自老模块逐字保留；
 各查重函数原有的内联"惰性清过期 + 硬上限"提取为共享 _sweep_expired()（语义等价）。
 """
-import os
 from collections import deque
 from datetime import datetime, timedelta, timezone
+
+from autotrade.utils.envcfg import env_int
 
 
 def _sweep_expired(reg: dict, now, window, cap=None):
@@ -239,8 +240,9 @@ def runner_preserve_should_alert(pos_label: str, now: "datetime | None" = None) 
     pos_label 用 close_flow 拼的 "SYM strikeC/P" 展示串做 key——
     与 TG 文案同粒度，同一合约不同 pct 的重复提醒一并压掉。
     """
+    # minimum=0 而非 1:0 是合法配置(不节流,每次都提醒)。
     window = timedelta(
-        seconds=int(os.getenv("RUNNER_PRESERVE_ALERT_WINDOW_SEC", "3600"))
+        seconds=env_int("RUNNER_PRESERVE_ALERT_WINDOW_SEC", 3600, minimum=0)
     )
     if now is None:
         now = datetime.now(timezone.utc)

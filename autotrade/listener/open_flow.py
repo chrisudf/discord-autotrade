@@ -8,7 +8,6 @@ record_order → _record_recent_exec → position_mgr.on_order_filled →
 fill_checker.spawn → 成交通知 + 延迟统计。
 """
 import asyncio
-import os
 from datetime import datetime, timezone
 
 from autotrade.broker.trade import place_order
@@ -44,6 +43,7 @@ from autotrade.position import fill_checker
 from autotrade.position import manager as position_mgr
 from autotrade.risk import check_order, record_order
 from autotrade.storage.logger_db import log_order
+from autotrade.utils.envcfg import env_float
 from autotrade.utils.logger import logger
 
 # OPEN 链路串行锁：check_order → place_order → record_order 必须原子，
@@ -152,7 +152,9 @@ async def process_open(message, raw, cfg, cid, t0, msg_date_et):
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
         age_sec = (datetime.now(timezone.utc) - created).total_seconds()
-        max_age = float(os.getenv("OPEN_SIGNAL_MAX_AGE_SEC", "300"))
+        # 坏值退默认而不是抛:这行在每条消息的处理路径上,ValueError 会一路
+        # 冒到 router 兜底,表现为**所有 OPEN 被静默丢掉**——闸门反成断路器。
+        max_age = env_float("OPEN_SIGNAL_MAX_AGE_SEC", 300.0, minimum=1.0)
         if age_sec > max_age:
             logger.warning(
                 f"[age-guard] OPEN 信号已 {age_sec:.0f}s(> {max_age:.0f}s 上限),"

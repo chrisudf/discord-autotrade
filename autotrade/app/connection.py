@@ -9,7 +9,6 @@ Discord 连接健康(scripts/run_listener.py 229-429 逐字搬运):
 tests 以 `import autotrade.app.connection as rl` 使用。
 """
 import asyncio
-import os
 from datetime import datetime, timedelta, timezone
 
 from loguru import logger
@@ -20,6 +19,7 @@ from autotrade.config.channel_loader import registry
 from autotrade.listener.router import handle_message
 from autotrade.notify.transport import send_telegram
 from autotrade.storage.logger_db import processed_msg_ids_since
+from autotrade.utils.envcfg import env_int
 
 # 唯一 discord.Client 由 app.main 创建后注入;import 时保持 None。
 client = None
@@ -306,7 +306,9 @@ async def _backfill_missed():
         return
     # 往前多看 30s 安全余量：宁可多喂（去重挡住）也不漏边界消息
     after = since - timedelta(seconds=30)
-    limit = int(os.getenv("BACKFILL_HISTORY_LIMIT", str(_BACKFILL_LIMIT_DEFAULT)))
+    # minimum=1:limit<=0 传给 history() 会拉回空列表,而下面 len(msgs) >= limit
+    # 恒真 → 每次都判"不完整"保留锚点,回补看似在跑实则一条不喂,静默丢整段。
+    limit = env_int("BACKFILL_HISTORY_LIMIT", _BACKFILL_LIMIT_DEFAULT, minimum=1)
 
     # 跨进程去重水位线:重启后 _seen 是空的,若不查库,startup_backfill 会把
     # 上一次运行已经执行过的 trim 再执行一遍(CLOSE 无年龄闸门)。
