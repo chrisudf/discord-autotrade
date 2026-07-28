@@ -536,6 +536,69 @@ Two hidden failures fell out of this:
 
 ---
 
+## 17. `channel.history(limit=N, after=X, oldest_first=True)` truncates the **newest** messages, not the oldest
+
+**Symptom**: Found during review of the 7/28 backfill patch, before it ever
+ran overnight. A 60-minute startup backfill on an active channel replayed
+messages 1..50 of a 60-message window and silently dropped 51-60 — i.e.
+exactly the most recent, most actionable calls. The code looked correct and
+even logged "hit the 50 limit" — but the warning names the wrong casualty.
+
+**Why non-obvious**:
+- `limit` reads like "cap the work", not "choose which half of the window
+  to throw away". Which half you lose is decided by `oldest_first`, a
+  parameter that looks purely cosmetic (display order).
+- discord.py's docs describe `oldest_first` as ordering, not as retention.
+  The mechanism is in `abc.py`: `reverse = oldest_first` selects
+  `_after_strategy`, which pages *forward* from `after` and stops once
+  `limit` is consumed — so the tail of the window is never fetched.
+- For a chat log the intuition is "limit trims history"; here the window is
+  anchored in the past, so limit trims the *present*.
+- Our own test fake ignored both `limit` and `oldest_first`, so the test
+  suite could never have caught it.
+
+**Defense**: [autotrade/app/connection.py](../autotrade/app/connection.py)
+`_backfill_missed()` fetches with `oldest_first=False` (newest first) into a
+list, then replays `reversed(...)` for chronological order — truncation now
+drops the oldest. discord.py's `after` predicate breaks out as soon as it
+pages past the anchor, so this does not walk the whole channel history.
+Limit raised 50 → 200 (`BACKFILL_HISTORY_LIMIT`). `_FakeChannel` in
+`tests/test_backfill.py` now honors both parameters.
+
+---
+
+## 18. `time.monotonic()` does not advance while macOS sleeps — every monotonic-based window silently stretches
+
+**Symptom**: 7/27 overnight the churn detector reported "5 disconnects in
+last 30min" at 01:55 and "32 in last 30min" at 09:09 — both were the
+*running total for the whole night*, not a 30-minute count. The rolling
+window never evicted anything because its clock barely moved.
+
+**Why non-obvious**:
+- `monotonic()` is the textbook-correct choice for measuring intervals
+  (immune to NTP steps and DST) — it's what you reach for precisely to
+  avoid clock bugs. That it also freezes across system sleep is a
+  platform detail (`mach_absolute_time` on Darwin) that the "always use
+  monotonic for durations" advice never mentions.
+- The distortion is *silent and inverted*: the counter looks alarmingly
+  high while the window is the thing that's broken. Easy to read the
+  number as "the network got much worse" and chase the wrong layer.
+- It bites windows in proportion to their length: the 60s storm window is
+  effectively unaffected, the 30min churn window is destroyed. So a
+  detector can be "half broken" with no obvious pattern.
+- Same freeze applies to `asyncio.sleep()` (loop clock is monotonic), which
+  is *why* wall-clock heartbeat gap detection works at all.
+
+**Defense**: churn accounting in
+[autotrade/app/connection.py](../autotrade/app/connection.py) switched to
+`time.time()` (wall clock) for both the window and the notify cooldown;
+storm (60s) stays on monotonic deliberately. The same insight is used
+constructively by `run_alive_heartbeat()`: a wall-clock beat every 15s whose
+gap > 90s *is* the sleep signal, used to rewind the backfill anchor over the
+sleep period. Root cause is environmental — `caffeinate -is make run`.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -849,6 +912,10 @@ python -m autotrade.diag.diag_handle_message_real
 | 14 | ITM 长仓到期自动行权、本地 DB 变陈旧 | 过期清扫：`test_positions.py::test_sweep_expired_marks_and_excludes`、`::test_sweep_expired_keeps_today_and_future`、`::test_sweep_expired_idempotent`；EOD 强平窗口：`test_watchers.py::test_eod_*`；对账工具：`ops/sync_positions`（手动/开盘前跑） |
 | 15 | 卖没持有的期权 = 开裸空 | 无单测（`place_sell_order` 在测试里始终被 mock，`_get_long_qty` 需真实 ctx）。防御：`broker/trade.py::place_sell_order` 提交前查 `_get_long_qty`，不足即拒单 |
 | 16 | 全量 re-login 不回放漏掉的消息 | `test_backfill.py::test_backfill_replays_missed`、`::test_backfill_idempotent_against_already_seen`、`::test_backfill_noop_without_disconnect_wall`、`::test_backfill_consumes_wall_timestamp` |
+| 17 | history 的 limit 截断掉的是**最新**几条 | `test_overnight_0728.py::test_backfill_truncation_drops_oldest_not_newest`；`test_backfill.py::_FakeChannel` 现按真实语义模拟 `oldest_first`/`limit` |
+| 18 | monotonic 在系统睡眠中不走 | `test_overnight_0728.py::test_churn_counts_wall_clock_window`（挂钟记账）、`::test_alive_gap_pulls_backfill_anchor_and_alerts_once`（反向利用:挂钟心跳跳变=睡眠指纹） |
+| 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
+| OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |
 | 中文 Bug B | skip 与失败语义混淆 | `test_folded_skip_returns_dict.py`（全部 4 个 case） |
 | 中文 Bug C | expiry 用本地日期算 | `test_folded_qcom_replay.py`（历史 msg_ts 回放）；`test_parser.py` 中带 msg_ts 的用例 |
