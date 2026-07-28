@@ -12,6 +12,10 @@ Rules (2026-06):
 import re
 from datetime import date, timedelta
 from autotrade.parsing.holidays import adjust_to_trading_day, is_trading_day
+# out N% 的模式只有一份，定义在 close_parser（"out" 短语词表的所在地），
+# 这里 import 复用：路由与解析必须同进同退。close_parser 只依赖 re/logger，
+# 不反向 import 本模块，无循环风险。
+from autotrade.parsing.close_parser import _OUT_PCT_PATTERN
 from autotrade.utils.logger import logger
 
 
@@ -686,7 +690,13 @@ STRONG_CLOSE_RE = re.compile(
 WEAK_CLOSE_RE = re.compile(
     r"\bclosing\b(?!\s+bell)"          # 'closing bell' 是时间状语不是动作
     r"|\bout\s+(?:half|full|majority)\b"
-    r"|\bselling\b"
+    # 7/25 实测:enrich "$LLY - Out 25% more. Down to runners." 双语双发全漏
+    # (裸 out 不在词表)。只认 out 紧跟 N% 的形态;行情解说("knocked out 25%
+    # of the premium")由 _OUT_PCT_PATTERN 自带的 lookbehind 排除。
+    # 路由(这里)与解析(close_parser._OUT_PHRASE_RE)共用同一个常量——
+    # 两边写法漂移就是漏单裂缝。
+    r"|" + _OUT_PCT_PATTERN
+    + r"|\bselling\b"
     r"|\bscaling\s+down\b",
     re.I,
 )

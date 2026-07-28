@@ -83,12 +83,22 @@ def _is_eod_window(now_et: datetime, hour: int, minute: int) -> bool:
 _skip_until: dict[str, float] = {}
 _skip_until_date: date_cls = None  # 跨日清空
 
+# [7/25 事故] no-quote 的 TG 告警节流,与重试**分离**。
+# 原实现把 _skip_until 同时当"防 TG 刷屏"和"防重试"用(no-quote 一次就
+# backoff 1800s)——7/24 AVGO 415C 到期日:15:50-15:55 窗口被僵尸连接吃掉,
+# 15:55 首试 no-quote 后下次重试排到 16:25,早过 16:05 窗口上限,
+# 整个到期日强平只有一次机会,仓位直接过期。
+# 现在:no-quote 每个 tick(30s)都重试(临近收盘迟到的报价还能接住),
+# 只有 TG 按 30min/code 节流。broker 异常/拒单仍走 60s _skip_until。
+_alerted_until: dict[str, float] = {}
+
 
 def _gc_skip(today_et: date_cls):
-    """跨日清空 skip set，避免昨天的失败影响今天。"""
+    """跨日清空 skip/alert set，避免昨天的失败影响今天。"""
     global _skip_until_date, _skip_until
     if _skip_until_date != today_et:
         _skip_until.clear()
+        _alerted_until.clear()
         _skip_until_date = today_et
 
 
@@ -106,20 +116,24 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float):
 
         last = await asyncio.to_thread(get_last_price, code)
         if last is None:
-            # 没 quote 时不挂 entry-based 卖单——0DTE ITM 会被自残卖在远低于真实市价
-            # backoff 30 分钟避免 30s tick 反复刷 TG
-            if _skip_until.get(code, 0) <= ts_now:
-                _skip_until[code] = ts_now + 1800
+            # 没 quote 时不挂 entry-based 卖单——0DTE ITM 会被自残卖在远低于真实市价。
+            # [7/25 事故] 不再进重试 backoff(见 _alerted_until 注释):下个 tick
+            # 继续试,迟到的报价还能接住;只有 TG 按 30min 节流。
+            if _alerted_until.get(code, 0) <= ts_now:
+                _alerted_until[code] = ts_now + 1800
                 logger.warning(
                     f"[eod] no quote for {code}, refusing entry-fallback sell, "
-                    f"manual close required"
+                    f"manual close required (每 tick 重试中,TG 30min 一次)"
                 )
-                await send_telegram(format_error(
+                ok = await send_telegram(format_error(
                     "EOD 强平跳过：无报价",
                     f"{code} qty={qty} entry=${pos['avg_entry_price']:.2f}\n"
                     f"原因：OPRA 不可用，避免 entry × 0.9 自残卖\n"
-                    f"请在 moomoo 手动平仓"
+                    f"收盘前每 30s 继续重试；若一直无报价请在 moomoo 手动平仓"
                 ))
+                # 裸 send_telegram 成功只记 debug,出过"告警到底发没发"说不清的账
+                # (7/24 夜这条告警在日志里完全隐形)——安全关键路径把结果提到 INFO
+                logger.info(f"[eod] no-quote TG {'sent' if ok else 'FAILED'} for {code}")
             return
 
         limit = max(0.01, round(last * (1 - sell_slip), 2))

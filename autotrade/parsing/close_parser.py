@@ -95,10 +95,29 @@ ACTION_VERBS = [
     "lock them", "lock it", "lock in", "lock these", "locking in",
 ]
 
+# "out N%"（7/25 加：enrich "$LLY - Out 25% more."）的**唯一**来源。
+# signal_parser.WEAK_CLOSE_RE 的路由判定 import 这个常量——两处必须逐字一致，
+# 否则会出现"路由成 CLOSE 但 parse_close 返 None"（或反过来）的漏单裂缝，
+# 各写一份字面量迟早漂移。
+#
+# 前缀排除的是行情解说里的 "<动词> out N%"（不是减仓动作）：
+#   "IV crush knocked/knocking out 25% of the premium"  ← 权利金被打掉
+#   "shaking out 20% of weak hands"                     ← 洗盘
+# Python re 的 lookbehind 必须定长，所以每个词形单独写一条。刻意**不**排除
+# 通用的 "-ing + out"：真实减仓句式里 "scaling out 50%" / "taking out 30%"
+# 正是这个形状，一刀切会把真 trim 一起砍掉。
+_OUT_PCT_PATTERN = (
+    r"(?<!knock\s)(?<!knocks\s)(?<!knocked\s)(?<!knocking\s)"
+    r"(?<!shake\s)(?<!shakes\s)(?<!shaken\s)(?<!shook\s)(?<!shaking\s)"
+    r"\bout\s+\d{1,3}\s*%"
+)
+
 # "out" 短语统一走词边界 regex（勿放回 ACTION_VERBS/FULL_CLOSE_VERBS 的
 # substring 匹配——见上方 "overall outlook" 案例）
 _OUT_PHRASE_RE = re.compile(
-    r"\ball\s+out\b|\bout\s+(?:half|full|majority)\b", re.IGNORECASE,
+    r"\ball\s+out\b|\bout\s+(?:half|full|majority)\b"
+    r"|" + _OUT_PCT_PATTERN,
+    re.IGNORECASE,
 )
 _OUT_FULL_CLOSE_RE = re.compile(r"\ball\s+out\b|\bout\s+full\b", re.IGNORECASE)
 

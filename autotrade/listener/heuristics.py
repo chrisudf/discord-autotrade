@@ -99,10 +99,16 @@ _SIZED_ENTRY_SIZE_RE = _re.compile(
 # 中英双发全静默漏掉，后续 +200%）
 _SIZED_ENTRY_DTE_RE = _re.compile(r"\b\d+\s*DTE\b", _re.I)
 _SIZED_ENTRY_DOLLAR_NUM_RE = _re.compile(r"\$\s?\.?\d")
+# 7/25 实锤：enrich 纯 scalp 形态 "$LLY $1215 scalp $1.36" / "$NVDA $212.50
+# scalps off the 9EMA"（ZH 机翻 "头皮"）既无 N% position 也无 NDTE，双语
+# 六连发全程静默。scalp 关键词 + 恰好一个 ticker + ≥1 个 $数字 也算疑似入场
+# （NVDA 形态只有 strike 一个 $数字，≥2 的门槛接不住）。\bscalps?\b 的词边界
+# 天然排除过去式 scalped（recap）。
+_SIZED_ENTRY_SCALP_RE = _re.compile(r"\bscalps?\b|头皮")
 
 
 def _looks_like_sized_entry(text: str) -> "str | None":
-    """检测 enrich 式无方向入场（N% position 或 NDTE 简写）。
+    """检测 enrich 式无方向入场（N% position / NDTE 简写 / scalp 形态）。
     返回命中的 symbol，未命中返回 None。"""
     if not text:
         return None
@@ -110,9 +116,13 @@ def _looks_like_sized_entry(text: str) -> "str | None":
     tickers = {m.group(1) for m in _SIZED_ENTRY_TICKER_RE.finditer(text)}
     if len(tickers) != 1:
         return None
+    dollar_nums = len(_SIZED_ENTRY_DOLLAR_NUM_RE.findall(text))
+    # scalp 形态（7/25）：只要 1 个 $数字（NVDA 形态只有 strike）
+    if _SIZED_ENTRY_SCALP_RE.search(text) and dollar_nums >= 1:
+        return next(iter(tickers))
     if not (_SIZED_ENTRY_SIZE_RE.search(text) or _SIZED_ENTRY_DTE_RE.search(text)):
         return None
-    if len(_SIZED_ENTRY_DOLLAR_NUM_RE.findall(text)) < 2:
+    if dollar_nums < 2:
         return None
     return tickers.pop()
 

@@ -162,8 +162,13 @@ def test_sized_entry_hits_scalp_dte_format():
 
 
 def test_sized_entry_dte_needs_two_dollar_numbers():
-    # "$META scalp $685s" —— 无 DTE 无价格，不值得提醒
-    assert heuristics._looks_like_sized_entry("enrich:\n$META scalp $685s") is None
+    # [7/25 翻转] 原判定 "$META scalp $685s 无 DTE 无价格,不值得提醒"——
+    # 7/25 实锤推翻:enrich "$NVDA $212.50 scalps off the 9EMA" 同为
+    # scalp+单 ticker+1 个 $数字,双语静默漏过一整晚。scalp 形态降为 ≥1 个
+    # $数字即提醒(一条节流 TG 的代价换不漏);无 scalp 词的 NDTE 形态仍要 ≥2。
+    assert heuristics._looks_like_sized_entry("enrich:\n$META scalp $685s") == "META"
+    # NDTE 形态(无 scalp 词)维持 ≥2 门槛:只有一个 $数字不提醒
+    assert heuristics._looks_like_sized_entry("enrich:\n$META 0DTE $685s") is None
 
 
 # ============ 翻译孪生 close 防护（7/15 SPY "smaller size"→"小规模减仓"） ============
