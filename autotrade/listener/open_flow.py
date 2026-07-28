@@ -8,6 +8,7 @@ record_order → _record_recent_exec → position_mgr.on_order_filled →
 fill_checker.spawn → 成交通知 + 延迟统计。
 """
 import asyncio
+import os
 from datetime import datetime, timezone
 
 from autotrade.broker.trade import place_order
@@ -18,6 +19,7 @@ from autotrade.listener.dedup import (
     _is_duplicate_signal,
     _sized_entry_alerted,
     _sweep_expired,
+    stale_open_should_alert,
 )
 from autotrade.listener.heuristics import (
     _TWIN_SUPPRESS_WINDOW,
@@ -132,6 +134,39 @@ async def process_open(message, raw, cfg, cid, t0, msg_date_et):
                 for i, s in enumerate(all_signals)
             )
         )
+
+    # ---- 信号年龄闸门(7/28)----
+    # 睡眠回补/启动回补会重放几分钟~几十分钟前的消息:CLOSE 迟到也该执行
+    # (还持着就想平,走 close_flow 不经此处),OPEN 迟到不能自动追——
+    # 限价锚在陈旧喊价上,价格早走了(追上=没成交,跌破=接飞刀)。
+    # 超龄 OPEN 降级为 TG 告警,人工决定追不追。FakeMessage 无 created_at
+    # → 视为实时,不拦。
+    #
+    # 必须放在指纹去重**之前**:_is_duplicate_signal 是"查即登记",让一条
+    # 陈旧重放先去登记指纹,等于给这个合约上了 5 分钟的静音闸——KC 常在
+    # 几分钟内重喊同一张(NNE 实测 8s 重发),那条**实时**信号会被当成孪生
+    # 静默丢掉。改为先判年龄:陈旧的直接告警返回,不碰指纹表;
+    # 双语孪生的重复告警由 stale_open_should_alert 按 symbol 5min 节流。
+    created = getattr(message, "created_at", None)
+    if created is not None:
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age_sec = (datetime.now(timezone.utc) - created).total_seconds()
+        max_age = float(os.getenv("OPEN_SIGNAL_MAX_AGE_SEC", "300"))
+        if age_sec > max_age:
+            logger.warning(
+                f"[age-guard] OPEN 信号已 {age_sec:.0f}s(> {max_age:.0f}s 上限),"
+                f"不自动下单: {raw[:80]}"
+            )
+            if stale_open_should_alert(signal["symbol"]):
+                await _safe_notify(format_error(
+                    f"错过的开仓信号({age_sec/60:.0f} 分钟前),未自动下单",
+                    f"{signal['symbol']} {signal['strike']}{signal['side'][0]} "
+                    f"{signal.get('expiry', '')} @ {signal.get('price')}\n"
+                    f"来源:回补/晚启动重放,限价会锚在旧喊价上。要跟请手动。\n\n"
+                    f"{raw[:200]}"
+                ))
+            return
 
     # ---- Fingerprint 去重 ----
     # 必须放在 parse 成功之后（要拿 symbol/strike/side/expiry_date 作 key）

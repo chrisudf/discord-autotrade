@@ -215,6 +215,24 @@ _ALERT_THROTTLE_MAX = 200
 _runner_preserve_alerted: dict[str, datetime] = {}
 
 
+# 陈旧 OPEN(回补重放)告警节流：同 symbol 5 分钟内只提醒一次。
+# 语义等同 _sized_entry_alerted，独立一个 registry 是为了不让"没下单的告警"
+# 去顶掉真实入场告警的节流位。
+_stale_open_alerted: dict[str, datetime] = {}
+
+
+def stale_open_should_alert(symbol: str, now: "datetime | None" = None) -> bool:
+    """查即登记：窗口内同 symbol 第二次起返回 False（双语孪生只告警一次）。"""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    _sweep_expired(_stale_open_alerted, now, _ADDON_ALERT_WINDOW,
+                   cap=_ALERT_THROTTLE_MAX)
+    if symbol in _stale_open_alerted:
+        return False
+    _stale_open_alerted[symbol] = now
+    return True
+
+
 def runner_preserve_should_alert(pos_label: str, now: "datetime | None" = None) -> bool:
     """查即登记（同 _is_duplicate_* 的原子语义）：窗口内同仓位第二次起返回 False。
 

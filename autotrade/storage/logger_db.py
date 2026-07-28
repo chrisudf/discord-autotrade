@@ -82,6 +82,24 @@ def log_raw_signal(msg_id, author, content, received_at):
         )
 
 
+def processed_msg_ids_since(since: datetime) -> set:
+    """[7/28] 回补用的**跨进程**去重集合：since 之后已落库的 msg_id。
+
+    dedup._seen() 只活在进程内存里，重启即清零。startup_backfill 会重放最近
+    N 分钟的频道历史——上一次运行**已经执行过**的 CLOSE（trim）会被当成新信号
+    再跑一遍（OPEN 有年龄闸门挡着，CLOSE 按设计不受年龄限制）。
+    raw_signals.msg_id 是 PRIMARY KEY 且在 handler 早期就写，正好当持久化水位线。
+
+    注意 msg_id 列是 TEXT（写入侧 str(msg_id)），比较必须用字符串。
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT msg_id FROM raw_signals WHERE received_at >= ?",
+            (_utc_iso(since),),
+        ).fetchall()
+    return {r[0] for r in rows}
+
+
 def log_order(msg_id, signal, result):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
