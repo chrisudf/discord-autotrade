@@ -14,6 +14,8 @@
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
+from autotrade.utils.envcfg import env_int
+
 
 def _sweep_expired(reg: dict, now, window, cap=None):
     """共享惰性 GC：清过期项；cap 给定时做硬上限保护（丢最老，恰好一个）。
@@ -205,3 +207,47 @@ _sized_entry_alerted: dict[str, datetime] = {}
 # 老版只写不清，长期运行 symbol 键会无限累积。open_flow 在读写前调
 # _sweep_expired(reg, now, _ADDON_ALERT_WINDOW, cap=_ALERT_THROTTLE_MAX)。
 _ALERT_THROTTLE_MAX = 200
+
+# runner-preserve 通知节流：同一仓位的"跳过 trim"TG 在窗口内只发一次。
+# 7/23 实测：AVGO 415c 单张仓一夜 6 条一模一样的 runner-preserve TG——
+# KC 每次喊 trim（02:00/02:18/02:34/03:12/03:19/03:51/05:06）都触发一条。
+# 跳过动作本身每次照常执行并留 log；这里只压 TG 重复。
+# 窗口 RUNNER_PRESERVE_ALERT_WINDOW_SEC（默认 3600s，per-call 读，改 .env 重启生效）。
+_runner_preserve_alerted: dict[str, datetime] = {}
+
+
+# 陈旧 OPEN(回补重放)告警节流：同 symbol 5 分钟内只提醒一次。
+# 语义等同 _sized_entry_alerted，独立一个 registry 是为了不让"没下单的告警"
+# 去顶掉真实入场告警的节流位。
+_stale_open_alerted: dict[str, datetime] = {}
+
+
+def stale_open_should_alert(symbol: str, now: "datetime | None" = None) -> bool:
+    """查即登记：窗口内同 symbol 第二次起返回 False（双语孪生只告警一次）。"""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    _sweep_expired(_stale_open_alerted, now, _ADDON_ALERT_WINDOW,
+                   cap=_ALERT_THROTTLE_MAX)
+    if symbol in _stale_open_alerted:
+        return False
+    _stale_open_alerted[symbol] = now
+    return True
+
+
+def runner_preserve_should_alert(pos_label: str, now: "datetime | None" = None) -> bool:
+    """查即登记（同 _is_duplicate_* 的原子语义）：窗口内同仓位第二次起返回 False。
+
+    pos_label 用 close_flow 拼的 "SYM strikeC/P" 展示串做 key——
+    与 TG 文案同粒度，同一合约不同 pct 的重复提醒一并压掉。
+    """
+    # minimum=0 而非 1:0 是合法配置(不节流,每次都提醒)。
+    window = timedelta(
+        seconds=env_int("RUNNER_PRESERVE_ALERT_WINDOW_SEC", 3600, minimum=0)
+    )
+    if now is None:
+        now = datetime.now(timezone.utc)
+    _sweep_expired(_runner_preserve_alerted, now, window, cap=_ALERT_THROTTLE_MAX)
+    if pos_label in _runner_preserve_alerted:
+        return False
+    _runner_preserve_alerted[pos_label] = now
+    return True

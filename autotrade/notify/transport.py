@@ -235,3 +235,22 @@ async def _safe_notify(msg: str):
             logger.warning(f"[notify] TG send returned False: {head}")
     except Exception as e:
         logger.error(f"[notify] TG raised: {type(e).__name__}: {e} (msg head: {head})")
+
+
+# [7/23] 后台通知：给"不该阻塞交易路径"的消息用（目前：开仓前的解析成功预警）。
+# 7/22 夜实测：NBIS 信号→挂单 1944ms / AVGO 1609ms，其中 ~1.2s 是同步等预警 TG
+# 的 round-trip——对快速拉升的合约就是纯滑点成本。
+# 强引用 set + done_callback（同 fill_checker.spawn 的教训：裸 create_task
+# 只有弱引用，GC 可能吃掉未完成的发送任务）。
+_bg_tasks: set = set()
+
+
+def notify_bg(msg: str) -> None:
+    """fire-and-forget 版 _safe_notify。必须在 event loop 内调用。
+
+    语义与 await _safe_notify(msg) 相同（永不抛、成败留 log），
+    仅不阻塞调用方；消息可能晚于后续同步通知到达（如"下单成功"）。
+    """
+    task = asyncio.create_task(_safe_notify(msg))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)

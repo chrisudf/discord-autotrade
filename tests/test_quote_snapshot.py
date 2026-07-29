@@ -273,8 +273,24 @@ def test_probe_quote_access_no_permission(monkeypatch):
 
 
 def test_probe_quote_access_delayed(monkeypatch):
-    """update_time > 15 分钟旧 → DELAYED"""
+    """盘中 update_time > 15 分钟旧 → DELAYED。
+
+    [7/23] 新鲜度判定改为时段感知（盘外无法区分实时/延迟，不再误报——
+    7/22 22:30 AEST 启动即误报 82813s 的实测修复），本测试原来隐式依赖
+    "跑测试时恰好是盘中"，现把 now 钉死在交易日 10:00 ET，两个时段跑都稳定。
+    盘外分支的行为由 test_overnight_0723 的 _freshness_verdict 系列覆盖。
+    """
     import pandas as pd
+    from datetime import datetime as _real_dt
+    from zoneinfo import ZoneInfo as _ZI
+
+    class _FakeDT(_real_dt):
+        @classmethod
+        def now(cls, tz=None):
+            fixed = _real_dt(2026, 7, 22, 10, 0, tzinfo=_ZI("America/New_York"))
+            return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+
+    monkeypatch.setattr(bc, "datetime", _FakeDT)
     delayed_row = _make_snapshot_row(
         "US.SPY260710C600000", 5.0, update_offset_s=-1200,  # 20 分钟前
     )
@@ -292,6 +308,37 @@ def test_probe_quote_access_chain_fail(monkeypatch):
     monkeypatch.setattr(bc, "_get_quote_ctx", lambda: _mock_ctx_for_probe(chain_ok=False))
     status, _ = bc.probe_quote_access()
     assert status == bc.QUOTE_ERROR
+
+
+def test_probe_samples_atm_call_contract(monkeypatch):
+    """[7/23] 探测样本必须取"最接近现价的 CALL 档"而非 iloc[0]（链首=最低
+    行权价的深度实值死档，update_time 停在几小时前 → 盘中误报 stale）。
+    mock 链用 calls-then-puts 分组排列——链中间行会落在 call/put 边界的
+    深虚值档，恰好验证取样不依赖行序假设。SPY mock 现价 600 → 必须选 C600。"""
+    import pandas as pd
+
+    ctx = _mock_ctx_for_probe()
+    strikes = (560, 580, 600, 620, 640)
+    rows = [
+        {"code": f"US.SPY260710C{k}000", "strike_price": float(k), "option_type": "CALL"}
+        for k in strikes
+    ] + [
+        {"code": f"US.SPY260710P{k}000", "strike_price": float(k), "option_type": "PUT"}
+        for k in strikes
+    ]
+    ctx.get_option_chain.return_value = (bc.RET_OK, pd.DataFrame(rows))
+    sampled = []
+    orig_dispatch = ctx.get_market_snapshot.side_effect
+
+    def recording_dispatch(req):
+        if req != ["US.SPY"]:
+            sampled.append(req[0])
+        return orig_dispatch(req)
+
+    ctx.get_market_snapshot.side_effect = recording_dispatch
+    monkeypatch.setattr(bc, "_get_quote_ctx", lambda: ctx)
+    bc.probe_quote_access()
+    assert sampled == ["US.SPY260710C600000"]  # spot=600 → 最近的 CALL 档
 
 
 def test_probe_quote_access_chain_no_permission_routes_to_no_perm(monkeypatch):

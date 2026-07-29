@@ -8,6 +8,7 @@ Discord 连接健康(scripts/run_listener.py 229-429 逐字搬运):
 只是普通 async 函数,由 app.main 注册到唯一 discord.Client 上。
 tests 以 `import autotrade.app.connection as rl` 使用。
 """
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from loguru import logger
@@ -17,6 +18,8 @@ from autotrade.config.channel_loader import registry
 # `handle_message` 全局调用,tests(test_backfill)才能 monkeypatch 它。
 from autotrade.listener.router import handle_message
 from autotrade.notify.transport import send_telegram
+from autotrade.storage.logger_db import processed_msg_ids_since
+from autotrade.utils.envcfg import env_int
 
 # 唯一 discord.Client 由 app.main 创建后注入;import 时保持 None。
 client = None
@@ -156,13 +159,18 @@ async def on_disconnect():
                 logger.warning(f"storm TG notify failed: {e}")
 
     # 慢性 churn 检测：30min 窗口里累计 >= 5 次 → TG 告警一次
-    _churn_disconnects.append(now)
-    churn_cutoff = now - _CHURN_WINDOW_SEC
+    # [7/28] churn 记账改用**挂钟**：monotonic 在系统睡眠中不走（macOS），
+    # 整夜睡眠+dark-wake 时 "30min 窗口" 实际横跨 8 小时——7/27 夜收盘时
+    # 报 "32 disconnects in last 30min"，32 是整夜累计。storm（60s 短窗）
+    # 保持 monotonic 不受影响。cooldown 同步改挂钟基准。
+    now_wall = _time.time()
+    _churn_disconnects.append(now_wall)
+    churn_cutoff = now_wall - _CHURN_WINDOW_SEC
     while _churn_disconnects and _churn_disconnects[0] < churn_cutoff:
         _churn_disconnects.pop(0)
     if len(_churn_disconnects) >= _CHURN_THRESHOLD:
-        if now - _churn_notified_at >= _CHURN_NOTIFY_COOLDOWN_SEC:
-            _churn_notified_at = now
+        if now_wall - _churn_notified_at >= _CHURN_NOTIFY_COOLDOWN_SEC:
+            _churn_notified_at = now_wall
             n = len(_churn_disconnects)
             logger.error(
                 f"🌀 Discord churn: {n} disconnects in last "
@@ -179,36 +187,192 @@ async def on_disconnect():
                 logger.warning(f"churn TG notify failed: {e}")
 
 
+# ============================================================
+# [7/28 事故] 睡眠/挂起检测(alive heartbeat)
+# ============================================================
+# 四夜"16-20 分钟节拍器式掉线"的真相是 **macOS 系统睡眠**(dark-wake 周期):
+# 睡眠期间 gateway 死、watcher 停摆;醒来才检测到断线,而回补锚
+# (_last_disconnect_wall)记在"检测到断线"= 醒来那刻往前 30s——
+# **整段睡眠期的消息落在回补窗口之外,静默丢失**(7/27 夜 00:48-09:07
+# 两个频道"零消息"多半就是这么丢的)。monotonic 时钟同样在睡眠中不走,
+# churn 计数因此失真(已改挂钟,见 on_disconnect)。
+#
+# 心跳任务每 15s 记一次挂钟;两拍间隔 > 90s ⇒ 刚经历睡眠/挂起:
+#   1) 把回补锚回拨到跳变前最后一拍(覆盖整段睡眠期);
+#   2) client 就绪则立即回补(否则留给重登录后的 on_ready 回补);
+#   3) TG 告警(1h 节流):睡眠期间保护缺位,必须让人知道。
+# 治本还是别让 Mac 睡:caffeinate -is make run。
+_ALIVE_BEAT_SEC = 15.0
+_ALIVE_GAP_SEC = 90.0
+_SLEEP_ALERT_COOLDOWN_SEC = 3600.0
+_last_alive_wall: "datetime | None" = None
+_sleep_alerted_wall: "datetime | None" = None
+
+
+async def _on_alive_gap(prev: datetime, now: datetime):
+    """心跳断档处理。prev=跳变前最后一拍,now=当前。可单测。"""
+    global _last_disconnect_wall, _sleep_alerted_wall
+    gap = (now - prev).total_seconds()
+    logger.error(
+        f"😴 [alive] 挂钟跳变 {gap:.0f}s(系统睡眠/进程挂起)——"
+        f"期间 watcher 停摆、消息未接收;回补锚回拨至 {prev.isoformat()}"
+    )
+    # 回补锚取更早者:睡眠可能横跨多次断线检测
+    if _last_disconnect_wall is None or _last_disconnect_wall > prev:
+        _last_disconnect_wall = prev
+    # client 就绪才立即回补;未就绪(醒来还在重连)则保留锚,
+    # 重登录后的 on_ready → _backfill_missed 会消费它
+    if client is not None and getattr(client, "is_ready", lambda: False)():
+        try:
+            await _backfill_missed()
+        except Exception:
+            logger.exception("[alive] gap 回补失败(重登录后仍会重试)")
+    if (_sleep_alerted_wall is None
+            or (now - _sleep_alerted_wall).total_seconds() >= _SLEEP_ALERT_COOLDOWN_SEC):
+        _sleep_alerted_wall = now
+        try:
+            await send_telegram(
+                f"😴 检测到系统睡眠/挂起 {gap/60:.0f} 分钟。\n"
+                f"睡眠期间 SL/TP/EOD watcher 停摆、Discord 消息不接收，"
+                f"已尝试回补漏掉的消息。\n"
+                f"跑 bot 请用 `caffeinate -is make run` 防止 Mac 入睡。",
+                parse_mode=None,
+            )
+        except Exception as e:
+            logger.warning(f"[alive] sleep TG notify failed: {e}")
+
+
+async def run_alive_heartbeat():
+    """后台心跳循环,由 app.main 作为常驻 task 启动(与 watcher 同级强引用)。"""
+    global _last_alive_wall
+    _last_alive_wall = datetime.now(timezone.utc)
+    logger.info(f"[alive] heartbeat started: beat={_ALIVE_BEAT_SEC:.0f}s gap>{_ALIVE_GAP_SEC:.0f}s 判睡眠")
+    while True:
+        try:
+            await asyncio.sleep(_ALIVE_BEAT_SEC)
+            now = datetime.now(timezone.utc)
+            prev = _last_alive_wall
+            _last_alive_wall = now
+            if prev is not None and (now - prev).total_seconds() > _ALIVE_GAP_SEC:
+                await _on_alive_gap(prev, now)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[alive] heartbeat tick error (continuing)")
+
+
+async def startup_backfill(minutes: int):
+    """[7/28] 启动回补:script 晚启动期间(实测晚 50 分钟)的消息一条收不到,
+    也没有任何机制找回。minutes>0 时把回补锚拨到 now-N 分钟,复用重登录
+    回补管线。陈旧 OPEN 由 open_flow 的信号年龄闸门降级为告警(不追高),
+    CLOSE 照常执行(还持着就该平)——迟到的平仓好过不平。"""
+    global _last_disconnect_wall
+    if minutes <= 0:
+        return
+    anchor = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    if _last_disconnect_wall is None or _last_disconnect_wall > anchor:
+        _last_disconnect_wall = anchor
+    logger.info(f"[backfill] 启动回补:重放最近 {minutes} 分钟的频道历史")
+    await _backfill_missed()
+
+
+# 每频道每次回补最多拉多少条。50 太小:睡眠/晚启动的窗口能到几十分钟,
+# 活跃频道轻松超过(0008 原版只是告警,消息照丢)。
+_BACKFILL_LIMIT_DEFAULT = 200
+
+
 async def _backfill_missed():
     """完整重登录后回补掉线窗口内漏掉的消息。
 
     on_resumed 会重放 gateway 事件，但 on_ready（完整 re-IDENTIFY）不会——
     session 已丢，那段时间 KC 发的信号 on_message 根本收不到（7/20 实锤）。
-    这里按 _last_disconnect_wall 拉各监听频道的历史重新喂给 handle_message；
-    handle_message 顶部的 _seen(msg_id) 去重保证重放幂等，不会重复下单。
+    这里按 _last_disconnect_wall 拉各监听频道的历史重新喂给 handle_message。
+
+    幂等两层：进程内 _seen(msg_id)，跨进程 raw_signals 水位线(见下方 seen_ids)。
+
+    [7/28 修正] 抓取失败时**不消费锚点**。原版一进函数就把
+    _last_disconnect_wall 置 None,而睡眠刚醒那一刻 gateway 往往还没活过来
+    (_on_alive_gap 判 is_ready() 为真只说明 ready 事件设过,不代表连接还在)——
+    每个频道的 history() 各自抛异常被 except 吞掉,函数正常返回,锚点却已经
+    没了。随后重登录的 on_ready 回补拿到 since=None 直接 return,
+    **整段睡眠期的消息就此静默丢失**——恰好是 0008 要治的那个病。
     """
     global _last_disconnect_wall
     since = _last_disconnect_wall
-    _last_disconnect_wall = None  # 消费掉，避免下次重登录重复回补
     if since is None:
         return
-    # 往前多看 30s 安全余量：宁可多喂（_seen 挡住）也不漏边界消息
+    if client is None:
+        logger.warning("[backfill] client 未注入,保留锚点等下次重试")
+        return
+    # 往前多看 30s 安全余量：宁可多喂（去重挡住）也不漏边界消息
     after = since - timedelta(seconds=30)
+    # minimum=1:limit<=0 传给 history() 会拉回空列表,而下面 len(msgs) >= limit
+    # 恒真 → 每次都判"不完整"保留锚点,回补看似在跑实则一条不喂,静默丢整段。
+    limit = env_int("BACKFILL_HISTORY_LIMIT", _BACKFILL_LIMIT_DEFAULT, minimum=1)
+
+    # 跨进程去重水位线:重启后 _seen 是空的,若不查库,startup_backfill 会把
+    # 上一次运行已经执行过的 trim 再执行一遍(CLOSE 无年龄闸门)。
+    try:
+        seen_ids = processed_msg_ids_since(after)
+    except Exception as e:
+        # 查不到就退回"只有内存去重"——比不回补强,但要留痕
+        logger.warning(f"[backfill] 读 raw_signals 水位线失败,仅靠内存去重: {e}")
+        seen_ids = set()
+
     total = 0
+    skipped = 0
+    incomplete = False
     for cid in registry.enabled_channel_ids():
         ch = client.get_channel(cid)
         if ch is None:
+            # 醒来/重连途中频道缓存还没建好 —— 这次回补不完整,锚点留着
+            logger.warning(f"[backfill] channel {cid} 尚未就绪,保留锚点重试")
+            incomplete = True
             continue
         try:
-            async for m in ch.history(limit=50, after=after, oldest_first=True):
-                total += 1
-                await handle_message(m)
+            # 新→旧拉取,再倒序重放。oldest_first=True + limit 的组合正好拿反:
+            # 窗口内消息超过 limit 时被丢掉的是**最新**那几条(最该跟的那几条)。
+            # 反过来拉,截断掉的是最老的,并且 discord.py 的 after 谓词一过界
+            # 就 break,不会翻整个频道历史。
+            msgs = [
+                m async for m in ch.history(limit=limit, after=after, oldest_first=False)
+            ]
         except Exception as e:
             logger.warning(f"[backfill] history fetch failed for {cid}: {e}")
-    if total:
+            incomplete = True
+            continue
+        if len(msgs) >= limit:
+            incomplete = True
+            logger.warning(
+                f"[backfill] channel {cid} 命中 {limit} 条上限,"
+                f"更早的消息可能仍有遗漏(窗口起点 {after.isoformat()});"
+                f"需要更长窗口请调 BACKFILL_HISTORY_LIMIT"
+            )
+        for m in reversed(msgs):  # 倒回时间正序重放
+            if str(m.id) in seen_ids:
+                skipped += 1
+                continue
+            total += 1
+            await handle_message(m)
+
+    if incomplete:
+        # 锚点不消费:留给下一次 on_ready / 心跳重试。这里不再往前推,
+        # 只保证不比 since 更晚(可能期间又有新的断线把锚点拨得更早)。
+        if _last_disconnect_wall is None or _last_disconnect_wall > since:
+            _last_disconnect_wall = since
+        logger.warning(
+            f"[backfill] 本次回补不完整,保留锚点 {since.isoformat()} 待重试"
+        )
+    elif _last_disconnect_wall == since:
+        # 消费掉，避免下次重登录重复回补。只清"我们刚回补的那个锚":
+        # 回补途中 _on_alive_gap 可能把锚回拨得更早(又睡了一觉),
+        # 那段窗口还没回补过,不能顺手清掉。
+        _last_disconnect_wall = None
+
+    if total or skipped:
         logger.info(
             f"[backfill] replayed {total} message(s) since {after.isoformat()} "
-            f"(_seen dedup 保证幂等)"
+            f"(另跳过 {skipped} 条上次运行已处理的)"
         )
 
 

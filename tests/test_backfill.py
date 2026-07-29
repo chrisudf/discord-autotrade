@@ -19,11 +19,19 @@ from autotrade.listener import dedup as dc
 
 
 class _FakeChannel:
+    """按时间正序(旧→新)持有消息。
+
+    [7/28] history() 现在如实模拟 discord.py 的语义:oldest_first=False 时
+    从**最新**往回给,且 limit 先截断再给。老版本无视这两个参数,恰好掩盖了
+    "oldest_first=True + limit 截断掉的是最新几条"这个真实缺陷。
+    """
+
     def __init__(self, msgs):
         self._msgs = msgs
 
     async def history(self, limit=50, after=None, oldest_first=True):
-        for m in self._msgs:
+        msgs = self._msgs if oldest_first else list(reversed(self._msgs))
+        for m in msgs[:limit]:
             yield m
 
 

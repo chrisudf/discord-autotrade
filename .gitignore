@@ -2,8 +2,16 @@ __pycache__/
 *.pyc
 .venv*/
 .pytest_cache/
+# 凭证文件:用通配覆盖所有变体(.bak / .bak-20260728 / .local / .old …)。
+# 只写精确的 `config/.env` 挡不住备份文件——一次 `git add -A` 就会把
+# DISCORD_USER_TOKEN / MOOMOO_TRD_PWD / TELEGRAM_BOT_TOKEN 推上公开仓库。
+# 末尾的 ! 例外把模板放回来(它不含实值,必须入库)。
 config/.env
+config/.env.*
+!config/.env.example
 config/channels.json
+config/channels.json.*
+!config/channels.json.example
 data/
 logs/
 *.egg-info/

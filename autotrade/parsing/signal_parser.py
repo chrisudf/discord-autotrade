@@ -12,6 +12,10 @@ Rules (2026-06):
 import re
 from datetime import date, timedelta
 from autotrade.parsing.holidays import adjust_to_trading_day, is_trading_day
+# out N% 的模式只有一份，定义在 close_parser（"out" 短语词表的所在地），
+# 这里 import 复用：路由与解析必须同进同退。close_parser 只依赖 re/logger，
+# 不反向 import 本模块，无循环风险。
+from autotrade.parsing.close_parser import _OUT_PCT_PATTERN
 from autotrade.utils.logger import logger
 
 
@@ -656,7 +660,15 @@ def _extract_tags(text: str) -> list:
 #       "out half 3.22 stop at entry" → \bentry\b 命中 "stop at entry"
 #     "at/to entry" 和 "re-enter" 是 KC 高频的止损/复盘用语，不是开仓动作
 STRONG_CLOSE_RE = re.compile(
-    r"\b(closed?|sold|exit|stopped|trim(?:med|ming)?|out of|scaling\s+out)\b"
+    # 7/24 实锤：`closed?` 同时命中裸名词 close——"META 620c 4DTE @ 4.80 little
+    # day trade **into the close** for fun" 被误路由 CLOSE，一个完全可解析的开仓
+    # 信号丢失（只发了条误导性的 "CLOSE 未执行" TG）。裸 close 只在**不是**
+    # 名词/副词用法时才算平仓动词：前面不能是 the/at/into/before/near/after
+    # （"into the close"、"at close"），后面不能接 to（"close to 620" 是邻近副词）。
+    # "close TSLA here" / "want to close half" 不受影响；closed/closing 语义不变。
+    r"\b(closed"
+    r"|(?<!the\s)(?<!at\s)(?<!into\s)(?<!before\s)(?<!near\s)(?<!after\s)close(?!\s+to\b)"
+    r"|sold|exit|stopped|trim(?:med|ming)?|out of|scaling\s+out)\b"
     # "all out" 从 WEAK 提级（7/15："all out SPY -11% not adding" 里的
     # "adding" 命中 OPEN_INTENT 把 WEAK close 一票否决 → 误判 OPEN，
     # 靠 ZH 孪生"全部平仓"才兜住检测）。"going all out" 是开仓情绪，排除。
@@ -666,13 +678,25 @@ STRONG_CLOSE_RE = re.compile(
     # 是 recap，不匹配。
     r"|\block(?:ing)?\s+(?:them\s+|these\s+|it\s+|profits?\s+)?(?:all\s+)?(?:in|on)\b"
     r"|减仓|平仓|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空|减持|缩减至|缩减到|出清"
+    # 7/23 实测：enrich ZH 孪生 "$NBIS - 出半"（EN "Out half"）没进 CLOSE 路由，
+    # 落到 OPEN 解析失败。EN 侧 WEAK_CLOSE_RE 一直认 "out half"，双语不对称。
+    # 两侧边界与 close_parser.ZH_OUT_HALF_RE 保持一致（对抗评审两轮实锤）：
+    # 右边界拦"冲出半年新高"，左边界拦"走出半V型反转"（ASCII 跟随右边界拦不住），
+    # "出半仓" 变体后面允许任意接续（"出半仓于2.45"）。
+    r"|(?<![一-鿿])出半(?:仓|(?![一-鿿]))"
     r"|锁定",
     re.I,
 )
 WEAK_CLOSE_RE = re.compile(
     r"\bclosing\b(?!\s+bell)"          # 'closing bell' 是时间状语不是动作
     r"|\bout\s+(?:half|full|majority)\b"
-    r"|\bselling\b"
+    # 7/25 实测:enrich "$LLY - Out 25% more. Down to runners." 双语双发全漏
+    # (裸 out 不在词表)。只认 out 紧跟 N% 的形态;行情解说("knocked out 25%
+    # of the premium")由 _OUT_PCT_PATTERN 自带的 lookbehind 排除。
+    # 路由(这里)与解析(close_parser._OUT_PHRASE_RE)共用同一个常量——
+    # 两边写法漂移就是漏单裂缝。
+    r"|" + _OUT_PCT_PATTERN
+    + r"|\bselling\b"
     r"|\bscaling\s+down\b",
     re.I,
 )

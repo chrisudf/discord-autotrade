@@ -50,3 +50,23 @@ def _isolate_dbs(monkeypatch, tmp_path):
     risk_manager._init_db()
 
     yield
+
+
+@pytest.fixture(autouse=True)
+def _clear_runner_preserve_throttle():
+    # 7/23 新增的 runner-preserve TG 节流是模块级 dict——不清的话
+    # 先跑的测试会把后跑测试的同名仓位 TG 压掉（顺序相关的假失败）
+    from autotrade.listener import dedup
+    dedup._runner_preserve_alerted.clear()
+    yield
+    dedup._runner_preserve_alerted.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_envcfg_warned():
+    # envcfg 的"同一坏值只告警一次"去重集同样是模块级——断言 warning 的测试
+    # 会被先跑的测试压掉（同 _clear_runner_preserve_throttle 的坑）
+    from autotrade.utils import envcfg
+    envcfg._warned.clear()
+    yield
+    envcfg._warned.clear()

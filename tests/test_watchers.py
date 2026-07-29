@@ -244,7 +244,11 @@ async def test_eod_skips_when_no_quote():
     with patch("autotrade.position.eod_watcher.get_last_price", return_value=None), \
          patch("autotrade.position.eod_watcher.place_sell_order", side_effect=sell_mock), \
          patch("autotrade.position.eod_watcher.send_telegram", new_callable=AsyncMock) as tg, \
-         patch("autotrade.position.eod_watcher._is_eod_window", return_value=True):
+         patch("autotrade.position.eod_watcher._is_eod_window", return_value=True), \
+         patch("autotrade.position.eod_watcher.sweep_expired_and_notify",
+               new_callable=AsyncMock):
+        # ^ [7/25] mock 掉 tick 内的过期清扫:周末跑测试时 walk-back 的
+        #   周五 expiry < 真实 today,仓位会先被扫成 EXPIRED(挂钟依赖假失败)
         await eod_watcher._eod_tick(now_et)
 
     # 关键：没有卖单提交
@@ -270,7 +274,11 @@ async def test_eod_force_closes_matching_expiry():
                return_value={"success": True, "qty": 2, "price": 0.27,
                              "order_id": "EOD_ORD", "code": code}), \
          patch("autotrade.position.eod_watcher.send_telegram", new_callable=AsyncMock), \
-         patch("autotrade.position.eod_watcher._is_eod_window", return_value=True):
+         patch("autotrade.position.eod_watcher._is_eod_window", return_value=True), \
+         patch("autotrade.position.eod_watcher.sweep_expired_and_notify",
+               new_callable=AsyncMock):
+        # ^ [7/25] mock 掉 tick 内的过期清扫:周末跑测试时 walk-back 的
+        #   周五 expiry < 真实 today,仓位会先被扫成 EXPIRED(挂钟依赖假失败)
         await eod_watcher._eod_tick(now_et)
 
     pos = positions_db.get(code)
@@ -301,7 +309,11 @@ async def test_eod_force_closes_weekly_expiring_today():
                return_value={"success": True, "qty": 2, "price": 0.27,
                              "order_id": "EOD_ORD_W", "code": code}), \
          patch("autotrade.position.eod_watcher.send_telegram", new_callable=AsyncMock), \
-         patch("autotrade.position.eod_watcher._is_eod_window", return_value=True):
+         patch("autotrade.position.eod_watcher._is_eod_window", return_value=True), \
+         patch("autotrade.position.eod_watcher.sweep_expired_and_notify",
+               new_callable=AsyncMock):
+        # ^ [7/25] mock 掉 tick 内的过期清扫:周末跑测试时 walk-back 的
+        #   周五 expiry < 真实 today,仓位会先被扫成 EXPIRED(挂钟依赖假失败)
         await eod_watcher._eod_tick(now_et)
 
     pos = positions_db.get(code)
@@ -324,7 +336,11 @@ async def test_eod_skips_future_expiry():
     now_et = datetime(2026, 6, 17, 15, 51, tzinfo=ET_TZ)
     sell_mock = AsyncMock()
     with patch("autotrade.position.eod_watcher.place_sell_order", side_effect=sell_mock), \
-         patch("autotrade.position.eod_watcher._is_eod_window", return_value=True):
+         patch("autotrade.position.eod_watcher._is_eod_window", return_value=True), \
+         patch("autotrade.position.eod_watcher.sweep_expired_and_notify",
+               new_callable=AsyncMock):
+        # ^ [7/25] mock 掉 tick 内的过期清扫:周末跑测试时 walk-back 的
+        #   周五 expiry < 真实 today,仓位会先被扫成 EXPIRED(挂钟依赖假失败)
         await eod_watcher._eod_tick(now_et)
     sell_mock.assert_not_called()
 

@@ -13,8 +13,11 @@ _is_dry_run / _get_quote_ctx / _reset_quote_ctx —— 这些名字必须留在�
 import os
 import threading
 import time
+from datetime import datetime, time as dt_time, timedelta, timezone
 
 from autotrade.utils.logger import logger
+# 仅用于 probe 的盘中/盘外判定（纯数据模块，无反向依赖）
+from autotrade.parsing.holidays import is_trading_day
 from autotrade.broker.common import (
     OPEND_HOST,
     OPEND_PORT,
@@ -282,6 +285,69 @@ QUOTE_NO_PERMISSION = "no_perm"  # 账户没 US MarketOptions 订阅
 QUOTE_ERROR = "error"          # 其它失败（OpenD 连不上 / chain 取不到 / etc.）
 
 
+def _is_rth(now_utc: datetime) -> bool:
+    """当前是否美股常规交易时段（交易日 09:30-16:00 ET）。半日市按整日算。"""
+    now_et = now_utc.astimezone(QUOTE_TZ)
+    return (
+        is_trading_day(now_et.date())
+        and dt_time(9, 30) <= now_et.time() < dt_time(16, 0)
+    )
+
+
+def _last_rth_close_utc(now_utc: datetime) -> datetime:
+    """上一次常规收盘（16:00 ET）的 UTC 时刻。"""
+    now_et = now_utc.astimezone(QUOTE_TZ)
+    d = now_et.date()
+    if not (is_trading_day(d) and now_et.time() >= dt_time(16, 0)):
+        d = d - timedelta(days=1)
+        while not is_trading_day(d):
+            d -= timedelta(days=1)
+    return datetime.combine(d, dt_time(16, 0), tzinfo=QUOTE_TZ).astimezone(timezone.utc)
+
+
+# 盘外容差：半日市提前 3h 收盘（不在假日表里）+ 清淡合约尾盘不更新，
+# 一并吞进 4h。真正的 delayed-tier 只差 15min，盘外本来就无法与实时区分。
+_OFF_HOURS_AGE_SLACK_SEC = 4 * 3600.0
+
+
+def _freshness_verdict(age: float, now_utc: datetime, sample_code: str) -> tuple[str, str]:
+    """探测时段感知的报价新鲜度判定。
+
+    [7/23] 修复盘外误报：22:30 AEST（= ET 盘前 08:30）启动，snapshot 的
+    update_time 停在上一交易日 → age 82813s > 900s → 误报 "delayed-data tier"；
+    当晚 RTH 里 TP watcher 实际拿到实时价（60s 新鲜度过滤全通过）。
+    盘外任何订阅档位的最后报价都停在上次收盘附近，这个时段 age 无法区分
+    实时/延迟——只能做"数据没有比上次收盘更旧"的 sanity check。
+
+    盘中：沿用 age > 900s（delayed tier 典型滞后 15min）判 DELAYED。
+    盘外：age ≤ 距上次收盘时长 + 4h 容差 → OK（标注盘外无法判定）；
+          超出容差 → DELAYED（数据比上个交易时段还旧，多半真有问题）。
+    """
+    if _is_rth(now_utc):
+        if age > 900:  # 15 分钟
+            return QUOTE_DELAYED, (
+                f"OPRA 行情可拿但滞后 {age:.0f}s（疑似 delayed-data tier）。\n"
+                f"  影响：watcher 的 60s 新鲜度过滤会把所有报价当 stale 丢弃 → "
+                f"实际 SL/TP/EOD 仍然 no-op。\n"
+                f"  开通方法：升级到 US MarketOptions Lv1 实时行情。"
+            )
+        return QUOTE_OK, f"OPRA 行情可用 + 实时（sample {sample_code}）"
+
+    closed_gap = (now_utc - _last_rth_close_utc(now_utc)).total_seconds()
+    if age <= closed_gap + _OFF_HOURS_AGE_SLACK_SEC:
+        return QUOTE_OK, (
+            f"OPRA 行情可拿（盘外探测：报价停在上次收盘附近，"
+            f"age {age:.0f}s ≈ 距收盘 {closed_gap:.0f}s，无法区分实时/延迟档位；"
+            f"以盘中 watcher 实际取价为准。sample {sample_code}）"
+        )
+    return QUOTE_DELAYED, (
+        f"OPRA 行情比上一交易时段还旧（age {age:.0f}s，距上次收盘仅 "
+        f"{closed_gap:.0f}s）——不是普通 delayed tier 能解释的，检查订阅/OpenD。\n"
+        f"  影响：watcher 的 60s 新鲜度过滤会把所有报价当 stale 丢弃 → "
+        f"实际 SL/TP/EOD no-op。"
+    )
+
+
 def probe_quote_access() -> tuple[str, str]:
     """探测期权行情订阅状态，决定 SL/TP/EOD watcher 真盘是否能工作。
 
@@ -341,7 +407,26 @@ def probe_quote_access() -> tuple[str, str]:
         return QUOTE_ERROR, f"无法获取 SPY {target} 期权链: {str(chain)[:120]}"
     if chain is None or len(chain) == 0:
         return QUOTE_ERROR, f"SPY {target} 期权链为空（可能无该到期日，换一天试）"
-    sample_code = chain.iloc[0]["code"]
+    # [7/23] 取样改为"最接近 SPY 现价的 CALL 档"：链首行（=最低行权价的深度
+    # 实值死档，几乎无人交易）update_time 停在几小时前，盘中也会被误判 stale
+    # ——7/22 夜 82813s 误报的成因之一（另一半是盘外探测，见 _freshness_verdict）。
+    # 只在 CALL 行里选还顺带消掉了"call/put 行序如何排列"的假设；
+    # 现价/列缺失时退化为链中间行，仍好于链端。
+    spot = None
+    try:
+        spot = float(df.iloc[0]["last_price"])
+    except Exception:
+        pass
+    sample_chain = chain
+    if "option_type" in getattr(chain, "columns", []):
+        calls = chain[chain["option_type"].astype(str).str.upper() == "CALL"]
+        if len(calls):
+            sample_chain = calls
+    if spot and "strike_price" in getattr(sample_chain, "columns", []):
+        idx = (sample_chain["strike_price"].astype(float) - spot).abs().idxmin()
+        sample_code = sample_chain.loc[idx, "code"]
+    else:
+        sample_code = sample_chain.iloc[len(sample_chain) // 2]["code"]
 
     # 4. 对真实期权 code 试 snapshot —— 触发 OPRA 权限检查
     try:
@@ -359,18 +444,12 @@ def probe_quote_access() -> tuple[str, str]:
             )
         return QUOTE_ERROR, f"OPRA snapshot 异常: {str(opt_df)[:200]}"
 
-    # 5. 新鲜度（delayed-data tier 通常滞后 15 分钟）
+    # 5. 新鲜度（时段感知，见 _freshness_verdict：盘中 900s 规则 / 盘外 sanity）
     try:
         update_ts = _quote_epoch(opt_df.iloc[0]["update_time"])
         age = time.time() - update_ts
-        if age > 900:  # 15 分钟
-            return QUOTE_DELAYED, (
-                f"OPRA 行情可拿但滞后 {age:.0f}s（疑似 delayed-data tier）。\n"
-                f"  影响：watcher 的 60s 新鲜度过滤会把所有报价当 stale 丢弃 → "
-                f"实际 SL/TP/EOD 仍然 no-op。\n"
-                f"  开通方法：升级到 US MarketOptions Lv1 实时行情。"
-            )
+        return _freshness_verdict(age, datetime.now(timezone.utc), sample_code)
     except Exception:
         pass  # 拿不到 update_time 时不阻断
 
-    return QUOTE_OK, f"OPRA 行情可用 + 实时（sample {sample_code}）"
+    return QUOTE_OK, f"OPRA 行情可用（update_time 缺失，未做新鲜度判定；sample {sample_code}）"

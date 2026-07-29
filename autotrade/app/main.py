@@ -94,6 +94,13 @@ async def on_ready():
     except Exception as e:
         logger.warning(f"Telegram startup notify failed: {e}")
 
+    # [7/28] 启动回补:晚启动期间的消息找回来(STARTUP_BACKFILL_MIN=0 关闭)。
+    # 陈旧 OPEN 被 open_flow 年龄闸门降级为告警;CLOSE 照常执行。
+    try:
+        await startup_backfill(int(os.getenv("STARTUP_BACKFILL_MIN", "0")))
+    except Exception:
+        logger.exception("startup backfill failed (continuing)")
+
 
 async def on_message(message):
     try:
@@ -174,6 +181,7 @@ async def main():
     global send_telegram, format_error, close_ctx
     global _backfill_missed, _log_reconnect_time
     global _connection_on_disconnect, _connection_on_resumed
+    global startup_backfill
     global discord
 
     # [组合根] .env 只在这里加载一次（load_settings 内部 load_dotenv，
@@ -203,6 +211,8 @@ async def main():
         bind,
         on_disconnect as _connection_on_disconnect,
         on_resumed as _connection_on_resumed,
+        run_alive_heartbeat,
+        startup_backfill,
     )
     from autotrade.app.preflight import preflight
     from autotrade.broker.trade import close_ctx
@@ -252,10 +262,12 @@ async def main():
         asyncio.create_task(run_sl_watcher(), name="sl_watcher"),
         asyncio.create_task(run_eod_watcher(), name="eod_watcher"),
         asyncio.create_task(run_tp_watcher(), name="tp_watcher"),
+        # [7/28] 睡眠/挂起检测心跳(见 connection.run_alive_heartbeat 注释)
+        asyncio.create_task(run_alive_heartbeat(), name="alive_heartbeat"),
     ):
         _watcher_tasks.add(task)
         task.add_done_callback(_watcher_tasks.discard)
-    logger.info("🛡️  watchers started: sl / eod / tp")
+    logger.info("🛡️  watchers started: sl / eod / tp / alive-heartbeat")
 
     try:
         await client.start(token)

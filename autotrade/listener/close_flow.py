@@ -7,7 +7,11 @@
 import asyncio
 
 from autotrade.broker.trade import place_sell_order
-from autotrade.listener.dedup import _is_duplicate_close, _unregister_close_fp
+from autotrade.listener.dedup import (
+    _is_duplicate_close,
+    _unregister_close_fp,
+    runner_preserve_should_alert,
+)
 from autotrade.listener.heuristics import _close_is_open_twin, _looks_like_close_attempt
 from autotrade.notify.messages import (
     format_close_filled,
@@ -269,11 +273,20 @@ async def handle_close_signal(
             any_success = True
 
     if runner_preserved:
-        await _safe_notify(format_close_skipped(
-            f"runner-preserve：{'、'.join(runner_preserved)} 各剩 1 张，"
-            f"跳过 {pct}% trim（策略 A，等 100% 全平信号）",
-            raw,
-        ))
+        # 7/23 降噪：同一仓位窗口期内（默认 1h）只发一次 runner-preserve TG，
+        # 其余只 log——单张仓遇上 KC 连环 trim 时一夜 6 条相同提醒（AVGO 实测）。
+        fresh = [p for p in runner_preserved if runner_preserve_should_alert(p)]
+        if fresh:
+            await _safe_notify(format_close_skipped(
+                f"runner-preserve：{'、'.join(fresh)} 各剩 1 张，"
+                f"跳过 {pct}% trim（策略 A，等 100% 全平信号；窗口期内不重复提醒）",
+                raw,
+            ))
+        else:
+            logger.info(
+                f"[CLOSE] runner-preserve TG throttled "
+                f"(window 内已提醒过): {runner_preserved} pct={pct}"
+            )
 
     if any_broker_failure and not any_success:
         # 指纹已在 _is_duplicate_close 查重时登记（原子，堵双发竞态）。
