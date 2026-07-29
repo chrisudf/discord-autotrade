@@ -619,14 +619,21 @@ def _try_pattern_c(text: str, today: date):
 #   - side 是完整词 calls/puts：ZH 归一化("看涨期权"→" calls ")的产物，
 #     正是 A 系列(要求 strike 紧贴单字符 c/p)接不住的原因
 #   - 要素间窗口 _GAP：容纳全角逗号/空格等机翻标点，但**不允许跨越**句读
-#     （。！？；.!?）、换行、或第二个 ticker(≥2 连续大写字母)。
+#     （。！？；.!?）、换行、或**连续 2+ 个英文字母**（第二个 ticker，以及
+#     "target"/"stop loss" 这类英文限定词都会被它挡住）。
 #     [7/28 对抗评审] 旧版 [^\n]{0,30} 会把 "META 620看涨期权，SPY 4DTE @ 3.15"
 #     拼成 META+SPY 的 4DTE @3.15 混合单——30 字符轻松跨过一整个 ZH 子句
 #     和第二个标的。禁止字符类把窗口锁死在"同一子句、同一 ticker 内"。
-#   - 价格必须是**入场价**语义：负向 lookbehind 排除 目标/止损/目前/现价/当前
-#     等限定词——"目标价格6.00"/"止损价格2.40"/"目前价格6.00" 是评论不是喊单，
-#     旧版当 entry 下单（对抗评审实锤）。裸"价格N"和"@N"才算。
-_GAP = r"(?:[^A-Z\n。！？；.!?]|[A-Z](?![A-Z]))*?"  # 单个大写字母(缩写)允许,连续 2+ 不允许
+#     [7/29 复核] 原写法是 `[^A-Z...]` + re.IGNORECASE，实际语义 **不是**
+#     注释当时写的"≥2 连续大写字母"：Python 里否定字符类叠加 IGNORECASE 会
+#     把小写一并排除（re.match(r'[^A-Z]','a',re.I) is None），所以它挡的是
+#     任何 2+ 连续英文字母。这里改写成 [^A-Za-z...] 显式表达同一行为
+#     （**逐字等价，不改召回**），免得后人"照注释修正"成只挡大写——那会
+#     让 "META 620 calls 4DTE target @ 6.00" 当 entry 下单（实测验证过）。
+#     英文限定词的防线现在有两层：_GAP 的字母墙 + 下面的 _price_qualified。
+#   - 价格必须是**入场价**语义：见 _PRICE_QUALIFIERS / _price_qualified。
+#     "目标价格6.00"/"止损价格2.40"/"目前价格6.00" 是评论不是喊单。
+_GAP = r"(?:[^A-Za-z\n。！？；.!?]|[A-Za-z](?![A-Za-z]))*?"  # 连续 2+ 英文字母不允许
 _PATTERN_D = re.compile(
     r"(?<![A-Za-z$])([A-Z]{1,5})\s+"                        # symbol（禁 $ 前缀：$ 形态归 B/C 管）
     r"(\d+(?:\.\d+)?)\s+"                                   # strike
@@ -636,6 +643,34 @@ _PATTERN_D = re.compile(
     r"|(?<![标损前的现])价格\s*[:：]?\s*\$?\s*(\.?\d+(?:\.\d+)?))",  # 价格4.80（紧邻限定词末字 标/损/前/的/现 → 目标|止损|目前|当前|…的|现 价格，视为评论不下单）
     re.IGNORECASE,
 )
+
+# 价格限定词：出现在价格 token **之前**就说明那个数字不是入场价，是评论。
+# [7/29 对抗测试] `价格` 分支原本只有负向 lookbehind (?<![标损前的现])，
+# **`@` 分支一个防护都没有** —— 实测 "AMD 210看涨期权 4天到期 目标 @ 4.50"
+# 会按 4.50 下单（真实 entry 3.00，溢价 50%），且 4.50 低于
+# MAX_PRICE_PER_CONTRACT 熔断线，风控接不住。EN 版 "target @ 6.00" 当时能
+# 被拒纯属 _GAP 字母墙的副作用（见 _GAP 注释），不是有意设计——ZH 侧因为
+# 限定词是 CJK 直接穿墙而过。而按 docstring，ZH 孪生常比 EN 早 ~2s 到，
+# ZH 误解析先执行、EN 版压根不匹配 → **没有孪生来纠正**，这是单边错单。
+#
+# 只收"这个数字明确不是入场价"的词，宁可漏挡也不误伤真喊单：
+# 特意**不含** "now"——"buying now @ 3.15" 是合法开仓。
+_PRICE_QUALIFIERS = (
+    "目标", "止损", "止盈", "目前", "当前", "现价", "预期",
+    "target", "stop", "current",
+)
+# 回看窗口：够装下 "stop loss @ "(12) 即可；再长会摸到 DTE 要素区徒增误伤。
+_QUALIFIER_LOOKBACK = 16
+
+
+def _price_qualified(text: str, price_start: int, match_start: int) -> bool:
+    """价格 token 前 _QUALIFIER_LOOKBACK 字符内是否有限定词（→ 评论，不下单）。
+
+    只往回看到本次匹配的起点，不跨出 m.group(0)——否则同一条消息里前面
+    某个仓位的"止损"会误伤后面真正的开仓喊价。
+    """
+    window = text[max(match_start, price_start - _QUALIFIER_LOOKBACK):price_start]
+    return any(q in window.lower() for q in _PRICE_QUALIFIERS)
 
 
 def _try_pattern_d(text: str, today: date):
@@ -669,6 +704,16 @@ def _try_pattern_d(text: str, today: date):
         if not symbol.isupper():
             continue
         if symbol.upper() in {"I", "A", "THE", "AT", "ON", "IS", "DTE", "IPO"}:
+            continue
+        # 限定价防护：目标/止损/现价 等前缀说明这个数字不是入场价。
+        # finditer + continue（而非 return None）：同一条消息里"目标 @ 6.00"
+        # 之后若还跟着真正的喊价，仍有机会被后一个 match 接住。
+        price_group = 6 if price_at is not None else 7
+        if _price_qualified(text, m.start(price_group), m.start()):
+            logger.info(
+                f"[parser] Pattern D 跳过限定价（目标/止损/现价类，非入场价）: "
+                f"{m.group(0).strip()[:60]}"
+            )
             continue
         n = int(dte_en if dte_en is not None else dte_zh)
         price = price_at if price_at is not None else price_zh

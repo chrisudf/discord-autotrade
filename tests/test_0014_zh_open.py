@@ -205,3 +205,84 @@ def test_pattern_d_no_cross_ticker_stitch():
     ):
         s = parse_signal(text, msg_ts=date(2026, 7, 27))
         assert s is None or s.get("skip"), text
+
+
+# ============================================================
+# [7/29 对抗测试] 限定价防护:`@` 分支原本零防护
+# ============================================================
+def test_pattern_d_qualified_at_price_not_order():
+    """`目标/止损 @ 价` 是评论,不是喊单——不下单。
+
+    实锤(7/29 对抗测试):`价格` 分支有 lookbehind (?<![标损前的现]),
+    但 **`@` 分支一个防护都没有** → "AMD 210看涨期权 4天到期 目标 @ 4.50"
+    按 4.50 下单(真实 entry 3.00,溢价 50%),且 4.50 低于
+    MAX_PRICE_PER_CONTRACT 熔断线,风控接不住。
+
+    更要命的是它是**单边**错单:按 docstring,ZH 孪生常比 EN 早 ~2s 到,
+    ZH 误解析先执行、EN 版压根不匹配 → 没有孪生来纠正。
+    """
+    for text in (
+        "AMD 210看涨期权 4天到期 目标 @ 4.50",
+        "AMD 210看涨期权 4天到期 止损 @ 2.10",
+        "META 620看涨期权 4天到期 目标价 @ 6.00",
+        "META 620看涨期权 4天到期 现价 @ 6.00",
+        "META 620看涨期权 4天到期 当前 @ 6.00",
+        "META 620看涨期权 4天到期 止盈 @ 8.00",
+    ):
+        s = parse_signal(text, msg_ts=date(2026, 7, 27))
+        assert s is None or s.get("skip"), text
+
+
+def test_pattern_d_en_qualified_price_not_order():
+    """EN 限定词同样不得当 entry。
+
+    这条钉的是**设计**而非巧合:改前 EN "target @ 6.00" 被拒纯粹是
+    _GAP 字母墙的副作用(否定字符类 + IGNORECASE 连小写一起排除),
+    一旦有人"照注释修正" _GAP 成只挡大写,这个洞立刻打开(实测验证过)。
+    现在 _price_qualified 是第二道独立防线。
+    """
+    for text in (
+        "META 620 calls 4DTE target @ 6.00",
+        "META 620 calls 4DTE stop loss @ 2.40",
+        "META 620 calls 4DTE current @ 6.00",
+    ):
+        s = parse_signal(text, msg_ts=date(2026, 7, 27))
+        assert s is None or s.get("skip"), text
+
+
+def test_pattern_d_qualified_price_blocklist_extended():
+    """`价格` 分支的限定词表补全:旧 lookbehind 只看紧邻一个字,
+    "预期价格6.00" 这类漏网(实测旧版当 entry 下单)。"""
+    for text in (
+        "META 620看涨期权,4天到期,预期价格6.00",
+        "META 620看涨期权,4天到期,目标价格6.00",
+    ):
+        s = parse_signal(text, msg_ts=date(2026, 7, 27))
+        assert s is None or s.get("skip"), text
+
+
+def test_pattern_d_now_at_price_still_orders():
+    """"now @ 价" 是合法开仓,不能被限定词表误伤——
+    _PRICE_QUALIFIERS 特意不含 "now"。"""
+    s = parse_signal(
+        "buying NOW META 620 calls 4DTE @ 3.15", msg_ts=date(2026, 7, 27),
+    )
+    assert s is not None and not s.get("skip")
+    assert s["price"] == 3.15
+
+
+def test_gap_rewrite_is_behavior_preserving():
+    """_GAP 由 [^A-Z...]+IGNORECASE 改写成显式 [^A-Za-z...] 必须逐字等价。
+
+    改写目的是消灭"注释说挡大写、实际挡所有字母"的陷阱,**不是**放宽召回:
+    要素间夹任何英文单词依旧不命中(没有语料要求支持,按 0012 的规矩
+    先加语料行再改 parser)。
+    """
+    import re as _re
+    from autotrade.parsing.signal_parser import _GAP
+    old = _re.compile(r"^(?:[^A-Z\n。！？；.!?]|[A-Z](?![A-Z]))*?$", _re.IGNORECASE)
+    new = _re.compile(r"^" + _GAP + r"$", _re.IGNORECASE)
+    for probe in ("，", " 4天到期 ", "目标 @ ", "in ", "X ", "AB", "ab", "。"):
+        assert bool(old.match(probe)) == bool(new.match(probe)), probe
+    # 夹英文单词仍不命中(召回未放宽)
+    assert parse_signal("META 620 calls in 4DTE @ 3.15", msg_ts=date(2026, 7, 27)) is None

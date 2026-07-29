@@ -56,40 +56,53 @@ def main(codes: "list[str]"):
             print("[diag_sell_ref] DB 无 OPEN 持仓，请显式传 option_code")
             return
 
-    for code in codes:
-        print(f"\n=== {code} ===")
-        ret, df = bq._snapshot([code])
-        if ret != RET_OK:
-            print(f"  snapshot 失败: {df}")
-        elif df is None or not hasattr(df, "iterrows") or len(df) == 0:
-            print("  snapshot 空返回")
-        else:
-            now_ts = time.time()
-            for _, row in df.iterrows():
-                age = None
-                try:
-                    age = now_ts - _quote_epoch(row["update_time"])
-                except Exception:
-                    pass
-                fresh = (age is not None and age <= bq.QUOTE_FRESHNESS_SEC)
-                print(
-                    f"  bid={row.get('bid_price')} ask={row.get('ask_price')} "
-                    f"last={row.get('last_price')} vol={row.get('volume')}\n"
-                    f"  update_time={row.get('update_time')} "
-                    f"age={age if age is None else f'{age:.0f}s'} "
-                    f"新鲜度门(≤{bq.QUOTE_FRESHNESS_SEC:.0f}s)="
-                    f"{'通过' if fresh else '不通过(update_time 缺失时放行)'}"
-                )
+    try:
+        for code in codes:
+            print(f"\n=== {code} ===")
+            ret, df = bq._snapshot([code])
+            if ret != RET_OK:
+                print(f"  snapshot 失败: {df}")
+            elif df is None or not hasattr(df, "iterrows") or len(df) == 0:
+                print("  snapshot 空返回")
+            else:
+                now_ts = time.time()
+                for _, row in df.iterrows():
+                    age = None
+                    try:
+                        age = now_ts - _quote_epoch(row["update_time"])
+                    except Exception:
+                        pass
+                    # 三态如实标注：原版无论哪种情况都打"不通过(update_time
+                    # 缺失时放行)"，盘后看到会误以为是"缺失放行"而不是"确实
+                    # 过期拒绝"——这两种结论对上不上线是相反的。
+                    if age is None:
+                        verdict = "update_time 缺失 → 放行(信任 snapshot)"
+                    elif age <= bq.QUOTE_FRESHNESS_SEC:
+                        verdict = "通过"
+                    else:
+                        verdict = "不通过(报价过期 → 拒绝参照)"
+                    print(
+                        f"  bid={row.get('bid_price')} ask={row.get('ask_price')} "
+                        f"last={row.get('last_price')} vol={row.get('volume')}\n"
+                        f"  update_time={row.get('update_time')} "
+                        f"age={age if age is None else f'{age:.0f}s'} "
+                        f"新鲜度门(≤{bq.QUOTE_FRESHNESS_SEC:.0f}s)={verdict}"
+                    )
 
-        ref = bq.get_sell_ref_price(code)
-        limit = calc_sell_limit(0.0, None, ref)
-        print(f"  → get_sell_ref_price = {ref}")
-        print(
-            f"  → calc_sell_limit(quote_ref) = {limit} "
-            f"(= ref × (1 - SELL_SLIP {SELL_SLIP}))"
-            if limit is not None
-            else "  → 无参照价：CLOSE 无价信号将维持拒卖 + TG 人工接管"
-        )
+            ref = bq.get_sell_ref_price(code)
+            limit = calc_sell_limit(0.0, None, ref)
+            print(f"  → get_sell_ref_price = {ref}")
+            print(
+                f"  → calc_sell_limit(quote_ref) = {limit} "
+                f"(= ref × (1 - SELL_SLIP {SELL_SLIP}))"
+                if limit is not None
+                else "  → 无参照价：CLOSE 无价信号将维持拒卖 + TG 人工接管"
+            )
+    finally:
+        # moomoo SDK 的接收线程不是 daemon：不关 ctx 的话 main() 返回后
+        # 进程一直吊着不退（实测跑完 0.2s 的活挂到 Ctrl-C 才停，在生产机上
+        # 照 docstring 跑这脚本会以为链路卡死）。
+        bq._reset_quote_ctx()
 
 
 if __name__ == "__main__":
