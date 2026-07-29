@@ -300,3 +300,51 @@ def test_list_open_option_positions_failure_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="position_list_query failed"):
         trade.list_open_option_positions()
+
+
+# ============================================================
+# [7/29] 期权代码判定：strike < $100 曾被判成正股
+# ============================================================
+# moomoo 的 strike×1000 不补零，旧判据 `[CP]\d{6,}$` 要求 strike 段 ≥6 位，
+# 于是所有 strike < $100 的期权漏判。危险链条：reconciler 拿不到这类仓 →
+# 误报 db_only「疑似已行权」→ 指引跑 ops/sync_positions → 那边同一 bug →
+# record_close 把活仓错标 CLOSED → 掉出 SL/TP/EOD 选仓，裸放。
+_OPTION_CODES = [
+    "US.SOFI270115C20000",   # $20   —— 实测出现在生产模拟盘账户里
+    "US.NIO260731C5500",     # $5.5  —— 4 位 strike 段
+    "US.F260731C12000",      # $12
+    "US.INTC260731C35000",   # $35
+    "US.AMD260731C99000",    # $99   —— 边界：旧判据的分水岭
+    "US.AMD260731C100000",   # $100  —— 边界：旧判据从这里开始才对
+    "US.NOW260731C115000",   # $115  —— 实测持仓
+    "US.SPY260731C745000",   # $745  —— 实测持仓
+    "US.SPY260731P745000",   # put 侧同理
+]
+_STOCK_CODES = [
+    "US.XOM", "US.HOOD", "US.IBM", "US.GOOGL", "US.TSLA", "US.BRK.B",
+]
+
+
+def test_option_code_predicate_covers_sub_100_strikes():
+    from autotrade.broker.trade import _looks_like_option_code
+    for code in _OPTION_CODES:
+        assert _looks_like_option_code(code), f"期权被漏判: {code}"
+    for code in _STOCK_CODES:
+        assert not _looks_like_option_code(code), f"正股被误判成期权: {code}"
+
+
+def test_sync_positions_predicate_agrees_with_broker():
+    """两处判据必须逐条一致 —— 只修一处等于留着另一条路踩雷，
+    而 sync_positions 那条**会写库**。"""
+    from autotrade.broker.trade import _looks_like_option_code
+    from autotrade.ops.sync_positions import _looks_like_option
+    for code in _OPTION_CODES + _STOCK_CODES:
+        assert _looks_like_option(code) == _looks_like_option_code(code), code
+
+
+def test_sub_100_strike_not_reported_as_phantom_drift():
+    """端到端：DB 与 broker 都持有一张 $20 期权 → 不该报任何漂移。
+    旧判据下 broker 侧拿不到它 → 误报 db_only（那正是错误落账的起点）。"""
+    db_rows = [{"option_code": "US.SOFI270115C20000", "qty_remaining": 1}]
+    broker_rows = {"US.SOFI270115C20000": 1}
+    assert reconciler.diff_positions(db_rows, broker_rows) == []

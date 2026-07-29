@@ -287,14 +287,30 @@ def _get_long_qty(option_code: str) -> int:
     return qty
 
 
-# [0016] US 期权代码粗判：US.SYMBOL<数字><C|P><strike*1000 至少 6 位>。
-# 与 ops/sync_positions._looks_like_option 同一判据（那边是独立人工脚本，
-# 保持自包含不动；这里给 reconciler 复用模块单例 ctx 的查询路径）。
-_OPTION_CODE_RE = re.compile(r"[CP]\d{6,}$")
+# US 期权代码判定：US.SYMBOL + YYMMDD + C|P + strike×1000。
+#
+# [7/29 修正] 原判据 `[CP]\d{6,}$` 要求 strike 字段 **至少 6 位**，但 moomoo
+# 的 strike×1000 **不补零** —— strike < $100 就只有 5 位甚至更少：
+#     US.SOFI270115C20000  ($20)  → 20000  5 位 → 判成正股 ❌
+#     US.NIO260731C5500    ($5.5) → 5500   4 位 → 判成正股 ❌
+#     US.AMD260731C100000  ($100) → 100000 6 位 → 正确     ✅
+# 即 **所有 strike < $100 的期权全部漏判**（实测你账户里的 SOFI 20C 就中招，
+# 被列进 sync_positions 的"孤儿正股"并建议手工清掉）。
+#
+# 危险链条：reconciler 拿不到这类仓 → 本地有而 broker "没有" → 误报
+# db_only「疑似已行权/场外平仓」→ 报告指引去跑 ops/sync_positions →
+# 那边同一个 bug → record_close(fill_price=0) 把**活仓**错标 CLOSED →
+# 掉出 SL/TP/EOD 选仓，裸放且无人知道。
+#
+# 改为按结构锚定（日期段恰好 6 位 + 行权价至少 1 位），而不是数 strike 位数。
+# 正股不会误命中：股票代码里没有数字（BRK.B 之类含点的也不匹配）。
+# ops/sync_positions._looks_like_option 是独立人工脚本、各自自包含，
+# 已同步修同一个 bug（两处都改，只改一处等于留着另一条路踩雷）。
+_OPTION_CODE_RE = re.compile(r"^[A-Z]+\d{6}[CP]\d+$")
 
 
 def _looks_like_option_code(code: str) -> bool:
-    return code.startswith("US.") and bool(_OPTION_CODE_RE.search(code[3:]))
+    return code.startswith("US.") and bool(_OPTION_CODE_RE.match(code[3:]))
 
 
 def list_open_option_positions() -> dict[str, int]:
