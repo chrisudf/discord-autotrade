@@ -28,8 +28,9 @@ TODO（实测调整）：
 - 0DTE 收盘前几分钟可能完全卖不动（ITM 容易出，OTM 几乎归零）→
   要不要 OTM 直接放弃挂单、自动归零
 - 把"今日是否已强平过"持久化到 DB，跨重启更稳
-- 早收盘日（black friday / xmas eve）EOD_HOUR 应该是 12:50 而不是 15:50
-  → 需要 holidays.py 加 EARLY_CLOSE_DATES set
+
+[0017] 早收盘日（black friday / xmas eve / 独立日前一天）已支持：
+holidays.EARLY_CLOSE_DATES + _is_eod_window 内整体前移 3h（12:50~13:05）。
 """
 import asyncio
 import os
@@ -38,10 +39,13 @@ from zoneinfo import ZoneInfo
 
 from autotrade.broker.trade import place_sell_order
 from autotrade.broker.quote import get_last_price
+from autotrade.parsing.holidays import is_early_close
 from autotrade.position import manager as position_mgr
 from autotrade.position import fill_checker
+from autotrade.position.sell_executor import Outcome, SellPlan, SkipSell, execute_sell
 from autotrade.notify.transport import send_telegram
-from autotrade.notify.messages import format_close_filled, format_error
+# format_close_filled 已随成交 TG 收进 sell_executor（0015），此处只剩错误文案
+from autotrade.notify.messages import format_error
 from autotrade.utils.logger import logger
 
 ET_TZ = ZoneInfo("America/New_York")
@@ -61,19 +65,33 @@ def _cfg() -> dict:
 # 每 30 分钟"手动平仓"告警到 18:50 ET，直到人工 Ctrl-C。
 _WINDOW_END_HOUR, _WINDOW_END_MIN = 16, 5
 
+# [0017] 半日市（黑五/平安夜/独立日前一天）13:00 ET 收盘，EOD 各时点整体
+# 前移 3 小时：默认 cutoff 15:50→12:50、上界 16:05→13:05（正好落在原 TODO
+# 指定的时点）。用"平移收盘差 3h"而不是硬编码 12:50，是为了保住
+# env EOD_HOUR/EOD_MIN 的真实语义——"收盘前 N 分钟"——在半日市同样成立
+# （比如有人调到 15:30 求更早强平，半日市自动变 12:30，而不是回退默认）。
+# 不修的后果是钱路事故：半日市当天 15:50 才进窗 = 收盘后 2.5h 才开始挂单，
+# 当日到期仓位 100% 过期——AVGO 415C（7/23-24 夜）+50% 拿到归零的同款结局，
+# 只是触发原因从"窗口内无报价"换成"整个窗口都错过"。
+_EARLY_CLOSE_SHIFT_HOURS = 3
+
 
 def _is_eod_window(now_et: datetime, hour: int, minute: int) -> bool:
-    """是否在 EOD 强平时窗内（工作日 hour:minute ～ 16:05 ET）。
+    """是否在 EOD 强平时窗内。
 
-    TODO: 半日交易日（黑五 / 平安夜 / 独立日前夜 / 元旦前夜等）13:00 ET 收盘，
-          应在 holidays.py 加 EARLY_CLOSE_DATES set，当日把 cutoff 调到 12:50、
-          上界调到 13:05。实测一年才几次，不急；但漏掉那几天会变成"收盘后才挂卖单"。
+    全日市：工作日 hour:minute ～ 16:05 ET。
+    半日市（holidays.is_early_close）：整体前移 3h → 默认 12:50 ～ 13:05 ET。
     """
     if now_et.weekday() >= 5:  # 周六/日
         return False
-    cutoff = now_et.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    shift = _EARLY_CLOSE_SHIFT_HOURS if is_early_close(now_et.date()) else 0
+    # max(0,...) 防御：EOD_HOUR 被配成 <3 时不让 replace 抛 ValueError
+    # （那种配置本身没有交易意义，宁可窗口从 0 点开也不能让 tick 整个炸掉）
+    cutoff = now_et.replace(
+        hour=max(hour - shift, 0), minute=minute, second=0, microsecond=0
+    )
     window_end = now_et.replace(
-        hour=_WINDOW_END_HOUR, minute=_WINDOW_END_MIN, second=0, microsecond=0
+        hour=_WINDOW_END_HOUR - shift, minute=_WINDOW_END_MIN, second=0, microsecond=0
     )
     return cutoff <= now_et <= window_end
 
@@ -103,17 +121,21 @@ def _gc_skip(today_et: date_cls):
 
 
 async def _force_close(pos: dict, sell_slip: float, ts_now: float):
-    """单仓位强平。"""
+    """单仓位强平。
+
+    [0015] 执行骨架合并进 sell_executor.execute_sell；EOD 专属差异保留在钩子：
+      - **锁内取价**（plan_fn 在锁内执行）：报价与下单在同一把锁的同一视图下，
+        等锁期间被 CLOSE/SL 卖掉的仓位不会再吃一次 snapshot 配额
+      - 0007 的 no-quote 重试/告警分离：无报价每 tick(30s) 照常重试
+        （迟到的报价还能接住），只有 TG 按 30min/code 节流（_alerted_until）；
+        broker 异常/拒单仍走 60s _skip_until backoff
+      - 10% 卖出 slip（临近收盘 spread 跳水，比 SL 更激进）
+    """
     code = pos["option_code"]
 
-    async with position_mgr.sell_lock(code):
-        # 锁内重读：等锁期间可能已被 SL/TP/CLOSE 卖掉（部分或全部）
-        pos = position_mgr.get(code) or pos
-        if pos["status"] not in ("OPEN", "PARTIAL") or pos["qty_remaining"] <= 0:
-            logger.debug(f"[eod] {code} already closed while waiting for lock, skip")
-            return
-        qty = pos["qty_remaining"]
-
+    async def _plan(fresh: dict):
+        """锁内决策：先取价（无报价拒绝 entry-fallback 自残卖），再定限价。"""
+        qty = fresh["qty_remaining"]
         last = await asyncio.to_thread(get_last_price, code)
         if last is None:
             # 没 quote 时不挂 entry-based 卖单——0DTE ITM 会被自残卖在远低于真实市价。
@@ -127,61 +149,58 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float):
                 )
                 ok = await send_telegram(format_error(
                     "EOD 强平跳过：无报价",
-                    f"{code} qty={qty} entry=${pos['avg_entry_price']:.2f}\n"
+                    f"{code} qty={qty} entry=${fresh['avg_entry_price']:.2f}\n"
                     f"原因：OPRA 不可用，避免 entry × 0.9 自残卖\n"
                     f"收盘前每 30s 继续重试；若一直无报价请在 moomoo 手动平仓"
                 ))
                 # 裸 send_telegram 成功只记 debug,出过"告警到底发没发"说不清的账
                 # (7/24 夜这条告警在日志里完全隐形)——安全关键路径把结果提到 INFO
                 logger.info(f"[eod] no-quote TG {'sent' if ok else 'FAILED'} for {code}")
-            return
+                return SkipSell(Outcome.SKIPPED_NOTIFIED)
+            return SkipSell(Outcome.SKIPPED_SILENT)
 
         limit = max(0.01, round(last * (1 - sell_slip), 2))
         logger.warning(
             f"[eod] 🕒 force-close {code}: qty={qty} last={last:.2f} limit={limit}"
         )
+        return SellPlan(
+            qty=qty, limit=limit, remark="eod_force", notify_pct=100,
+            note=f"EOD force close (last={last:.2f})",
+        )
 
-        try:
-            result = await asyncio.to_thread(
-                place_sell_order,
-                option_code=code, qty=qty,
-                limit_price=limit, remark="eod_force",
-            )
-        except Exception as e:
-            logger.exception("[eod] place_sell_order failed")
-            _skip_until[code] = ts_now + 60  # 1 分钟后再试
-            await send_telegram(format_error("EOD sell error", f"{code}\n{e}"))
-            return
+    def _already_closed(fresh: dict):
+        logger.debug(f"[eod] {code} already closed while waiting for lock, skip")
 
-        if not result.get("success"):
-            err = result.get("message", "unknown")
-            logger.error(f"[eod] sell rejected: {err}")
-            _skip_until[code] = ts_now + 60
-            await send_telegram(format_error("EOD sell rejected", f"{code} qty={qty}\n{err}"))
-            return
+    async def _sell_error(e: Exception, plan):
+        logger.exception("[eod] place_sell_order failed")
+        _skip_until[code] = ts_now + 60  # 1 分钟后再试
+        await send_telegram(format_error("EOD sell error", f"{code}\n{e}"))
 
-        try:
-            position_mgr.on_close_filled(
-                option_code=code,
-                qty_sold=result.get("qty", qty),
-                fill_price=result.get("price", limit),
-                trigger_source="eod",
-                order_id=result.get("order_id"),
-                note=f"EOD force close (last={last:.2f})",
-            )
-        except Exception as e:
-            logger.error(f"[eod] on_close_filled failed: {e}")
+    async def _sell_rejected(result: dict, plan):
+        err = result.get("message", "unknown")
+        logger.error(f"[eod] sell rejected: {err}")
+        _skip_until[code] = ts_now + 60
+        await send_telegram(format_error(
+            "EOD sell rejected", f"{code} qty={plan.qty}\n{err}"))
 
+    async def _record_failure(e: Exception, result: dict):
+        logger.error(f"[eod] on_close_filled failed: {e}")
+
+    await execute_sell(
+        pos,
+        trigger_source="eod",
+        notify_trigger="eod",
+        plan_fn=_plan,
+        place_sell_order=place_sell_order,
+        notify=send_telegram,
         # 卖单成交确认：收盘前 spread 跳水，限价卖单挂不上必须立刻知道
-        fill_checker.spawn(fill_checker.confirm_sell_fill(
-            result.get("order_id") or "", code, result.get("qty", qty), "eod",
-        ))
-
-    await send_telegram(format_close_filled(
-        pos["symbol"], pos["strike"], pos["side"], pos["expiry"],
-        result.get("qty", qty), result.get("price", limit),
-        100, "eod", result.get("order_id", "N/A"),
-    ))
+        fill_confirm=lambda order_id, qty_sold: fill_checker.spawn(
+            fill_checker.confirm_sell_fill(order_id, code, qty_sold, "eod")),
+        on_already_closed=_already_closed,
+        on_sell_error=_sell_error,
+        on_sell_rejected=_sell_rejected,
+        on_record_failure=_record_failure,
+    )
 
 
 async def sweep_expired_and_notify() -> list[dict]:

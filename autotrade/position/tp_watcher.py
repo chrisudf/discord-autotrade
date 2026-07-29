@@ -31,9 +31,11 @@ from autotrade.broker.trade import place_sell_order
 from autotrade.broker.quote import get_last_prices
 from autotrade.position import manager as position_mgr
 from autotrade.position import fill_checker
+from autotrade.position.sell_executor import Outcome, SellPlan, SkipSell, execute_sell
 from autotrade.storage import positions_db
 from autotrade.notify.transport import send_telegram
-from autotrade.notify.messages import format_close_filled, format_error
+# format_close_filled 已随成交 TG 收进 sell_executor（0015），此处只剩错误文案
+from autotrade.notify.messages import format_error
 from autotrade.utils.logger import logger
 
 
@@ -56,82 +58,85 @@ _triggered_this_tick: set[tuple[str, int]] = set()
 
 async def _trigger_tp(pos: dict, last_price: float, threshold_pct: float,
                       trim_pct: int, tier_bit: int, sell_slip: float):
-    """对单个仓位触发 TP 单档。"""
+    """对单个仓位触发 TP 单档。
+
+    [0015] 执行骨架合并进 sell_executor.execute_sell；TP 专属差异保留在钩子：
+      - 锁内重读后先查 tp_hits 位掩码（同档已触发 → 静默跳过）
+      - qty 用 round() 而非 manager.calc_qty_to_sell 的 ceil()——契约点名
+        **原样保留**的口径差异：TP 阶梯"卖剩余的 50%"倾向少卖（round(2.5)=2，
+        banker's rounding），让 runner 多跑；KC trim 的 ceil 倾向跟足信号比例。
+        两者不是笔误，是两种策略语义，合并执行器时不做"顺手统一"。
+      - 先 mark_tp_hit 再记账（pre_record 钩子）：即使 on_close_filled 出错，
+        下轮也不会重复触发同档
+      - 5% 卖出 slip（价格在涨，不需要 SL 那么激进）
+    """
     code = pos["option_code"]
     key = (code, tier_bit)
     if key in _triggered_this_tick:
         return
     _triggered_this_tick.add(key)
 
-    async with position_mgr.sell_lock(code):
-        # 锁内重读：等锁期间可能已被 SL/EOD/CLOSE 卖掉，或同档已被标记
-        pos = position_mgr.get(code) or pos
-        if pos["status"] not in ("OPEN", "PARTIAL") or pos["qty_remaining"] <= 0:
-            logger.debug(f"[tp] {code} already closed while waiting for lock, skip")
-            return
-        if pos["tp_hits"] & tier_bit:
-            return
-
-        qty_to_sell = max(1, round(pos["qty_remaining"] * trim_pct / 100))
-        qty_to_sell = min(qty_to_sell, pos["qty_remaining"])
+    async def _plan(fresh: dict):
+        """锁内决策：同档位掩码防护 + round() 口径的分档张数。"""
+        if fresh["tp_hits"] & tier_bit:
+            return SkipSell(Outcome.SKIPPED_SILENT)
+        qty_to_sell = max(1, round(fresh["qty_remaining"] * trim_pct / 100))
+        qty_to_sell = min(qty_to_sell, fresh["qty_remaining"])
         limit = round(last_price * (1 - sell_slip), 2)
         if limit <= 0:
             limit = 0.01
-
         logger.info(
             f"[tp] 🎯 T{tier_bit} HIT {code}: last={last_price:.2f} "
-            f">= entry*({1+threshold_pct:.2f})={pos['avg_entry_price']*(1+threshold_pct):.2f}, "
-            f"selling {qty_to_sell}/{pos['qty_remaining']} @ {limit}"
+            f">= entry*({1+threshold_pct:.2f})={fresh['avg_entry_price']*(1+threshold_pct):.2f}, "
+            f"selling {qty_to_sell}/{fresh['qty_remaining']} @ {limit}"
+        )
+        return SellPlan(
+            qty=qty_to_sell, limit=limit, remark=f"tp_t{tier_bit}",
+            notify_pct=trim_pct,
+            note=f"TP T{tier_bit} +{int(threshold_pct*100)}%: last={last_price:.2f}",
         )
 
-        try:
-            result = await asyncio.to_thread(
-                place_sell_order,
-                option_code=code, qty=qty_to_sell,
-                limit_price=limit, remark=f"tp_t{tier_bit}",
-            )
-        except Exception as e:
-            logger.exception("[tp] place_sell_order failed")
-            _triggered_this_tick.discard(key)
-            await send_telegram(format_error("TP sell error", f"{code}\n{e}"))
-            return
+    def _already_closed(fresh: dict):
+        logger.debug(f"[tp] {code} already closed while waiting for lock, skip")
 
-        if not result.get("success"):
-            err = result.get("message", "unknown")
-            logger.error(f"[tp] sell rejected: {err}")
-            _triggered_this_tick.discard(key)
-            await send_telegram(format_error("TP sell rejected", f"{code} qty={qty_to_sell}\n{err}"))
-            return
+    async def _sell_error(e: Exception, plan):
+        logger.exception("[tp] place_sell_order failed")
+        _triggered_this_tick.discard(key)
+        await send_telegram(format_error("TP sell error", f"{code}\n{e}"))
 
-        # 先持久化档位（即使下面 on_close_filled 出错也不会重复触发同档）
+    async def _sell_rejected(result: dict, plan):
+        err = result.get("message", "unknown")
+        logger.error(f"[tp] sell rejected: {err}")
+        _triggered_this_tick.discard(key)
+        await send_telegram(format_error(
+            "TP sell rejected", f"{code} qty={plan.qty}\n{err}"))
+
+    # 先持久化档位（即使 on_close_filled 出错也不会重复触发同档）
+    def _pre_record():
         try:
             positions_db.mark_tp_hit(code, tier_bit)
         except Exception as e:
             logger.error(f"[tp] mark_tp_hit failed: {e}")
 
-        try:
-            position_mgr.on_close_filled(
-                option_code=code,
-                qty_sold=result.get("qty", qty_to_sell),
-                fill_price=result.get("price", limit),
-                trigger_source="tp_polling",
-                order_id=result.get("order_id"),
-                note=f"TP T{tier_bit} +{int(threshold_pct*100)}%: last={last_price:.2f}",
-            )
-        except Exception as e:
-            logger.error(f"[tp] on_close_filled failed: {e}")
+    async def _record_failure(e: Exception, result: dict):
+        logger.error(f"[tp] on_close_filled failed: {e}")
 
+    await execute_sell(
+        pos,
+        trigger_source="tp_polling",
+        notify_trigger=f"tp_t{tier_bit}",
+        plan_fn=_plan,
+        place_sell_order=place_sell_order,
+        notify=send_telegram,
         # 卖单成交确认：未成交则 TG 告警（DB 已扣减，broker 端可能还持有）
-        fill_checker.spawn(fill_checker.confirm_sell_fill(
-            result.get("order_id") or "", code,
-            result.get("qty", qty_to_sell), f"tp_t{tier_bit}",
-        ))
-
-    await send_telegram(format_close_filled(
-        pos["symbol"], pos["strike"], pos["side"], pos["expiry"],
-        result.get("qty", qty_to_sell), result.get("price", limit),
-        trim_pct, f"tp_t{tier_bit}", result.get("order_id", "N/A"),
-    ))
+        fill_confirm=lambda order_id, qty_sold: fill_checker.spawn(
+            fill_checker.confirm_sell_fill(order_id, code, qty_sold, f"tp_t{tier_bit}")),
+        on_already_closed=_already_closed,
+        on_sell_error=_sell_error,
+        on_sell_rejected=_sell_rejected,
+        pre_record=_pre_record,
+        on_record_failure=_record_failure,
+    )
 
 
 async def _tp_tick():

@@ -221,6 +221,7 @@ async def main():
     from autotrade.notify.messages import format_error
     from autotrade.notify.transport import send_telegram
     from autotrade.position.eod_watcher import run_eod_watcher, sweep_expired_and_notify
+    from autotrade.position.reconciler import start_reconciler
     from autotrade.position.sl_watcher import run_sl_watcher
     from autotrade.position.tp_watcher import run_tp_watcher
 
@@ -268,6 +269,15 @@ async def main():
         _watcher_tasks.add(task)
         task.add_done_callback(_watcher_tasks.discard)
     logger.info("🛡️  watchers started: sl / eod / tp / alive-heartbeat")
+
+    # [0016] 定时对账 reconciler（report-only）：broker 持仓 vs DB open 仓位
+    # 定时 diff，漂移只发 TG 不写 DB。背景：7/25 夜 AVGO 强平失败过期后本地
+    # 仍挂 OPEN、7/2 自动行权脱钩（lessons #14/#15）——之前只有人工跑
+    # ops/sync_positions 才能发现。RECONCILE_INTERVAL_MIN<=0（缺省 "0"）
+    # 不建 task；接线与 alive_heartbeat 同款（上面的 _watcher_tasks 强引用
+    # set + done_callback discard），逻辑收在 reconciler.start_reconciler
+    # 里以便单测覆盖"env=0 不起"。
+    start_reconciler(_watcher_tasks)
 
     try:
         await client.start(token)

@@ -8,6 +8,8 @@ Rules (2026-06):
 5. expiry 相对消息时间戳计算（回测正确性）
 6. expiry 落假日/周末 → 自动前移到最近交易日（如 6/19 Juneteenth → 6/18）
 7. expiry 显示字符串与 expiry_date 保持一致（避免 TG/DB 显示 6/19 但实际下 6/18）
+8. (2026-07) ZH 机翻开仓模板走 Pattern D（A/B/C 全落空后兜底，五要素严格匹配，
+   详见 _try_pattern_d）——规则 1 "English-only" 自 ZH 方向词归一化起已放宽
 """
 import re
 from datetime import date, timedelta
@@ -213,7 +215,13 @@ def parse_signal(text: str, msg_ts: date = None):
         return {"skip": "price_range"}
 
     try:
-        sig = _try_pattern_a(text, today) or _try_pattern_b(text, today) or _try_pattern_c(text, today)
+        # Pattern D 在 A/B/C 全落空后才尝试（ZH 机翻模板兜底，不影响既有优先级）
+        sig = (
+            _try_pattern_a(text, today)
+            or _try_pattern_b(text, today)
+            or _try_pattern_c(text, today)
+            or _try_pattern_d(text, today)
+        )
     except ValueError as e:
         # smart_expiry 对 6/31 这类无效日期抛 ValueError → 按解析失败处理，
         # 走 None 路径（listener 会 TG 报警），不让异常传出去
@@ -604,6 +612,84 @@ def _try_pattern_c(text: str, today: date):
     }
 
 
+# Pattern D: ZH 机翻开仓模板（编译一次，模块级；分组次序见 _try_pattern_d）
+# 形态：SYM + strike + calls/puts + (NDTE | N天到期) + (@价 | 价格N)
+#   - symbol 允许紧贴 CJK（"买入META"——ZH 原文动词和 ticker 之间没有空格，
+#     \b 在 \w(CJK 也是 \w) 之间不成立，只能用 lookbehind 排除英文字母/$）
+#   - side 是完整词 calls/puts：ZH 归一化("看涨期权"→" calls ")的产物，
+#     正是 A 系列(要求 strike 紧贴单字符 c/p)接不住的原因
+#   - 要素间窗口 _GAP：容纳全角逗号/空格等机翻标点，但**不允许跨越**句读
+#     （。！？；.!?）、换行、或第二个 ticker(≥2 连续大写字母)。
+#     [7/28 对抗评审] 旧版 [^\n]{0,30} 会把 "META 620看涨期权，SPY 4DTE @ 3.15"
+#     拼成 META+SPY 的 4DTE @3.15 混合单——30 字符轻松跨过一整个 ZH 子句
+#     和第二个标的。禁止字符类把窗口锁死在"同一子句、同一 ticker 内"。
+#   - 价格必须是**入场价**语义：负向 lookbehind 排除 目标/止损/目前/现价/当前
+#     等限定词——"目标价格6.00"/"止损价格2.40"/"目前价格6.00" 是评论不是喊单，
+#     旧版当 entry 下单（对抗评审实锤）。裸"价格N"和"@N"才算。
+_GAP = r"(?:[^A-Z\n。！？；.!?]|[A-Z](?![A-Z]))*?"  # 单个大写字母(缩写)允许,连续 2+ 不允许
+_PATTERN_D = re.compile(
+    r"(?<![A-Za-z$])([A-Z]{1,5})\s+"                        # symbol（禁 $ 前缀：$ 形态归 B/C 管）
+    r"(\d+(?:\.\d+)?)\s+"                                   # strike
+    r"(calls?|puts?)\b"                                     # side（完整词）
+    r"" + _GAP + r"(?:(\d{1,3})\s*DTE\b|(\d{1,3})\s*天到期)"  # NDTE | N天到期
+    r"" + _GAP + r"(?:@\s*\$?\s*(\.?\d+(?:\.\d+)?)"         # @3.15 / @ $3.15
+    r"|(?<![标损前的现])价格\s*[:：]?\s*\$?\s*(\.?\d+(?:\.\d+)?))",  # 价格4.80（紧邻限定词末字 标/损/前/的/现 → 目标|止损|目前|当前|…的|现 价格，视为评论不下单）
+    re.IGNORECASE,
+)
+
+
+def _try_pattern_d(text: str, today: date):
+    """Pattern D: ZH 机翻开仓模板 `SYM STRIKE calls/puts (NDTE|N天到期) (@价|价格N)`
+
+    两夜实锤（逐字语料在 tests/test_0014_zh_open.py）：
+      1. 7/24 夜："买入META 620看涨期权，4天到期，价格4.80" —— 归一化后
+         "META 620 calls ，4天到期，价格4.80"：A 系列要求 strike 紧贴 c/p
+         （"620c"），B/C 系列要求 $ 前缀，三头全落空 → 当晚 ZH 孪生解析失败，
+         全靠 EN 版被路由修复接住。enrich 的 ZH 版实测常早 EN ~2s 到达（7/14），
+         ZH 不可解析 = 白等 EN；EN 同时失手（当晚 "into the close" 误路由）
+         就是整单丢失。
+      2. 7/28 夜："SPY 745看涨期权 4DTE @ 3.15 日内交易" 同型再现。
+
+    语义复用：
+      - "N天到期" 等价 NDTE —— expiry_date 与 A3 同一条路径
+        （today + N 天，再 _adjust_expiry 假日回退），保证 ZH/EN 孪生
+        指纹 (symbol,side,strike,expiry_date) 完全一致，dedup 才拦得住双发。
+      - "日内交易" 的 day_trade tag 由 _extract_tags 的 zh_tag_map（"日内"）
+        既有词表覆盖，无需另补。
+
+    保守边界（契约铁律 2：宁错过不错杀）：
+      - 模板五要素缺一不命中，不做宽松匹配——缺价/缺期的残句宁可落到
+        looks-like-signal 大声告警，也不半猜下单。
+      - "7月15日" 这类 ZH 日期形态不在本模板内（无实测语料，不扩）。
+    """
+    for m in _PATTERN_D.finditer(text):
+        symbol, strike, side_word, dte_en, dte_zh, price_at, price_zh = m.groups()
+        # 同 A 系列：IGNORECASE 下 [A-Z] 也吃小写，要求原文全大写才算 ticker
+        # （"buy 620 calls 4DTE @ 3.15" 里的 "buy" 不是 ticker）
+        if not symbol.isupper():
+            continue
+        if symbol.upper() in {"I", "A", "THE", "AT", "ON", "IS", "DTE", "IPO"}:
+            continue
+        n = int(dte_en if dte_en is not None else dte_zh)
+        price = price_at if price_at is not None else price_zh
+        return {
+            "raw": text,
+            "matched": m.group(0).strip(),
+            "symbol": symbol.upper(),
+            "side": "CALL" if side_word.lower().startswith("call") else "PUT",
+            "strike": float(strike),
+            # 显示字符串统一记 NDTE（_finalize_signal 会覆盖成实际 M/D，
+            # 与 A3 行为一致）
+            "expiry": f"{n}DTE",
+            "expiry_date": _adjust_expiry(
+                today + timedelta(days=n), context="D NDTE/天到期"
+            ),
+            "price": float(price),
+            "tags": _extract_tags(text),
+        }
+    return None
+
+
 def _extract_tags(text: str) -> list:
     """从 KC 信号文本抽 tag，给后续 category/分析用。
 
@@ -691,10 +777,9 @@ WEAK_CLOSE_RE = re.compile(
     r"\bclosing\b(?!\s+bell)"          # 'closing bell' 是时间状语不是动作
     r"|\bout\s+(?:half|full|majority)\b"
     # 7/25 实测:enrich "$LLY - Out 25% more. Down to runners." 双语双发全漏
-    # (裸 out 不在词表)。只认 out 紧跟 N% 的形态;行情解说("knocked out 25%
-    # of the premium")由 _OUT_PCT_PATTERN 自带的 lookbehind 排除。
-    # 路由(这里)与解析(close_parser._OUT_PHRASE_RE)共用同一个常量——
-    # 两边写法漂移就是漏单裂缝。
+    # (裸 out 不在词表)。out N% 的模式只有一份、定义在 close_parser
+    # (_OUT_PCT_PATTERN,含 knocked-out 解说的 lookbehind),这里 import 复用——
+    # 路由与解析同进同退,两边写法漂移就是漏单裂缝。
     r"|" + _OUT_PCT_PATTERN
     + r"|\bselling\b"
     r"|\bscaling\s+down\b",

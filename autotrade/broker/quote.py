@@ -17,7 +17,7 @@ from datetime import datetime, time as dt_time, timedelta, timezone
 
 from autotrade.utils.logger import logger
 # 仅用于 probe 的盘中/盘外判定（纯数据模块，无反向依赖）
-from autotrade.parsing.holidays import is_trading_day
+from autotrade.parsing.holidays import is_early_close, is_trading_day
 from autotrade.broker.common import (
     OPEND_HOST,
     OPEND_PORT,
@@ -200,6 +200,61 @@ def get_last_price(option_code: str):
     return get_last_prices([option_code]).get(option_code)
 
 
+def get_sell_ref_price(option_code: str) -> "float | None":
+    """[0010] CLOSE 无价 fallback 的卖出参照价：优先 bid，其次 last，
+    拿不到/stale 一律 None。
+
+    背景（7/25 夜实锤）：KC "Trimmed AVGO +20%" 只报盈利不喊价，
+    calc_sell_limit 无 signal_price → 拒卖 + TG 让人工接管——半夜没人盯，
+    trim 全漏。OPRA 订阅到位后由本函数补实时参照：
+
+    - **bid 优先**：卖单要"吃穿 bid"才成交。用 bid 做参照比 last 保守——
+      last 可能是几分钟前的成交高点，按它挂 (1-SELL_SLIP) 仍可能悬在
+      ask 之上变死单；bid 是"现在真有人接的价"。
+    - bid 无/为 0（无人出价的清淡合约）才退回 last。
+    - 两者都无、或没过 60s 新鲜度门 → None，调用方保持"宁错过不错杀"
+      的拒卖底线（7/10 enrich "$NVDA all out" 误匹配就是靠无价拒卖
+      挡下 100% 误平的，这条底线不能因为 fallback 松动）。
+
+    复用 _snapshot 单层 wrapper：限频/无权限 backoff、异常 reset、
+    threading 锁全部继承——CLOSE 与 SL/TP/EOD watcher 共享同一份
+    频率配额与退避状态，**不开第二条 snapshot 路径**。
+
+    DRY_RUN 路径：委托 get_last_price 的 mock env
+    （MOCK_LAST_PRICE_<code> / MOCK_LAST_PRICE，缺省 None = 不假装有价）。
+    """
+    if _is_dry_run():
+        return get_last_price(option_code)
+
+    ret, df = _snapshot([option_code])
+    if ret != RET_OK or df is None:
+        return None
+    if not hasattr(df, "iterrows") or len(df) == 0:
+        return None
+
+    import pandas as pd  # 仅 SDK 路径需要，pandas 是 moomoo 必装依赖
+    now_ts = time.time()
+    for _, row in df.iterrows():
+        if row.get("code") != option_code:
+            continue
+        # 与 get_last_prices 同一把新鲜度尺（QUOTE_FRESHNESS_SEC=60s）。
+        # stale 报价用于卖单定价比用于 watcher 触发更危险：按几分钟前的
+        # bid 挂单可能远低于现价，等于白送 —— stale 一律当"没有参照"。
+        try:
+            ts = _quote_epoch(row["update_time"])
+            if now_ts - ts > QUOTE_FRESHNESS_SEC:
+                return None
+        except Exception:
+            pass  # update_time 缺失时仍信任 snapshot（与 get_last_prices 一致）
+        for field in ("bid_price", "last_price"):
+            val = row.get(field)
+            if val is None or pd.isna(val) or val <= 0:
+                continue
+            return float(val)
+        return None
+    return None
+
+
 def _validate_one(code: str) -> bool:
     """单 code 校验。返回 True=可下单（含权限不足/瞬时失败时的"未知放行"），
     False=**确认**不存在。"""
@@ -285,28 +340,47 @@ QUOTE_NO_PERMISSION = "no_perm"  # 账户没 US MarketOptions 订阅
 QUOTE_ERROR = "error"          # 其它失败（OpenD 连不上 / chain 取不到 / etc.）
 
 
+def _rth_close_et(d) -> dt_time:
+    """[0017] 当日 RTH 收盘时刻（ET）：半日市 13:00，其余 16:00。"""
+    return dt_time(13, 0) if is_early_close(d) else dt_time(16, 0)
+
+
 def _is_rth(now_utc: datetime) -> bool:
-    """当前是否美股常规交易时段（交易日 09:30-16:00 ET）。半日市按整日算。"""
+    """当前是否美股常规交易时段（交易日 09:30 ~ 收盘 ET；半日市 13:00 收盘）。
+
+    [0017] 原实现"半日市按整日算"：黑五 14:00 ET 启动 probe（实际已收盘 1h，
+    报价停在 13:00 附近）会走盘中分支，age>900s 一律误判 DELAYED——
+    与 7/22 夜 22:30 AEST 盘外启动误报 delayed-tier 同构的假告警。
+    现在半日市 13:00 之后按盘外处理，_freshness_verdict 走 sanity check 分支。
+    """
     now_et = now_utc.astimezone(QUOTE_TZ)
     return (
         is_trading_day(now_et.date())
-        and dt_time(9, 30) <= now_et.time() < dt_time(16, 0)
+        and dt_time(9, 30) <= now_et.time() < _rth_close_et(now_et.date())
     )
 
 
 def _last_rth_close_utc(now_utc: datetime) -> datetime:
-    """上一次常规收盘（16:00 ET）的 UTC 时刻。"""
+    """上一次常规收盘的 UTC 时刻（全日 16:00 ET；[0017] 半日市 13:00 ET）。
+
+    半日市按 16:00 算的隐患：黑五 13:30 ET（已收盘）探测时会把"上次收盘"
+    错算成前一交易日 16:00 → closed_gap 虚大一整天，比上次收盘还旧的
+    坏数据（真该告警的）反而被容差吞掉。
+    """
     now_et = now_utc.astimezone(QUOTE_TZ)
     d = now_et.date()
-    if not (is_trading_day(d) and now_et.time() >= dt_time(16, 0)):
+    if not (is_trading_day(d) and now_et.time() >= _rth_close_et(d)):
         d = d - timedelta(days=1)
         while not is_trading_day(d):
             d -= timedelta(days=1)
-    return datetime.combine(d, dt_time(16, 0), tzinfo=QUOTE_TZ).astimezone(timezone.utc)
+    return datetime.combine(d, _rth_close_et(d), tzinfo=QUOTE_TZ).astimezone(timezone.utc)
 
 
-# 盘外容差：半日市提前 3h 收盘（不在假日表里）+ 清淡合约尾盘不更新，
-# 一并吞进 4h。真正的 delayed-tier 只差 15min，盘外本来就无法与实时区分。
+# 盘外容差：清淡合约尾盘不更新等噪声，一并吞进 4h。真正的 delayed-tier
+# 只差 15min，盘外本来就无法与实时区分。
+# [0017] 半日市已进 EARLY_CLOSE_DATES（_last_rth_close_utc 按 13:00 计），
+# 不再需要这 4h 兜底"提前 3h 收盘"，但阈值保持不动——收紧只会增加盘外
+# 误报（7/22 夜的教训方向），且不改任何既有测试期望。
 _OFF_HOURS_AGE_SLACK_SEC = 4 * 3600.0
 
 

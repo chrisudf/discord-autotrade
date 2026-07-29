@@ -93,30 +93,36 @@ def build_option_code(symbol: str, exp_date: date, strike: float, side: str) -> 
     return f"US.{symbol}{date_str}{cp}{strike_str}"
 
 
-# 卖单挂价相对当前 avg_entry 的负偏移 —— v1 直接用 avg_entry * (1 - SELL_SLIP)
-# 简化策略：模拟盘没真实 bid，先用 entry 价做参照位；上真盘后改用 query 报价
-# 偏移要够"吃"穿 bid，避免挂在 ask 上没人接
+# 卖单挂价相对参照价的负偏移 —— 偏移要够"吃"穿 bid，避免挂在 ask 上没人接。
+# [0010] 无价 CLOSE 的实时参照已落地：close_flow 经 broker.quote.
+# get_sell_ref_price 取 bid（优先）/last 传入 quote_ref。
 # TODO（实测调整）：
-#  - 接入 moomoo 实时 quote 后，用 bid * (1 - SELL_SLIP)
 #  - 分档：trim (pct<100) 用浅偏移、close (pct=100) 用深偏移
 #  - SL/EOD 触发时用更激进偏移
 SELL_SLIP = 0.05
 
 
-def calc_sell_limit(avg_entry: float, signal_price: float = None) -> "float | None":
+def calc_sell_limit(
+    avg_entry: float, signal_price: float = None, quote_ref: float = None,
+) -> "float | None":
     """卖出限价。
 
     优先级：
-      1. signal_price 存在 → 用 KC 喊的价 × (1 - SELL_SLIP)
-      2. signal_price 缺失 → 返回 None，**拒绝执行**
+      1. signal_price 存在 → 用 KC 喊的价 × (1 - SELL_SLIP)（现行为不变）
+      2. quote_ref 存在（[0010] CLOSE 无价时调用方取实时 bid/last，
+         见 broker.quote.get_sell_ref_price）→ quote_ref × (1 - SELL_SLIP)
+      3. 都无 → 返回 None，**拒绝执行**
 
     设计原则（"宁错过不错杀"）：
-    没有可靠价参照（信号没喊价 + OPRA 报价不可用）就不卖。
-    用 avg_entry 当兜底参照会**锁定 -5% 亏损**——曾在 TSLA 案例上踩坑。
+    没有可靠价参照（信号没喊价 + 实时报价不可得/stale）就不卖。
+    用 avg_entry 当兜底参照会**锁定 -5% 亏损**——曾在 TSLA 案例上踩坑；
+    avg_entry 参数保留只为签名兼容，永不作为参照价。
 
-    TODO（OPRA 到位后）: signal_price 缺失时 fallback 到 last_price，
-    都没有才返回 None。
+    纯函数：不做 I/O。quote_ref 的获取与 60s 新鲜度门在 broker.quote 侧，
+    是否启用 fallback 的开关（CLOSE_QUOTE_FALLBACK）在 close_flow 侧。
     """
-    if signal_price is None:
-        return None
-    return round(signal_price * (1 - SELL_SLIP), 2)
+    if signal_price is not None:
+        return round(signal_price * (1 - SELL_SLIP), 2)
+    if quote_ref is not None and quote_ref > 0:
+        return round(quote_ref * (1 - SELL_SLIP), 2)
+    return None
