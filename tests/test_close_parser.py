@@ -893,3 +893,56 @@ def test_zh_watchlist_skipped():
     from autotrade.parsing.close_parser import parse_close
     text = "丰富：\n明天的观察列表，5/12：\n\n今天我们在TSLA上赚了160%。锁定收益。\n\n@everyone"
     assert parse_close(text, {"TSLA"}) is None
+
+
+# ============================================================
+# [7/29] 建议句（不是指令）+ 叙述价（不是喊价）
+# ============================================================
+_OPEN = {"SPY", "GOOGL"}
+
+
+def test_suggestion_clause_not_a_close_command():
+    """"若想…离场" / "if you want to exit" 是选项不是指令。
+
+    7/29 夜实锤：ZH 孪生把它解析成 CLOSE 33% + 叙述价 1.50（实际约 2.5），
+    靠 runner-preserve 才没成交。EN 当晚返回 None 纯属侥幸——KC 写的小写
+    "spy" 没命中裸 ticker 抽取，写成大写就漏过去了，所以两侧都要挡。
+
+    必须在"是不是指令"这层挡：0010 之后 CLOSE_QUOTE_FALLBACK 默认开，
+    "无喊价" 不再等于拒卖（改为按实时 bid 卖），旧安全网没了。
+    """
+    for text in (
+        "KC Trades Bot: SPY看涨期权跌至1.50后回到入场价，若想止盈离场而非持有至FOMC，现在正是时机",
+        "KC Trades Bot:SPY calls dipped to 1.50 and back to entry, "
+        "if you want to exit for green, now is your chance",
+        "SPY 如果想减仓的话，现在可以",
+    ):
+        assert parse_close(text, _OPEN) is None, text
+
+
+def test_conditional_imperative_still_executes():
+    """条件-祈使句是真指令，不能被建议句防护误伤。
+
+    "若此前未减仓，可在此处操作" 同样带"若"，但动作不受"想"支配 ——
+    一刀切按"若"/"if" 抹会把 KC 的补单指令一起吃掉。
+    """
+    for text in (
+        "若此前未在2.54进行安全减仓，SPY可在此处减仓 @ 2.54",
+        "if you missed safety trim earlier, trim SPY here @ 2.54",
+    ):
+        r = parse_close(text, _OPEN)
+        assert r is not None, text
+        assert r["signal_price"] == 2.54, text
+
+
+def test_narrative_price_skipped_real_quote_taken():
+    """叙述价（跌至/dipped to）跳过，同句里真喊价仍要拿到。"""
+    r = parse_close("SPY 之前跌至1.50，现在减仓 @ 2.48", _OPEN)
+    assert r is not None and r["signal_price"] == 2.48
+
+
+def test_actionable_level_verb_not_treated_as_narrative():
+    """触及 是 KC 宣布可执行位的用词，不能进叙述价表
+    （加进去会让 lessons:zh_googl_sharp_prefix 的 7.00 喊价丢失）。"""
+    r = parse_close("#GOOGL 正在抛售！350 安全减仓区域已触及 7.00 ✅", _OPEN)
+    assert r is not None and r["signal_price"] == 7.0

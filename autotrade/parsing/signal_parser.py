@@ -50,6 +50,19 @@ def _next_friday(today: date) -> date:
     return today + timedelta(days=days_to_friday)
 
 
+def _third_friday(year: int, month: int) -> date:
+    """该月第三个周五 —— 美股月度期权（含 LEAPS）的标准到期日。
+
+    [7/29] KC "added SOFI 20c Jan 2027 leaps @ 1.22" 只给月+年不给日，
+    月度合约的到期日按规则就是第三个周五（2027-01 → 01-15）。
+    调用方仍要过 _adjust_expiry：第三个周五撞假日（如 Good Friday）时
+    整体前挪到周四，与 weekly 路径同一套回退。
+    """
+    d = date(year, month, 1)
+    d += timedelta(days=(4 - d.weekday()) % 7)  # 当月第一个周五
+    return d + timedelta(days=14)
+
+
 # === 假日调整封装 ===
 def _adjust_expiry(d: date, context: str = "") -> date:
     """把 expiry 调整到最近的交易日（向前回退）。
@@ -242,11 +255,52 @@ def parse_signal(text: str, msg_ts: date = None):
 def _try_pattern_a(text: str, today: date):
     """Pattern A: SYMBOL STRIKEc/p {MM/DD | Month DD} @ PRICE"""
 
+    # === A2L: 月份 + 四位年份（LEAPS 形态，无 day）===
+    # [7/29 实锤丢单] "added SOFI 20c Jan 2027 leaps @ 1.22"：下面 A2 的
+    # (\d{1,2}) 没有右边界，把年份 "2027" 截成 day=20 → 2027-01-20 →
+    # US.SOFI270120C20000 被 OPRA 拒（Unknown stock），整单丢失。
+    # 月度/LEAPS 到期日 = 第三个周五 = 2027-01-15（账户里真实持有的正是它）。
+    # 必须排在 A2 前面，且 A2 的 day 已加 (?!\d) 右边界双保险。
+    pattern_a2_leaps = re.compile(
+        rf"\b([A-Z]{{1,5}})\s+"
+        rf"(\d+(?:\.\d+)?)([cp])\s+"
+        rf"({MONTH_NAMES_RE})\s+(20\d{{2}})\b"
+        rf"(?:[^@\n]*?@\s*\$?(\d+(?:\.\d+)?))?",
+        re.IGNORECASE,
+    )
+    for m in pattern_a2_leaps.finditer(text):
+        symbol, strike, cp, month_name, yyyy, price = m.groups()
+        if not symbol.isupper():
+            continue
+        if symbol.upper() in {"I", "A", "THE", "AT", "ON", "IS", "DTE", "IPO"}:
+            continue
+        if price is None:
+            filled = re.search(r"filled?\s*@\s*\$?(\d+(?:\.\d+)?)", text, re.I)
+            if filled:
+                price = filled.group(1)
+        if price is None:
+            continue
+        mm = MONTH_NAME_TO_NUM[month_name.lower()]
+        return {
+            "raw": text,
+            "matched": m.group(0).strip(),
+            "symbol": symbol.upper(),
+            "side": "CALL" if cp.lower() == "c" else "PUT",
+            "strike": float(strike),
+            "expiry": f"{mm}/{int(yyyy)}",
+            "expiry_date": _adjust_expiry(
+                _third_friday(int(yyyy), mm), context="A2L Month YYYY (LEAPS)"
+            ),
+            "price": float(price),
+            "tags": _extract_tags(text),
+        }
+
     # === A2: 英文月份在先（优先级更高，避免 A1 误吃）===
+    # day 的 (?!\d) 右边界：没有它，"Jan 2027" 会被截成 day=20（见上方 A2L）。
     pattern_a2 = re.compile(
         rf"\b([A-Z]{{1,5}})\s+"
         rf"(\d+(?:\.\d+)?)([cp])\s+"
-        rf"({MONTH_NAMES_RE})\s+(\d{{1,2}})(?:st|nd|rd|th)?"
+        rf"({MONTH_NAMES_RE})\s+(\d{{1,2}})(?!\d)(?:st|nd|rd|th)?"
         rf"(?:[^@\n]*?@\s*\$?(\d+(?:\.\d+)?))?",
         re.IGNORECASE,
     )

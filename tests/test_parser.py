@@ -505,3 +505,33 @@ def test_detect_action_locked_past_tense_is_recap():
     from autotrade.parsing.signal_parser import detect_action
     # 过去式 "locked in 200%" 是 PnL 复盘，不是平仓动作
     assert detect_action("locked in 200% on my runners today, what a day") == "OPEN"
+
+
+# ============================================================
+# [7/29] LEAPS：Month YYYY（无 day）→ 当月第三个周五
+# ============================================================
+def test_leaps_month_year_uses_third_friday():
+    """7/29 夜真丢单：A2 的 (\\d{1,2}) 没有右边界，把年份 2027 截成 day=20
+    → US.SOFI270120C20000 被 OPRA 拒（Unknown stock），整单丢失。
+    月度/LEAPS 到期日 = 第三个周五 = 2027-01-15（账户里真实持有的正是它）。"""
+    r = parse_signal("added SOFI 20c Jan 2027 leaps @ 1.22", msg_ts=FIXED_TODAY)
+    assert r is not None
+    assert r["symbol"] == "SOFI" and r["strike"] == 20.0 and r["side"] == "CALL"
+    assert r["price"] == 1.22
+    assert r["expiry_date"] == date(2027, 1, 15)
+
+
+def test_leaps_third_friday_various_months():
+    for text, expected in (
+        ("AAPL 300c Dec 2027 leaps @ 8.50", date(2027, 12, 17)),
+        ("NVDA 250c Jun 2028 @ 12.00", date(2028, 6, 16)),
+    ):
+        r = parse_signal(text, msg_ts=FIXED_TODAY)
+        assert r is not None, text
+        assert r["expiry_date"] == expected, text
+
+
+def test_month_day_form_unaffected_by_leaps_pattern():
+    """A2 的 Month DD 形态不能被 A2L 抢走，也不能被 (?!\\d) 边界误伤。"""
+    r = parse_signal("NVDA 250c Sep 18 @ 4.20", msg_ts=FIXED_TODAY)
+    assert r is not None and r["expiry_date"] == date(2026, 9, 18)

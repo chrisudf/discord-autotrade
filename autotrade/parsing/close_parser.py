@@ -233,22 +233,18 @@ def _extract_signal_price(scope: str) -> "float | None":
 
     返回 None → caller fallback 到 entry-based 算法
     """
-    m = PRICE_AT_PATTERN.search(scope)
-    if m:
-        try:
-            v = float(m.group(1))
-            if 0.01 <= v <= 100:  # 期权合理价区间
-                return v
-        except ValueError:
-            pass
-    m = PRICE_BARE_PATTERN.search(scope)
-    if m:
-        try:
-            v = float(m.group(1))
-            if 0.01 <= v <= 100:
-                return v
-        except ValueError:
-            pass
+    # 两种形态都要过叙述价闸：命中就继续找下一个候选，而不是直接放弃——
+    # "SPY 跌至1.50后，减仓 @ 2.48" 里第一个是叙述、第二个才是喊价。
+    for pattern in (PRICE_AT_PATTERN, PRICE_BARE_PATTERN):
+        for m in pattern.finditer(scope):
+            if _price_is_narrative(scope, m.start(1)):
+                continue
+            try:
+                v = float(m.group(1))
+                if 0.01 <= v <= 100:  # 期权合理价区间
+                    return v
+            except ValueError:
+                continue
     return None
 
 
@@ -364,6 +360,59 @@ ZH_FULL_CLOSE_VERBS = ["平仓", "清仓", "全平", "清空", "全部卖出", "
 # 已知残留：全连写"止损全部卖出"（纯汉字无分隔）仍会整段被抹——正则层面无法与
 # "止损设在现价"区分，宁可漏卖（有 EN 孪生兜底）不可误卖。
 ZH_SL_ADJUST_CLAUSE_RE = re.compile(r"(?<!防)止损[一-鿿0-9.．%％+\-]*")
+
+# 建议句（"若想…就…"）—— 是选项不是指令，动词判定前整句抹掉。
+# 7/29 实测最危险的一条：
+#   "SPY看涨期权跌至1.50后回到入场价，若想止盈离场而非持有至FOMC，现在正是时机"
+# ZH 把它解析成 CLOSE 33%，还把叙述价 1.50 当卖出参照（当时实际约 2.5）。
+# EN 孪生 "if you want to exit for green" 当晚返回 None 纯属侥幸——KC 写的是
+# 小写 "spy"，裸 ticker 抽取要求大写才没命中；下次他写 "SPY" 就漏过去了。
+#
+# 为什么必须在"是不是指令"这一层挡，而不是只修价格：
+# 0010 落地后 CLOSE_QUOTE_FALLBACK 默认开，"信号无喊价" 不再等于拒卖
+# （改为按实时 bid 卖）。旧的"无价→拒卖"安全网没了，建议句会真成交。
+#
+# 边界收得很紧，只认 想（want）系：
+#   "若想止盈离场"        → 建议，抹掉 ✅
+#   "若此前未减仓，可在此处操作" → 祈使句（KC 让你现在做），**不抹**
+# 后者同样带"若"，但动作不受"想"支配——一刀切按"若"抹会漏掉真指令。
+ZH_SUGGESTION_CLAUSE_RE = re.compile(
+    r"(?:若想|如果想|若你想|如果你想|想要的话)[^，,。！？\n]*"
+)
+
+# EN 对应形态："if you want/wish/'d like to <verb>"。
+# 同样只认 want 系；"if you missed the trim earlier, trim here @ 2.54" 这类
+# 条件-祈使句不在内（那是真指令）。
+EN_SUGGESTION_CLAUSE_RE = re.compile(
+    r"\bif\s+(?:you|u)\s*(?:'d|\bwould\b|\bwant\b|\bwish\b|\bcare\b)[^,.\n]*",
+    re.IGNORECASE,
+)
+
+# 叙述价：价格前紧邻"跌至/回到/涨到"这类**行情叙述**动词时，那个数字是在
+# 描述走势，不是喊卖价。7/29 "跌至1.50后回到入场价" 实锤（见上）。
+# 与建议句防护是两层独立防线：建议句挡"要不要卖"，本表挡"按什么价卖"——
+# 只要有一条真指令句里夹了叙述价（"减仓 SPY，之前跌至1.50"），前者就拦不住。
+# 收词很克制——只收"纯粹在描述走势"的动词。以下几个**特意排除**，每个都对应
+# 一次真实误伤或明确的反例：
+#   触及 —— KC 用它宣布可执行位，不是叙述：
+#           "#GOOGL 正在抛售！350 安全减仓区域已触及 7.00" 的 7.00 就是喊价
+#           （lessons:zh_googl_sharp_prefix，加进来当场变红）；
+#   最高/最低、low of/high of —— 无语料支撑，不臆测；
+#   down to/up to —— "down to runners" 是 KC 高频黑话，且 "trim down to 2.50"
+#           里的数字是目标不是叙述，歧义太大。
+_NARRATIVE_PRICE_MARKERS = (
+    "跌至", "跌到", "跌破", "涨至", "涨到", "回到", "回落至", "回落到",
+    "反弹至", "反弹到",
+    "dipped to", "dip to", "fell to", "dropped to", "back to",
+    "rallied to", "ran to",
+)
+_NARRATIVE_LOOKBACK = 12
+
+
+def _price_is_narrative(scope: str, price_start: int) -> bool:
+    """价格 token 前 _NARRATIVE_LOOKBACK 字符内是否有行情叙述动词。"""
+    window = scope[max(0, price_start - _NARRATIVE_LOOKBACK):price_start].lower()
+    return any(mk in window for mk in _NARRATIVE_PRICE_MARKERS)
 
 # "出半"（EN "out half" 的 ZH 孪生，7/23 NBIS 漏路由）——两侧都要边界：
 # 右边界：裸"出半"后不能跟汉字（"冲出半年新高"类评论，7/23 对抗评审实锤）；
@@ -626,6 +675,10 @@ def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
     if _has_recap_marker(text_lower):
         logger.info(f"[close_parser] EN skip (recap): {text[:80]}")
         return None
+    # 建议句抹掉（见 EN_SUGGESTION_CLAUSE_RE 注释，7/29 SPY "if you want to exit"）。
+    # 与 ZH 侧同一层：EN 当晚返回 None 靠的是 KC 写了小写 "spy"，不是防护。
+    text = EN_SUGGESTION_CLAUSE_RE.sub(" ", text)
+    text_lower = text.lower()
     if not _has_action_verb(text_lower):
         return None
 
@@ -782,6 +835,8 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
     text = ZH_OUT_HALF_RE.sub("减半", text)
     # 移动止损备注抹掉（见 ZH_SL_ADJUST_CLAUSE_RE 注释，7/23 AVGO 误判）
     text = ZH_SL_ADJUST_CLAUSE_RE.sub(" ", text)
+    # 建议句抹掉（见 ZH_SUGGESTION_CLAUSE_RE 注释，7/29 SPY "若想止盈离场"）
+    text = ZH_SUGGESTION_CLAUSE_RE.sub(" ", text)
     if not _has_zh_action(text):
         return None
 
