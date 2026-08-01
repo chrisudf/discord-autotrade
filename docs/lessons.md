@@ -599,6 +599,78 @@ sleep period. Root cause is environmental — `caffeinate -is make run`.
 
 ---
 
+## 19. A full disk erases the evidence of the outage it causes — log-only error handling is not error handling
+
+**Symptom**: 7/31 overnight (09:50:20–09:50:42 AEST = 19:50 ET) the sl/tp/eod
+watchers threw 33 consecutive `sqlite3.OperationalError: disk I/O error` as the
+volume hit zero free space. Telegram said nothing. Worse, `app_2026-08-01.log`
+jumps straight from `08:34:13` to `11:10:35` and `logs/errors/error_2026-08-01.log`
+is **0 bytes** — the 33 ERROR records are the only thing that happened in that
+window, and they are exactly what was lost. Without the terminal happening to be
+open there would have been no trace at all that all three risk watchers went down.
+
+**Why non-obvious**:
+- Every watcher's `except` was `logger.exception(...)`, which reads as
+  "loud and recorded". It is — right up until the failure mode *is* the log
+  sink. The one incident class that most needs an audit trail is the one that
+  cannot write one.
+- `loguru` degrades quietly here: a failing sink prints `--- Logging error ---`
+  to stderr and drops the record. The process stays healthy, other sinks keep
+  working, and nothing raises — so a "log and continue" loop genuinely continues,
+  just blind.
+- sqlite and the log sink shared a failure domain (same volume). Two independent-
+  looking defenses died to one cause.
+- The disk pressure came from outside the repo entirely (the checkout is ~4 MB).
+  Nothing in the app's own footprint hinted at it, and `preflight()` checks
+  broker, OPRA and risk budget but never free space.
+- The watcher loops *did* survive (`while True: try/except` held, and
+  `asyncio.CancelledError` is a `BaseException` so it isn't swallowed) — so
+  "process still up" was true and meaningless.
+
+**Defense**: [autotrade/notify/watchdog.py](../autotrade/notify/watchdog.py) —
+watcher `except` branches now call `notify_tick_error()`, which keeps the
+traceback in the log *and* pushes a Telegram alert down an independent path,
+first-failure-immediate then throttled per scope
+(`WATCHER_ERROR_ALERT_COOLDOWN_SEC`, default 300s; 33 alerts in 22s would be its
+own outage — see lesson 12 and the 7/23 runner-preserve noise). Recovery emits a
+matching ✅ with the suppressed count, so "it broke" and "it's fine now" are both
+observable. The alerting path is fully exception-guarded: a protection mechanism
+must never become a new failure source. Still open (see ROADMAP P1): a preflight
+free-space gate and a size-capped log rotation, so the condition is refused at
+startup rather than discovered at 3am.
+
+---
+
+## 20. Signal grammar drifts mid-flight: the same author inverts price and strike without warning
+
+**Symptom**: 7/31 13:41 ET, `$AAOI scalp 0DTE $.70 $98 calls` failed to parse and
+the trade was missed — both the EN message and its ZH twin. Every Pattern B
+variant (B0/B0.5/B1/B1b/B2/B3) hardcodes `$STRIKE calls … $PRICE`; this one put
+the fill price first.
+
+**Why non-obvious**:
+- The message is otherwise perfectly ordinary — right ticker, right tag, right
+  DTE. Nothing about it looks malformed to a human, which is why it doesn't
+  register as "a new format" when you skim the channel.
+- It failed *silently into the noise floor*: the same night produced legitimate
+  `Parse failed` warnings for level broadcasts, weekly recaps and buy lists. One
+  real miss inside a stream of correct rejections is invisible without
+  reconstructing intent per message.
+- The obvious fix (add an inverted copy of each B pattern) doubles a regex family
+  that already has six members and six expiry paths.
+
+**Defense**: normalize word order at the entrance instead —
+`_normalize_inverted_price()` in
+[autotrade/parsing/signal_parser.py](../autotrade/parsing/signal_parser.py)
+rewrites `$PRICE $STRIKE calls` into canonical order, so the existing B ladder
+supplies all the expiry/tag logic unchanged (same tactic as the ZH direction-word
+normalization above it). Two guards keep it from swapping the fields the wrong
+way — which would place a limit order at the *strike* — the price must carry a
+decimal point (this channel quotes premiums with cents and strikes as integers,
+so `$740 $745 calls` spread notation is rejected), and price must be < strike.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -914,6 +986,8 @@ python -m autotrade.diag.diag_handle_message_real
 | 16 | 全量 re-login 不回放漏掉的消息 | `test_backfill.py::test_backfill_replays_missed`、`::test_backfill_idempotent_against_already_seen`、`::test_backfill_noop_without_disconnect_wall`、`::test_backfill_consumes_wall_timestamp` |
 | 17 | history 的 limit 截断掉的是**最新**几条 | `test_overnight_0728.py::test_backfill_truncation_drops_oldest_not_newest`；`test_backfill.py::_FakeChannel` 现按真实语义模拟 `oldest_first`/`limit` |
 | 18 | monotonic 在系统睡眠中不走 | `test_overnight_0728.py::test_churn_counts_wall_clock_window`（挂钟记账）、`::test_alive_gap_pulls_backfill_anchor_and_alerts_once`（反向利用:挂钟心跳跳变=睡眠指纹） |
+| 19 | 磁盘写满会擦掉它自己造成的故障证据 | `test_overnight_0731.py::test_first_error_alerts_immediately`、`::test_burst_is_throttled_to_one_alert`、`::test_scopes_throttle_independently`、`::test_recovery_notifies_once_with_missed_count`、`::test_alerting_failure_never_escapes`、`::test_healthy_ticks_are_silent`。**磁盘闸门与日志尺寸上限尚未实现**（ROADMAP P1 #10），当前防御只覆盖"告警发得出去"，不覆盖"提前拒绝启动" |
+| 20 | 喊价/行权价语序会中途倒过来 | `test_overnight_0731.py::test_inverted_price_strike_now_parses`（EN+ZH 双播）、`::test_inverted_order_across_expiry_forms`、`::test_canonical_order_unaffected`、`::test_swap_guards_reject_non_premium`、`::test_price_levels_broadcast_still_skipped` |
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |

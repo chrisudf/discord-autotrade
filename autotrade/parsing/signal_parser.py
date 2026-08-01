@@ -151,6 +151,39 @@ PRICE_RANGE_PATTERN = re.compile(
 
 CHINESE_MARKERS = ["美股会员网rich", "美股会员网机器人"]
 
+# [7/31 实锤丢单] "$AAOI scalp 0DTE $.70 $98 calls"（13:41 ET 盘中）——喊价写在
+# 行权价**前面**。Pattern B 全系列（B0/B0.5/B1/B1b/B2/B3）都硬编码
+# "$STRIKE calls ... $PRICE" 语序，倒过来写一条都接不住，中英双播两条全丢。
+# 与其给 B 每个变体再写一份倒序副本（6 份正则 × 到期日逻辑），不如在入口做
+# 一次语序归一化，改写成规范序后复用既有 B 阶梯——到期日/tag 逻辑自动继承，
+# 与上面 ZH 方向词归一化是同一套路子。
+#
+# 两道护栏防止把 strike 和 price 换反（换反 = 用 $98 的限价买 $0.70 的合约）：
+#   1. price 必须带小数点（".70" / "1.50"）——本频道喊价一律带分位，
+#      行权价一律整数；这条直接排掉 "$740 $745 calls" 这类价差写法
+#   2. price < strike——期权权利金没有高过行权价的
+_INVERTED_PRICE_STRIKE_RE = re.compile(
+    r"\$(\.\d+|\d+\.\d+)"                             # $PRICE（必须带小数点）
+    r"\s+"
+    r"\$(\d+(?:\.\d+)?)"                              # $STRIKE
+    r"(\s*(?:[a-z0-9]+\s+){0,3}?(?:calls?|puts?))",   # [填充词] calls/puts
+    re.IGNORECASE,
+)
+
+
+def _normalize_inverted_price(text: str) -> str:
+    """把 "$PRICE $STRIKE calls" 改写成 "$STRIKE calls $PRICE"（规范序）。
+
+    不匹配 / 护栏不过 → 原样返回，对既有语序零影响。
+    """
+    def _swap(m):
+        price, strike, tail = m.group(1), m.group(2), m.group(3)
+        if float(price) >= float(strike):
+            return m.group(0)
+        return f"${strike}{tail} ${price}"
+
+    return _INVERTED_PRICE_STRIKE_RE.sub(_swap, text)
+
 
 def _strip_chinese(text: str) -> str:
     for marker in CHINESE_MARKERS:
@@ -218,6 +251,11 @@ def parse_signal(text: str, msg_ts: date = None):
     # 指纹 dedup 自然吸收。只认完整词"看涨期权/看跌期权"——裸"看涨/看跌"
     # 在行情评论里太常见（"我看涨大盘"），不碰。
     text = text.replace("看涨期权", " calls ").replace("看跌期权", " puts ")
+
+    # 语序归一化：喊价前置 → 规范序（见 _INVERTED_PRICE_STRIKE_RE）。
+    # 必须在 ZH 方向词归一化之后——ZH 版 "$.70 $98 看涨期权" 要先变出 "calls"
+    # 才能被倒序正则认出来。
+    text = _normalize_inverted_price(text)
 
     if _has_skip_keyword(text) or _HOLDING_TICKER_RE.search(text):
         logger.info(f"[parser] skip (holding/remaining): {text[:60]}")

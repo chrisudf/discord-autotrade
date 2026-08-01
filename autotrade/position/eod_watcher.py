@@ -46,6 +46,7 @@ from autotrade.position.sell_executor import Outcome, SellPlan, SkipSell, execut
 from autotrade.notify.transport import send_telegram
 # format_close_filled 已随成交 TG 收进 sell_executor（0015），此处只剩错误文案
 from autotrade.notify.messages import format_error
+from autotrade.notify.watchdog import notify_tick_error, notify_tick_ok
 from autotrade.utils.logger import logger
 
 ET_TZ = ZoneInfo("America/New_York")
@@ -278,6 +279,7 @@ async def run_eod_watcher():
         try:
             now_et = datetime.now(timezone.utc).astimezone(ET_TZ)
             await _eod_tick(now_et)
-        except Exception:
-            logger.exception("[eod] tick error (continuing)")
+            notify_tick_ok("eod")
+        except Exception as e:
+            notify_tick_error("eod", e)
         await asyncio.sleep(_cfg()["interval"])

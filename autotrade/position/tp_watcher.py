@@ -36,6 +36,7 @@ from autotrade.storage import positions_db
 from autotrade.notify.transport import send_telegram
 # format_close_filled 已随成交 TG 收进 sell_executor（0015），此处只剩错误文案
 from autotrade.notify.messages import format_error
+from autotrade.notify.watchdog import notify_tick_error, notify_tick_ok
 from autotrade.utils.logger import logger
 
 
@@ -187,6 +188,7 @@ async def run_tp_watcher():
     while True:
         try:
             await _tp_tick()
-        except Exception:
-            logger.exception("[tp] tick error (continuing)")
+            notify_tick_ok("tp")
+        except Exception as e:
+            notify_tick_error("tp", e)
         await asyncio.sleep(_cfg()["interval"])

@@ -18,6 +18,7 @@ from autotrade.config.channel_loader import registry
 # `handle_message` 全局调用,tests(test_backfill)才能 monkeypatch 它。
 from autotrade.listener.router import handle_message
 from autotrade.notify.transport import send_telegram
+from autotrade.notify.watchdog import notify_tick_error, notify_tick_ok
 from autotrade.storage.logger_db import processed_msg_ids_since
 from autotrade.utils.envcfg import env_int
 
@@ -255,10 +256,11 @@ async def run_alive_heartbeat():
             _last_alive_wall = now
             if prev is not None and (now - prev).total_seconds() > _ALIVE_GAP_SEC:
                 await _on_alive_gap(prev, now)
+            notify_tick_ok("alive")
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("[alive] heartbeat tick error (continuing)")
+        except Exception as e:
+            notify_tick_error("alive", e)
 
 
 async def startup_backfill(minutes: int):

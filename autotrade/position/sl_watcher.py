@@ -44,6 +44,7 @@ from autotrade.position.sell_executor import SellPlan, execute_sell
 from autotrade.notify.transport import send_telegram
 # format_close_filled 已随成交 TG 收进 sell_executor（0015），此处只剩错误文案
 from autotrade.notify.messages import format_error
+from autotrade.notify.watchdog import notify_tick_error, notify_tick_ok
 from autotrade.utils.envcfg import env_int
 from autotrade.utils.logger import logger
 
@@ -226,7 +227,10 @@ async def run_sl_watcher():
     while True:
         try:
             await _sl_tick()
-        except Exception:
-            logger.exception("[sl] tick error (continuing)")
+            notify_tick_ok("sl")
+        except Exception as e:
+            # [7/31] 只 logger.exception 不够：磁盘写满那晚日志本身就写不进去，
+            # 风控三路全灭却零告警。改走 watchdog（落日志 + 节流 TG）
+            notify_tick_error("sl", e)
         # 实时读 interval 让运行时调参生效
         await asyncio.sleep(_cfg()["interval"])

@@ -39,6 +39,7 @@ import os
 from autotrade.broker.common import _is_dry_run
 from autotrade.broker.trade import list_open_option_positions
 from autotrade.notify.transport import send_telegram
+from autotrade.notify.watchdog import notify_tick_error, notify_tick_ok
 from autotrade.storage import positions_db
 from autotrade.utils.envcfg import env_int
 from autotrade.utils.logger import logger
@@ -189,10 +190,11 @@ async def run_reconciler():
     while True:
         try:
             await _reconcile_tick()
+            notify_tick_ok("reconcile")
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("[reconcile] tick error (continuing)")
+        except Exception as e:
+            notify_tick_error("reconcile", e)
         # 实时重读 interval（同 sl_watcher 风格）；防御 max(_,1)：运行中被改成
         # <=0 也不 busy-loop（正常路径 env<=0 时 task 压根不存在）
         await asyncio.sleep(max(_interval_min(), 1) * 60)
