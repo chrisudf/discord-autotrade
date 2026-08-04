@@ -8,7 +8,7 @@
 #
 # 结构（为什么绕这一圈，见 launch_in_terminal.sh 的注释）：
 #   launchd → ~/Library/Application Support/autotrade-ops/launch_in_terminal.sh
-#           → open -a Terminal → 项目里的 night_run.sh / morning_review.sh
+#           → open -a Terminal → 项目里的 night_run.sh / morning_collect.sh
 # launchd 读不了 ~/Desktop（TCC），所以它只碰 Application Support；
 # 项目目录的读写全部发生在 Terminal.app 那边。
 set -eu
@@ -42,11 +42,9 @@ chmod +x "$PROJ"/ops/*.sh
 cp "$PROJ/ops/launch_in_terminal.sh" "$APPSUP/launch_in_terminal.sh"
 chmod +x "$APPSUP/launch_in_terminal.sh"
 
-# launchd 不继承登录 shell 的 PATH。把 node 目录也塞进去（morning_review.sh
-# 里还有一层兜底查找）。注意这个 PATH 传给的是垫片，真正的活儿在 Terminal
-# 里跑，那边用的是登录 shell 的环境。
-NODE_BIN=$(dirname "$(command -v claude 2>/dev/null || command -v node 2>/dev/null || echo /usr/bin/false)")
-LAUNCHD_PATH="$NODE_BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# launchd 不继承登录 shell 的 PATH。这个 PATH 只给垫片用，真正的活儿在
+# Terminal 里跑，那边是登录 shell 的完整环境。
+LAUNCHD_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 emit_plist() {
   local label=$1 script=$2 hour=$3 minute=$4 short=${1##*.}
@@ -98,7 +96,7 @@ EOF
 }
 
 emit_plist "$NIGHT_LABEL"   night_run.sh      23 15
-emit_plist "$MORNING_LABEL" morning_review.sh  7  0
+emit_plist "$MORNING_LABEL" morning_collect.sh  7  0
 
 cat <<TIP
 
