@@ -1,10 +1,14 @@
 #!/bin/zsh
-# 每早 07:00（本机时区）由 launchd 触发。
+# 每早 07:00（本机时区）跑。
 #   1. 优雅停掉夜里的 listener
 #   2. 把整晚 terminal log 存成桌面 txt
 #   3. 从 trades.db 抽一份当晚信号/成交摘要
 #   4. Opus 5 headless 复盘 -> markdown 报告
-#   5. 打开报告，并开一个 Terminal 接着那次会话继续追问
+#   5. 打开报告，并就地接着那次会话进入交互，可直接追问
+#
+# 本脚本在 Terminal.app 窗口里执行，不是由 launchd 直接执行 ——
+# launchd 读不了 ~/Desktop（TCC），中间隔着 launch_in_terminal.sh 这层垫片，
+# 原因见那个文件的注释。所以这里可以放心读写项目目录和桌面。
 #
 # 手动演练（跑 1-3 步，不烧 token、不开窗口）：
 #   zsh ops/morning_review.sh --no-claude
@@ -29,19 +33,24 @@ fi
 mkdir -p "$OUT_DIR" "$PROJ/logs"
 log_ops() { echo "$(date '+%F %T') morning: $*" >> "$OPS_LOG"; }
 
+# 匹配 Makefile 实际起的完整命令行，不能只匹配 "autotrade.app.main" ——
+# 那样任何命令行里含这个串的进程都会被当成 listener，早上就会误杀
+# 一个只是在 grep 的 shell，而真正的 listener 反倒没停。见 night_run.sh 同名注释。
+LISTENER_PAT='bin/python -m autotrade\.app\.main'
+
 # ---------- 1. 停 listener ----------
 # 先停再存：main.py 的 SIGTERM handler 会走 shutdown()，收尾日志也要进文件。
-PIDS=$(pgrep -f "autotrade.app.main" || true)
+PIDS=$(pgrep -f "$LISTENER_PAT" || true)
 if [[ -n "$PIDS" ]]; then
   log_ops "SIGTERM -> ${PIDS//$'\n'/ }"
   kill -TERM ${=PIDS} 2>/dev/null
   for _ in {1..60}; do
-    pgrep -f "autotrade.app.main" > /dev/null || break
+    pgrep -f "$LISTENER_PAT" > /dev/null || break
     sleep 1
   done
-  if pgrep -f "autotrade.app.main" > /dev/null; then
+  if pgrep -f "$LISTENER_PAT" > /dev/null; then
     log_ops "graceful stop timed out after 60s, SIGKILL"
-    pkill -KILL -f "autotrade.app.main"
+    pkill -KILL -f "$LISTENER_PAT"
   else
     log_ops "stopped cleanly"
   fi
@@ -170,18 +179,11 @@ log_ops "claude review exit=$RC -> $REPORT"
 # ---------- 5. 摊开给人看 ----------
 [[ -f "$REPORT" ]] && open "$REPORT"
 
-# 接着 headless 那次会话开交互窗口，上下文都在，可以直接追问。
-# 同样用 .command + open（osascript 那条路要 Automation 授权，见 night_run.sh 注释）。
-CMD_FILE="$PROJ/ops/.morning_review.command"
-cat > "$CMD_FILE" <<EOF
-#!/bin/zsh
-cd "$PROJ" || exit 1
+# 本脚本已经在 Terminal 窗口里，直接就地接续 headless 那次会话，
+# 上下文都在，可以直接追问 —— 不用再开第二个窗口。
+log_ops "interactive session (resume $SID)"
+echo
 echo "昨晚复盘报告: $REPORT"
 echo "接续 headless 复盘会话，可直接追问。"
 echo
 exec "$CLAUDE_BIN" --model claude-opus-5 --resume "$SID"
-EOF
-chmod +x "$CMD_FILE"
-
-/usr/bin/open -a Terminal "$CMD_FILE"
-log_ops "interactive session opened (resume $SID)"

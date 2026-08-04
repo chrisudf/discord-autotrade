@@ -15,5 +15,3 @@ config/channels.json.*
 data/
 logs/
 *.egg-info/
-# ops/ 下每晚现生成的一次性启动脚本，不入库
-ops/.*.command
