@@ -27,7 +27,7 @@ def categorize(
     Returns:
         (category, apply_sl, eod_force_close)
 
-    决策矩阵：
+    决策矩阵（eod_force 另见下方 day_trade 覆盖）：
         DTE  | lotto | category    | apply_sl | eod_force
         -----+-------+-------------+----------+----------
         0    | no    | 0dte        | False    | True
@@ -45,15 +45,25 @@ def categorize(
         dte = 0
 
     is_lotto = "lotto" in tags
-    eod_force = (dte == 0)
+    # day_trade：信号原文明说当日了结（8/3 KC "AMZN 275p 4DTE @ 1.65 day trade"）。
+    # 这个 tag 一直被解析、落库、打进 TG，却只在 guards 里当 DTE 上限用——EOD
+    # 完全不看它。8/3 实测后果：该单按 DTE=4 归 weekly、eod_force=False，
+    # 同晚 KC "-15% 离场" 的喊话又漏接（见 close_parser._OUT_BARE_SYM_PATTERN），
+    # 一笔"日内"仓位就这么过夜了。
+    # 与 0DTE 同等对待：收盘前强平，不赌隔夜。只翻 eod_force——
+    # category / apply_sl 及其余风控路径逐字不变（weekly 仍吃 50% 止损）。
+    eod_force = (dte == 0) or ("day_trade" in tags)
 
+    # 三个非 0DTE 分支原本硬写 False（当时 eod_force 只可能来自 dte==0，
+    # 写死与传变量等价）。现在 day_trade 也能置位，必须一律回传 eod_force——
+    # 否则 8/3 那笔 weekly day_trade 仍然过夜，改了等于没改。
     if dte == 0:
         return ("0dte_lotto" if is_lotto else "0dte"), False, eod_force
     if is_lotto:
-        return "lotto", False, False
+        return "lotto", False, eod_force
     if dte <= 7:
-        return "weekly", True, False
-    return "swing", False, False
+        return "weekly", True, eod_force
+    return "swing", False, eod_force
 
 
 def calc_qty_to_sell(position: dict, pct: int) -> int:

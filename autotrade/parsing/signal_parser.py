@@ -14,10 +14,15 @@ Rules (2026-06):
 import re
 from datetime import date, timedelta
 from autotrade.parsing.holidays import adjust_to_trading_day, is_trading_day
-# out N% 的模式只有一份，定义在 close_parser（"out" 短语词表的所在地），
+# "out" 系模式只有一份，定义在 close_parser（"out" 短语词表的所在地），
 # 这里 import 复用：路由与解析必须同进同退。close_parser 只依赖 re/logger，
 # 不反向 import 本模块，无循环风险。
-from autotrade.parsing.close_parser import _OUT_PCT_PATTERN
+from autotrade.parsing.close_parser import (
+    _OUT_BARE_SYM_PATTERN,
+    _OUT_FRACTION_PATTERN,
+    _OUT_PCT_PATTERN,
+    _ZH_OUT_FRACTION_PATTERN,
+)
 from autotrade.utils.logger import logger
 
 
@@ -907,7 +912,10 @@ STRONG_CLOSE_RE = re.compile(
     # 右边界拦"冲出半年新高"，左边界拦"走出半V型反转"（ASCII 跟随右边界拦不住），
     # "出半仓" 变体后面允许任意接续（"出半仓于2.45"）。
     r"|(?<![一-鿿])出半(?:仓|(?![一-鿿]))"
-    r"|锁定",
+    # 8/3 同型漏检：enrich "$TSLA 出 1/2"（EN "$TSLA out 1/2"）双语双漏。
+    # 边界与 close_parser.ZH_OUT_FRACTION_RE 共用同一份 pattern 串。
+    r"|" + _ZH_OUT_FRACTION_PATTERN
+    + r"|锁定",
     re.I,
 )
 WEAK_CLOSE_RE = re.compile(
@@ -918,6 +926,15 @@ WEAK_CLOSE_RE = re.compile(
     # (_OUT_PCT_PATTERN,含 knocked-out 解说的 lookbehind),这里 import 复用——
     # 路由与解析同进同退,两边写法漂移就是漏单裂缝。
     r"|" + _OUT_PCT_PATTERN
+    # 8/3 实测：KC "out AMZN -15%" 与 enrich "$TSLA out 1/2" 双双落到 OPEN 解析
+    # 失败——裸 "out <TICKER>" 和 "out <分数>" 两个形状 EN 侧一直没进路由词表。
+    # 两份 pattern 同样 import 自 close_parser，与解析同进同退。
+    # 放 WEAK 而非 STRONG：OPEN_INTENT 一票否决保留（"out AMZN, adding SPY"
+    # 这种混合句宁可判 OPEN——误平的代价大于漏平，见 close_parser 顶部注释）。
+    # 裸 ticker 分支大小写敏感（(?-i:) 局部关掉本 RE 的 re.I），否则
+    # "out of the money" 会被当平仓，理由详见 _OUT_BARE_SYM_PATTERN。
+    + r"|" + _OUT_FRACTION_PATTERN
+    + r"|(?-i:" + _OUT_BARE_SYM_PATTERN + r")"
     + r"|\bselling\b"
     r"|\bscaling\s+down\b",
     re.I,

@@ -14,7 +14,12 @@ from autotrade.listener.dedup import (
     _unregister_close_fp,
     runner_preserve_should_alert,
 )
-from autotrade.listener.heuristics import _close_is_open_twin, _looks_like_close_attempt
+from autotrade.listener.heuristics import (
+    _close_is_open_twin,
+    _close_is_zh_twin_of_skipped_en,
+    _looks_like_close_attempt,
+    _record_close_skip,
+)
 from autotrade.notify.messages import (
     format_close_skipped,
     format_error,
@@ -64,6 +69,9 @@ async def handle_close_signal(
     parsed = parse_close(raw, open_symbols)
     if parsed is None:
         logger.info(f"[CLOSE] parser skipped: {raw[:80]}")
+        # EN 原文判定"不是平仓指令"要留痕，供 60s 内的 ZH 机翻孪生查
+        # （8/3 SPY 误平，见 heuristics._close_is_zh_twin_of_skipped_en）
+        _record_close_skip(channel_id, raw, open_symbols)
         # 只对"含 ticker + 价格 hint"的发 TG：捕获真漏检（如 ZH 公司名映射失败）
         # 过滤无 ticker 的 follow-up close（如 "trim runners here at 3.45"）
         if _looks_like_close_attempt(raw):
@@ -120,6 +128,17 @@ async def handle_close_signal(
                 f"疑似开仓消息的翻译孪生，不平仓：{twin_reason}", raw,
             ))
             # 已发专属 TG，不再让外层报 "no matching"
+            outcomes.append((Outcome.SKIPPED_NOTIFIED, symbol))
+            continue
+
+        # 机翻孪生防护：同一条消息的 EN 原文刚被判定为"非平仓指令"
+        # （8/3 SPY "I personally am swinging them" → ZH 版把仓位卖了）
+        zh_twin_reason = _close_is_zh_twin_of_skipped_en(channel_id, symbol, parsed)
+        if zh_twin_reason:
+            logger.warning(f"[CLOSE] zh-twin guard: {zh_twin_reason} — skip")
+            await _safe_notify(format_close_skipped(
+                f"英文原文未判为平仓指令，中文孪生不执行：{zh_twin_reason}", raw,
+            ))
             outcomes.append((Outcome.SKIPPED_NOTIFIED, symbol))
             continue
 

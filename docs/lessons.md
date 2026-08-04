@@ -671,6 +671,80 @@ so `$740 $745 calls` spread notation is rejected), and price must be < strike.
 
 ---
 
+## 21. Bilingual redundancy is not redundancy when both channels degrade on the same message
+
+**Symptom**: 8/3 10:27 ET, KC posted `out AMZN -15%` and its ZH twin
+`减持亚马逊 -15%`. Neither closed the position. The EN copy never even reached
+the close parser — `detect_action` routed it to OPEN, because `STRONG_CLOSE_RE`
+only knew `out of` and `WEAK_CLOSE_RE` only knew `out half/full/majority` and
+`out N%`; bare `out <TICKER>` was in neither. The ZH copy *did* parse, but
+`减持` sits in `ZH_ACTION_VERBS` and not `ZH_FULL_CLOSE_VERBS`, so pct fell to
+the trim default of 33, which a 1-contract position turns into a
+runner-preserve skip. The author exited at −15%; we carried the put overnight.
+
+**Why non-obvious**: the whole design leans on "ZH arrives, EN backstops it
+1–3s later" (module docstring of `close_parser`, and the 63%/100% pairing stats
+behind it). That reads like two independent samples. It isn't — the ZH text is a
+*machine translation of the same sentence*, so an unusual phrasing perturbs both
+copies at once, in different ways. Here `out` → `减持` was a lossy translation
+(exit → reduce) and `out AMZN` was an unlisted EN form; each failure alone was
+survivable, and the pair was not. Any postmortem that reads "but the twin should
+have caught it" is describing a correlation the architecture never had.
+
+The same night produced a second instance of the identical shape, opposite
+direction: 16:06 ET `…if you don't want to swing you can close until 4:15pm EST.
+I personally am swinging them` was correctly skipped in EN and executed as
+`CLOSE 100%` from the ZH translation `若不想持仓过夜，可…平仓` — a conditional
+whose main clause carries the verb, attached to a message where the author says
+outright he is holding. Sold 1.63 against a 1.93 entry.
+
+**Defense**: two layers, deliberately independent.
+- *Semantic*, in [close_parser.py](../autotrade/parsing/close_parser.py):
+  `_OUT_BARE_SYM_PATTERN` (bare `out <TICKER>` = full close, uppercase-only via
+  `(?-i:)` plus a stopword list, still whitelist-gated downstream),
+  `ZH_OPTIONAL_CLAUSE_RE` / `EN_OPTIONAL_CLAUSE_RE` (negated conditionals mask to
+  *sentence* end, not comma — the action lives in the main clause), and
+  `AUTHOR_HOLD_MARKERS` / `ZH_AUTHOR_HOLD_MARKERS`.
+- *Structural*, in [heuristics.py](../autotrade/listener/heuristics.py):
+  `_close_is_zh_twin_of_skipped_en` — if the EN source text was judged "not an
+  instruction" within 60s, the ZH machine translation of it does not execute,
+  whatever it says. Asymmetric on purpose: EN is the source, so ZH-skipped never
+  blocks EN. This one costs nothing to maintain and catches the *next* weird
+  translation, which is the failure we cannot enumerate in advance.
+
+Note what was **not** changed: `减持` still means trim (pct=33). Promoting it to
+full-close to fix this one message would reprice every genuine trim signal. The
+fix belongs on the EN side, which arrives first and is the source of truth.
+
+---
+
+## 22. A tag that is parsed, stored and displayed is not a tag that does anything
+
+**Symptom**: 8/3, `AMZN 275p 4DTE @ 1.65 day trade` opened with
+`tags=['day_trade']` and `eod_force_close=False`, and was still open the next
+morning. `categorize()` derived `eod_force` from `dte == 0` alone; `day_trade`
+was consumed only by `policy/guards.py` as a DTE ceiling. The tag appeared in the
+parse log, in the positions table, and in the Telegram fill notice — every
+surface a human checks while convincing themselves the pipeline understood the
+signal.
+
+**Why non-obvious**: the failure has no error, no warning, and no silent branch
+you can grep for. The tag is *used*, just not for the thing its name implies, and
+the two consumers (`guards` and `categorize`) sit in different modules with no
+reason to reference each other. Reading either one alone looks complete.
+
+**Defense**: `eod_force = (dte == 0) or ("day_trade" in tags)` in
+[policy/positions.py](../autotrade/policy/positions.py), returned from **all**
+branches — the three non-0DTE returns previously hardcoded `False`, which was
+equivalent when `dte == 0` was the only source and became the actual bug the
+moment it wasn't. Regression pins the whole matrix, not just the new row, so the
+next flag added to `eod_force` cannot quietly stop at the `weekly` branch again.
+
+General form: when adding a tag, write down its consumer in the same commit. A
+tag with zero behavioral consumers should fail review, not ship as documentation.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -988,6 +1062,8 @@ python -m autotrade.diag.diag_handle_message_real
 | 18 | monotonic 在系统睡眠中不走 | `test_overnight_0728.py::test_churn_counts_wall_clock_window`（挂钟记账）、`::test_alive_gap_pulls_backfill_anchor_and_alerts_once`（反向利用:挂钟心跳跳变=睡眠指纹） |
 | 19 | 磁盘写满会擦掉它自己造成的故障证据 | `test_overnight_0731.py::test_first_error_alerts_immediately`、`::test_burst_is_throttled_to_one_alert`、`::test_scopes_throttle_independently`、`::test_recovery_notifies_once_with_missed_count`、`::test_alerting_failure_never_escapes`、`::test_healthy_ticks_are_silent`。**磁盘闸门与日志尺寸上限尚未实现**（ROADMAP P1 #10），当前防御只覆盖"告警发得出去"，不覆盖"提前拒绝启动" |
 | 20 | 喊价/行权价语序会中途倒过来 | `test_overnight_0731.py::test_inverted_price_strike_now_parses`（EN+ZH 双播）、`::test_inverted_order_across_expiry_forms`、`::test_canonical_order_unaffected`、`::test_swap_guards_reject_non_premium`、`::test_price_levels_broadcast_still_skipped` |
+| 21 | 双语孪生同时降级 = 冗余归零 | 语义层：`test_overnight_0803.py::test_bare_out_ticker_routes_and_parses_as_full_close`、`::test_out_forms_keep_their_pct`、`::test_bare_out_does_not_fire_on_prose`（误报护栏）、`::test_conditional_close_is_not_an_instruction`（当晚双语原文）、`::test_negated_conditional_masks_the_main_clause`、`::test_author_holding_skips_whole_message`、`::test_real_close_instructions_still_execute`（反向：真 trim 不受影响）、`::test_out_fraction_routes_and_parses`、`::test_expiry_dates_are_not_fractions`。结构层（不依赖措辞）：`::test_zh_twin_blocked_after_en_twin_skipped`、`::test_en_close_after_zh_skip_still_executes`（方向不对称）、`::test_zh_close_without_prior_en_skip_executes`、`::test_zh_skip_does_not_register_en_marker`。**不变量**：`::test_zh_trim_verb_still_means_trim`（减持 仍是 33，修复不许外溢到 ZH 侧） |
+| 22 | tag 被解析/落库/展示 ≠ tag 有行为 | `test_overnight_0803.py::test_day_trade_forces_eod_close`、`::test_eod_force_matrix_otherwise_unchanged`（整张矩阵，防"新 flag 只改一个分支"复发）、`::test_zero_dte_unchanged`、`::test_open_signal_with_day_trade_still_routes_open`（tag 解析口径不变） |
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |

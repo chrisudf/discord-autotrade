@@ -112,14 +112,56 @@ _OUT_PCT_PATTERN = (
     r"\bout\s+\d{1,3}\s*%"
 )
 
+# 裸 "out <TICKER>" —— 8/3 AMZN 事故的直接成因。KC "out AMZN -15%" 是当晚
+# 唯一一句清仓喊话，EN 侧 detect_action 判成 OPEN（STRONG 只认 "out of"，
+# WEAK 只认 out half/full/majority 和 out N%），ZH 孪生"减持亚马逊 -15%"
+# 落到 trim 默认 33 → runner-preserve 跳过。双语冗余同时降级 = 仓位过夜，
+# 隔天 KC 已经走人我们还在场内。与 _OUT_PCT_PATTERN 同为 signal_parser
+# 路由与本模块解析的**唯一**来源（两处 import 同一常量，见下方 WEAK_CLOSE_RE）。
+#
+# 三道安全边界（CLOSE 误平代价 > OPEN 误触发，见模块顶部）：
+#   1. ticker 必须**原文全大写** —— 用 (?-i:) 局部关掉 IGNORECASE。不这样做
+#      "out of the money" 里的 of/the 都是合法 [A-Z]{2,5}，每条行情解说都变平仓。
+#      代价：判定必须喂原文而非 text_lower（见 _has_action_verb 的 text 参数）；
+#   2. 停用词表挡掉大写语境里仍会出现的介词/黑话（OUT OF/ITM/EOD/EST…）；
+#   3. 抽出来的裸 ticker 最终仍要过 open_symbols 白名单（_extract_symbols）——
+#      本 pattern 只回答"这句话是不是平仓动作"，不负责选仓位。
+_OUT_BARE_SYM_STOPWORDS = (
+    "OF|THE|ALL|AT|ON|IN|TO|FOR|AND|BUT|NOW|HERE|THERE|SOON|TODAY|EARLY|LATE|"
+    "FLAT|HALF|FULL|MOST|BE|EOD|ITM|ATM|OTM|IV|PM|AM|ET|EST|EDT|DTE|LOL"
+)
+_OUT_BARE_SYM_PATTERN = (
+    r"\bout\s+(?:\$[A-Z]{1,5}\b"
+    r"|(?!(?:" + _OUT_BARE_SYM_STOPWORDS + r")\b)[A-Z]{2,5}\b)"
+)
+
+# "out 1/2" —— 8/3 enrich "$TSLA out 1/2" 漏路由。FRACTION_OUT_PATTERN 早就认得
+# 这个形状，但它在 pct 抽取阶段才跑，而路由/动词判定只认 out half/full/majority
+# → 根本走不到那一步（分数管道形同虚设）。
+# 分子分母**显式枚举**成 num<den 且 den∈[2,5]，与 _fraction_pct 的定义域逐条对齐：
+# 这样 "out 7/13" / "out 8/7" 这类到期日不会被当分数路由成 CLOSE（落到定义域外
+# 会让 pct 掉回 33 默认值 = 凭空 trim）。
+_OUT_FRACTION_PATTERN = (
+    r"\bout\s+(?:1\s*/\s*[2-5]|2\s*/\s*[3-5]|3\s*/\s*[45]|4\s*/\s*5)\b"
+)
+
 # "out" 短语统一走词边界 regex（勿放回 ACTION_VERBS/FULL_CLOSE_VERBS 的
 # substring 匹配——见上方 "overall outlook" 案例）
 _OUT_PHRASE_RE = re.compile(
     r"\ball\s+out\b|\bout\s+(?:half|full|majority)\b"
-    r"|" + _OUT_PCT_PATTERN,
+    r"|" + _OUT_PCT_PATTERN
+    + r"|" + _OUT_FRACTION_PATTERN
+    + r"|(?-i:" + _OUT_BARE_SYM_PATTERN + r")",
     re.IGNORECASE,
 )
-_OUT_FULL_CLOSE_RE = re.compile(r"\ball\s+out\b|\bout\s+full\b", re.IGNORECASE)
+# 裸 "out AMZN" 无 %/分数时是**全平**语义（"out X" = 清掉 X），
+# 与 "all out" / "out full" 同级；带了 %/分数的走 _extract_pct 前面的分支，
+# 到不了这里。
+_OUT_FULL_CLOSE_RE = re.compile(
+    r"\ball\s+out\b|\bout\s+full\b"
+    r"|(?-i:" + _OUT_BARE_SYM_PATTERN + r")",
+    re.IGNORECASE,
+)
 
 # 全平动词（pct 缺省 → 100）
 FULL_CLOSE_VERBS = ["closed", "cutting", "cut ", "dumped", "dumping"]
@@ -388,6 +430,43 @@ EN_SUGGESTION_CLAUSE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# === 条件-建议句的**否定**形态（8/3 SPY，当晚唯一一笔误平）===
+#   EN "SPY puts near entry price at the close around 1.72, if you don't want to
+#       swing you can close until 4:15pm EST. I personally am swinging them"
+#   ZH "…若不想持仓过夜，可在美东时间下午4:15前平仓。我个人选择持仓…"
+# ZH 版解析成 CLOSE 100% @1.72（1.72 本身还是"接近入场价"的行情描述），
+# 按 1.63 挂单卖出——而作者本人明说在持仓过夜。
+#
+# 与 ZH_SUGGESTION_CLAUSE_RE（若想 系）的区别只在**抹除范围**：
+#   "若想 X"        动作在从句里，抹到逗号就够；
+#   "若不想 X，可 Y" 动作在**主句 Y** 里，必须抹到句末才盖得住"平仓"。
+# 扩到句末只对"不想"系生效——"若此前未减仓，可在此处操作" 是真祈使句（KC 让你
+# 现在做），仍然不抹，与 7/29 定的边界一致。
+ZH_OPTIONAL_CLAUSE_RE = re.compile(r"(?:若|如果)(?:你)?不想[^。！？\n]*")
+EN_OPTIONAL_CLAUSE_RE = re.compile(
+    r"\bif\s+(?:you|u)\s+(?:do\s*n['’]?t|don['’]?t|dont)\s+want\b[^.!?\n]*",
+    re.IGNORECASE,
+)
+
+# === 作者自述"我不平，我拿着" ===
+# 同一条 8/3 SPY 消息的第二道防线：作者明确说自己在持有，这条消息就不是
+# 给跟单方的平仓指令，整条跳过。
+# 收得很窄（第一人称 + personally/个人 + 持有动词三件齐全），避免吞掉
+# "减仓一半，剩下的我继续持有" 这类**真 trim**消息的尾巴——那种句子没有
+# "我个人选择"这种整体表态。
+AUTHOR_HOLD_MARKERS = [
+    "i personally am swinging", "i personally am holding",
+    "i am personally swinging", "i am personally holding",
+    "i'm personally swinging", "i’m personally swinging",
+    "i'm personally holding", "i’m personally holding",
+    "personally i'm swinging", "personally i’m swinging",
+]
+ZH_AUTHOR_HOLD_MARKERS = [
+    "我个人选择持仓", "我个人选择持有", "我个人选择拿着",
+    "我个人继续持有", "我个人继续持仓", "我个人持有",
+    "我本人选择持仓", "我本人选择持有",
+]
+
 # 叙述价：价格前紧邻"跌至/回到/涨到"这类**行情叙述**动词时，那个数字是在
 # 描述走势，不是喊卖价。7/29 "跌至1.50后回到入场价" 实锤（见上）。
 # 与建议句防护是两层独立防线：建议句挡"要不要卖"，本表挡"按什么价卖"——
@@ -421,6 +500,18 @@ def _price_is_narrative(scope: str, price_start: int) -> bool:
 # "出半仓" 变体：仓 后允许任意接续（"出半仓于2.45" 对齐 7/9 "减半仓于2.45"）。
 # 命中后归一化成既有动词"减半"（pct=50 语义现成，无需新管道）。
 ZH_OUT_HALF_RE = re.compile(r"(?<![一-鿿])出半(?:仓|(?![一-鿿]))")
+
+# "出 1/2"（EN "out 1/2" 的 ZH 孪生，8/3 enrich $TSLA 双语双漏）。
+# 裸"出"同样不进 ZH_ACTION_VERBS（理由见 ZH_OUT_HALF_RE），但"出 + 合法分数"
+# 这个形状足够窄，可以带左边界单独收：左边界拦"退出1/2""冲出1/2"，
+# 分子分母枚举（与 _OUT_FRACTION_PATTERN / _fraction_pct 同定义域）拦到期日。
+# 命中后归一化成既有动词"卖出"，pct 交给现成的 ZH_FRACTION_OUT_PATTERN。
+# pattern 串单独导出：signal_parser.STRONG_CLOSE_RE import 同一份做路由判定
+# （与 _OUT_PCT_PATTERN 同规矩——两处各写一份字面量迟早漂移成漏单裂缝）。
+_ZH_OUT_FRACTION_PATTERN = (
+    r"(?<![一-鿿])出(\s*(?:1\s*/\s*[2-5]|2\s*/\s*[3-5]|3\s*/\s*[45]|4\s*/\s*5))"
+)
+ZH_OUT_FRACTION_RE = re.compile(_ZH_OUT_FRACTION_PATTERN)
 
 # "剩下 30%" / "剩 N%" → 卖 (100-N)%
 ZH_LEFT_PATTERN = re.compile(r"剩\s*下?\s*(\d{1,3})\s*%")
@@ -479,25 +570,36 @@ def _has_bulk_marker(text_lower: str) -> bool:
     return any(m in text_lower for m in BULK_MARKERS)
 
 
-def _has_action_verb(text_lower: str) -> bool:
+def _has_action_verb(text_lower: str, text: str = "") -> bool:
+    """text 传**原文**时才能命中裸 "out <TICKER>"（大写敏感，见 _OUT_BARE_SYM_PATTERN）。
+
+    默认空串保持旧调用方（只有 text_lower）的行为逐字不变。
+    """
     return (
         any(v in text_lower for v in ACTION_VERBS)
         or bool(_OUT_PHRASE_RE.search(text_lower))
+        or bool(text and _OUT_PHRASE_RE.search(text))
     )
 
 
-def _has_full_close_verb(text_lower: str) -> bool:
+def _has_full_close_verb(text_lower: str, text: str = "") -> bool:
+    """同 _has_action_verb：裸 "out <TICKER>" 要靠原文判定大小写。"""
     return (
         any(v in text_lower for v in FULL_CLOSE_VERBS)
         or bool(_OUT_FULL_CLOSE_RE.search(text_lower))
+        or bool(text and _OUT_FULL_CLOSE_RE.search(text))
     )
 
 
 # 分句 scope 用：单词动词加 \b 边界；"out" 短语与 _OUT_PHRASE_RE 同边界规则
+# （裸 out <TICKER> / out 分数同样入表，否则 "out AMZN -15%, bored…" 分不出
+# action 句，signal_price / strike hint 都退化到全文扫描）
 _ACTION_RE = re.compile(
     r"\b(?:trimming|trimmed|cutting|selling|closing|closed|dumping|dumped)\b"
     r"|\btrim\s|\bcut\s|\bsold\s+here\b|\bscaling\s+(?:out|down)\b|bang!|\bbang\s+-"
-    r"|\ball\s+out\b|\bout\s+(?:half|full|majority)\b",
+    r"|\ball\s+out\b|\bout\s+(?:half|full|majority)\b"
+    r"|" + _OUT_FRACTION_PATTERN
+    + r"|(?-i:" + _OUT_BARE_SYM_PATTERN + r")",
     re.IGNORECASE,
 )
 
@@ -666,7 +768,7 @@ def _extract_pct(text: str, text_lower: str) -> int:
     if re.search(r"\bout\s+(?:majority|most)\b", scope, re.I):
         return 75
 
-    return 100 if _has_full_close_verb(text_lower) else 33
+    return 100 if _has_full_close_verb(text_lower, text) else 33
 
 
 def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
@@ -675,11 +777,16 @@ def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
     if _has_recap_marker(text_lower):
         logger.info(f"[close_parser] EN skip (recap): {text[:80]}")
         return None
+    if any(m in text_lower for m in AUTHOR_HOLD_MARKERS):
+        logger.info(f"[close_parser] EN skip (author holding): {text[:80]}")
+        return None
     # 建议句抹掉（见 EN_SUGGESTION_CLAUSE_RE 注释，7/29 SPY "if you want to exit"）。
     # 与 ZH 侧同一层：EN 当晚返回 None 靠的是 KC 写了小写 "spy"，不是防护。
     text = EN_SUGGESTION_CLAUSE_RE.sub(" ", text)
+    # 否定条件句抹到句末（见 EN_OPTIONAL_CLAUSE_RE 注释，8/3 SPY）
+    text = EN_OPTIONAL_CLAUSE_RE.sub(" ", text)
     text_lower = text.lower()
-    if not _has_action_verb(text_lower):
+    if not _has_action_verb(text_lower, text):
         return None
 
     scope_en = _action_sentences(text)
@@ -831,12 +938,20 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
     if _has_zh_recap(text):
         logger.info(f"[close_parser] ZH skip (recap): {text[:80]}")
         return None
+    # 作者自述持有 —— 同 recap，必须在任何改写之前跑原文（8/3 SPY）
+    if any(m in text for m in ZH_AUTHOR_HOLD_MARKERS):
+        logger.info(f"[close_parser] ZH skip (author holding): {text[:80]}")
+        return None
     # "出半(仓)" 带边界归一化成"减半"（见 ZH_OUT_HALF_RE 注释，7/23 NBIS）
     text = ZH_OUT_HALF_RE.sub("减半", text)
+    # "出 1/2" 带边界归一化成"卖出 1/2"（见 ZH_OUT_FRACTION_RE 注释，8/3 TSLA）
+    text = ZH_OUT_FRACTION_RE.sub(r"卖出\1", text)
     # 移动止损备注抹掉（见 ZH_SL_ADJUST_CLAUSE_RE 注释，7/23 AVGO 误判）
     text = ZH_SL_ADJUST_CLAUSE_RE.sub(" ", text)
     # 建议句抹掉（见 ZH_SUGGESTION_CLAUSE_RE 注释，7/29 SPY "若想止盈离场"）
     text = ZH_SUGGESTION_CLAUSE_RE.sub(" ", text)
+    # 否定条件句抹到句末（见 ZH_OPTIONAL_CLAUSE_RE 注释，8/3 SPY "若不想…可…平仓"）
+    text = ZH_OPTIONAL_CLAUSE_RE.sub(" ", text)
     if not _has_zh_action(text):
         return None
 

@@ -23,6 +23,8 @@ tests/corpus/
   2026-07-23.jsonl   7/23-24 夜（META into-the-close 事故 + ZH 孪生）
   2026-07-24.jsonl   7/24-25 夜（enrich scalp 形态、Out 25% more）
   2026-07-27.jsonl   7/27-28 夜（睡眠夜的 SPY 745C 主力单）
+  2026-07-29.jsonl   7/29-30 夜（建议句"若想止盈离场"、叙述价 vs 喊价）
+  2026-08-03.jsonl   8/3-4 夜（裸 out <TICKER>、否定条件句误平、out 1/2、day_trade）
   lessons.jsonl      6/14-7/17 历史实锤（来自 test_parser / test_close_parser）
 ```
 

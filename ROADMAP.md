@@ -59,6 +59,36 @@ TP 先标 tier 再记账、EOD 锁内取价 + 无价拒卖 + backoff。
 `config/.env.example` 已建议 60,但生产 `.env` 没跟上。定时对账正好能兜住这类
 "DB 写不进去/漂移"的静默失败——属于低成本高价值,切换检查单里应显式确认一次。
 
+### 12. ADD(加仓)信号:决策后要么支持要么显式放弃(8/3 复盘)
+8/3 14:28 ET,KC `just added a few SPY @ average is 1.76` 双语双发,两条都 parse-fail。
+当晚 SPY 我们 1.93 进、16:06 平在 1.63;跟了这笔加仓均价会到 ~1.85,同一个出场
+就是 -$22 而不是 -$30。
+
+这不是 bug——`_looks_like_addon_attempt` 是**故意**只告警不下单的(无 strike/side
+的 add-on 要"关联已有仓位"上下文,错配风险同 follow-up close,见 close_parser 顶部
+注释)。但"故意漏"和"忘了做"在日志里长得一模一样,每次复盘都要重新推一遍。
+
+要的是一次拍板,不是慢慢想:
+- **方案 A(支持)**:限定在"已持仓 + 同频道 + 同 side + 有喊价"时按原合约加 1 张,
+  沿用 OPEN 的风控闸门;strike 从现有仓位取,不从文本猜——这样绕开了错配风险的来源;
+- **方案 B(放弃)**:保持现状,但把它写进 README 的"已知不做"清单,并让 TG 文案说清
+  "检测到加仓信号,不自动执行"——现在的 parse-fail 告警读起来像故障。
+
+任一方案都要先补当晚原文的表征测试。**决策点**:Zoe 拍板 A 还是 B。
+
+### 13. `[zh_unrecognized]` 归因错误,会污染"要不要建中文名映射"的判断(8/3 复盘)
+8/3 当晚该 warning 报了 5 次,全部是 SOFI——ticker 就是明文 ASCII,
+`likely Chinese company name` 完全不成立。真实原因是 SOFI 不在 `open_symbols`
+(我们没这个持仓),被裸 ticker 白名单正常挡掉。
+
+代价不在这一晚,在**下一次判断**:这条 warning 的设计用途就是攒够样本后决定
+要不要做数据驱动的中文名→ticker 学习(见 close_parser 顶部 TODO)。计数里混进
+"未持仓"噪音,样本就没法用了。
+
+修法很小:`_parse_close_zh` 里分两种 return——文本含裸 ticker 但不在白名单 →
+`[zh_no_position]` (info 级,不是漏检);确实抽不出任何 symbol → 保留
+`[zh_unrecognized]` (warning)。
+
 ## P2 — 值得做,不急
 
 ### 5. 解析器收敛
