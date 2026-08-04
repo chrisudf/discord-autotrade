@@ -14,8 +14,13 @@ expiry 列存 ISO date 字符串（YYYY-MM-DD），category 决定 SL 策略。
 category 是纯展示标签（用于日志/TG/复盘），行为靠两个独立 flag：
 
 - apply_sl         = 是否挂止损（DTE 1-7 且非 lotto 才挂）
-- eod_force_close  = 是否当日 EOD 强平（只看 DTE==0，不管 lotto 标签——
-                     0DTE 当天必过期，必须平；周内 lotto 要放飞到 expiry）
+- eod_force_close  = 是否 EOD 强平：DTE==0，**或**信号带 day_trade tag（8/3 起）。
+                     前者当天必过期、不平就归零/被行权；后者是作者显式声明
+                     "当日了结"，与到期日无关。lotto 标签不影响这一位——
+                     周内 lotto 能放飞到 expiry 是因为它自己不带 day_trade。
+                     消费端 = eod_watcher 的入选条件之一（另一条是
+                     expiry == today，两者取并集）。本字段一度**没有任何行为
+                     消费者**（被 expiry 判据取代后遗留），见 lessons #22。
 
 category 命名（信息性）：
 - 0dte          DTE == 0 且非 lotto
