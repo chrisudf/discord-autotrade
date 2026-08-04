@@ -1,21 +1,20 @@
 #!/bin/zsh
-# 每早 07:00（本机时区）跑。
+# 每早 07:00（本机时区）跑，只负责收尾取证三件事：
 #   1. 优雅停掉夜里的 listener
 #   2. 把整晚 terminal log 存成桌面 txt
 #   3. 从 trades.db 抽一份当晚信号/成交摘要
-#   4. Opus 5 headless 复盘 -> markdown 报告
-#   5. 打开报告，并就地接着那次会话进入交互，可直接追问
+#
+# 复盘不在这里做 —— 由 Claude 的定时任务 autotrade-nightly-review（7:05）
+# 读这两份产物，直接在对话里回答。这么切分是因为停机和存日志不该依赖
+# Claude app 开着：app 没开时定时任务会推迟到下次打开才跑，但那时
+# 文件已经稳稳躺在桌面上了。
 #
 # 本脚本在 Terminal.app 窗口里执行，不是由 launchd 直接执行 ——
 # launchd 读不了 ~/Desktop（TCC），中间隔着 launch_in_terminal.sh 这层垫片，
 # 原因见那个文件的注释。所以这里可以放心读写项目目录和桌面。
 #
-# 手动演练（跑 1-3 步，不烧 token、不开窗口）：
-#   zsh ops/morning_review.sh --no-claude
+# 手动演练：zsh ops/morning_collect.sh
 set -u
-
-NO_CLAUDE=0
-[[ "${1:-}" == "--no-claude" ]] && NO_CLAUDE=1
 
 # 路径一律从脚本位置推导，不写死 —— 换机器 / 换目录都不用改。
 # zsh: ${0:A} = 本脚本的绝对路径，:h 取目录，两次 :h 到项目根。
@@ -24,18 +23,12 @@ OUT_DIR="${AUTOTRADE_OUT_DIR:-$HOME/Desktop/autotrade-logs}"
 OPS_LOG="$PROJ/logs/ops.log"
 STAMP="$(date +%Y-%m-%d)"
 
-# launchd 的 PATH 不继承登录 shell，claude 常装在 nvm 目录下，两头都找一遍。
-CLAUDE_BIN="$(command -v claude || true)"
-if [[ -z "$CLAUDE_BIN" ]]; then
-  CLAUDE_BIN=$(ls -t "$HOME"/.nvm/versions/node/*/bin/claude 2>/dev/null | head -1)
-fi
-
 mkdir -p "$OUT_DIR" "$PROJ/logs"
 log_ops() { echo "$(date '+%F %T') morning: $*" >> "$OPS_LOG"; }
 
 # 匹配 Makefile 实际起的完整命令行，不能只匹配 "autotrade.app.main" ——
-# 那样任何命令行里含这个串的进程都会被当成 listener，早上就会误杀
-# 一个只是在 grep 的 shell，而真正的 listener 反倒没停。见 night_run.sh 同名注释。
+# 那样任何命令行里含这个串的进程都会被当成 listener，会误杀一个只是在
+# grep 的 shell，而真正的 listener 反倒停不掉。见 night_run.sh 同名注释。
 LISTENER_PAT='bin/python -m autotrade\.app\.main'
 
 # ---------- 1. 停 listener ----------
@@ -81,7 +74,7 @@ fi
 # 不写死偏移量，换时区的机器也对。
 # 取过去 9 小时（23:15 开跑到 07:00 是 7h45m，留点余量）。
 SINCE_UTC=$(date -u -v-9H '+%Y-%m-%dT%H:%M:%SZ')
-DIGEST="$OUT_DIR/.digest_${STAMP}.txt"
+DIGEST="$OUT_DIR/digest_${STAMP}.txt"
 
 # list 模式：box/markdown 模式会按终端宽度折行，长消息会被切成续行，喂给模型会串行。
 # note/content 里的换行压平成 " / "，竖线换成 "/"，保证一行一条记录。
@@ -137,53 +130,7 @@ SQL
 
 log_ops "digest built -> $DIGEST"
 
-if (( NO_CLAUDE )); then
-  log_ops "--no-claude: 跳过复盘与开窗"
-  echo "演练完成："
-  echo "  桌面日志: $DEST"
-  echo "  数据摘要: $DIGEST"
-  exit 0
-fi
-
-# ---------- 4. Opus 5 复盘 ----------
-# 日志已经存好了，复盘跑不了也别把前面的成果吞掉 —— 留痕后正常退出。
-if [[ -z "$CLAUDE_BIN" || ! -x "$CLAUDE_BIN" ]]; then
-  log_ops "找不到 claude CLI，跳过复盘。日志仍已存到 $DEST"
-  exit 0
-fi
-
-SID=$(uuidgen | tr 'A-Z' 'a-z')
-REPORT="$OUT_DIR/review_${STAMP}.md"
-echo "$SID" > "$OUT_DIR/.last_session_id"
-
-PROMPT=$(sed -e "s|{{LOG}}|$DEST|g" \
-             -e "s|{{DIGEST}}|$DIGEST|g" \
-             -e "s|{{REPORT}}|$REPORT|g" \
-             -e "s|{{PROJ}}|$PROJ|g" \
-             -e "s|{{DATE}}|$STAMP|g" \
-             "$PROJ/ops/review_prompt.md")
-
-cd "$PROJ"
-"$CLAUDE_BIN" -p "$PROMPT" \
-  --model claude-opus-5 \
-  --session-id "$SID" \
-  --add-dir "$OUT_DIR" \
-  --permission-mode acceptEdits \
-  --allowedTools "Read" "Grep" "Glob" "Write" \
-                 "Bash(sqlite3:*)" "Bash(grep:*)" "Bash(rg:*)" "Bash(awk:*)" \
-                 "Bash(sed:*)" "Bash(head:*)" "Bash(tail:*)" "Bash(wc:*)" "Bash(sort:*)" \
-  > "$OUT_DIR/.review_stdout_${STAMP}.log" 2>&1
-RC=$?
-log_ops "claude review exit=$RC -> $REPORT"
-
-# ---------- 5. 摊开给人看 ----------
-[[ -f "$REPORT" ]] && open "$REPORT"
-
-# 本脚本已经在 Terminal 窗口里，直接就地接续 headless 那次会话，
-# 上下文都在，可以直接追问 —— 不用再开第二个窗口。
-log_ops "interactive session (resume $SID)"
 echo
-echo "昨晚复盘报告: $REPORT"
-echo "接续 headless 复盘会话，可直接追问。"
-echo
-exec "$CLAUDE_BIN" --model claude-opus-5 --resume "$SID"
+echo "取证完成，等 Claude 的 7:05 定时任务来复盘："
+echo "  整晚日志: $DEST"
+echo "  数据摘要: $DIGEST"
