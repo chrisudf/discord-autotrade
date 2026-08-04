@@ -157,6 +157,38 @@ def test_eod_window_custom_cutoff_shifts_too():
     assert eod_watcher._is_eod_window(_et(2026, 11, 27, 12, 29), 15, 30) is False
 
 
+@pytest.mark.parametrize("hour,minute,when,why", [
+    # 半日市前移后落到 0 点之前：老代码 max(h-3,0) 把窗口撑成 00:50~13:05
+    (2, 50, (2026, 11, 27, 6, 0), "EOD_HOUR<shift 不得扩窗到 0 点"),
+    (2, 50, (2026, 11, 27, 1, 0), "扩窗后连凌晨 1 点都会强平"),
+    # replace() 会抛 ValueError 的越界配置（老代码只挡了 hour 侧）
+    (15, 99, (2026, 11, 25, 15, 51), "EOD_MIN 越界"),
+    (99, 50, (2026, 11, 25, 15, 51), "EOD_HOUR 越界"),
+    # cutoff 晚于 16:05 上界 → 时窗为空、EOD 静默失效（现在至少有告警）
+    (17, 0, (2026, 11, 25, 17, 30), "cutoff 晚于窗口上界"),
+])
+def test_eod_window_invalid_config_fails_closed(hour, minute, when, why):
+    """无效配置一律关窗：不扩窗、也不抛异常（PR#2 review）。
+
+    EOD 是唯一会主动清仓的 watcher——误配的代价是真下卖单，不是日志噪音。
+    """
+    eod_watcher._bad_window_warned.clear()
+    assert eod_watcher._is_eod_window(_et(*when), hour, minute) is False, why
+    eod_watcher._bad_window_warned.clear()
+
+
+def test_eod_window_invalid_config_alerts_once_per_config():
+    """本函数每 30s 被调一次，告警必须去重到"每种坏配置一条"。"""
+    eod_watcher._bad_window_warned.clear()
+    for _ in range(5):
+        eod_watcher._is_eod_window(_et(2026, 11, 27, 6, 0), 2, 50)
+    assert len(eod_watcher._bad_window_warned) == 1
+    # 另一种坏配置各占一格，不会被前一条压掉
+    eod_watcher._is_eod_window(_et(2026, 11, 25, 17, 30), 17, 0)
+    assert len(eod_watcher._bad_window_warned) == 2
+    eod_watcher._bad_window_warned.clear()
+
+
 def test_eod_window_normal_day_unchanged():
     """普通交易日行为与既有测试逐字一致（黑五前一周的周三）。"""
     wed = lambda hh, mm: _et(2026, 11, 25, hh, mm)  # noqa: E731

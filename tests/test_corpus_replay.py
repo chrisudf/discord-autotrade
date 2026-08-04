@@ -69,8 +69,26 @@ def _load_rows() -> list:
                 row = json.loads(line)
             except json.JSONDecodeError as e:
                 raise AssertionError(f"[corpus] {where} 不是合法 JSON: {e}") from e
+            # 顶层形状先判（PR#2 review）：合法 JSON 但不是 object 时，
+            # 下面的 set(row) 会抛 TypeError（int/float）或把字符串拆成字符集
+            # （"abc" → {'a','b','c'}），报出来的错和真实原因对不上，
+            # 而且 int 那条直接逃出 assert，丢掉 [corpus] file:line 归因——
+            # 本函数存在的唯一理由就是保住这个归因。
+            assert isinstance(row, dict), (
+                f"[corpus] {where} 顶层必须是 JSON object，实际是 "
+                f"{type(row).__name__}"
+            )
             missing = REQUIRED_KEYS - set(row)
             assert not missing, f"[corpus] {where} 缺字段 {missing}"
+            # 喂给 parser 的两个字段也当场验型：类型错在这里报比在 40 个
+            # 参数化用例里报 TypeError 好定位
+            assert isinstance(row["text"], str) and row["text"].strip(), (
+                f"[corpus] {where} text 必须是非空字符串"
+            )
+            assert isinstance(row["open_symbols"], list), (
+                f"[corpus] {where} open_symbols 必须是数组，实际是 "
+                f"{type(row['open_symbols']).__name__}"
+            )
             # skeleton（export_corpus 产物）不许直接进门：expect 必须已人工定案
             assert isinstance(row["expect"], dict), (
                 f"[corpus] {where} expect 未标注（skeleton 不能直接放进 tests/corpus/）"
@@ -222,6 +240,46 @@ def test_skeleton_expect_null_rejected_by_gate(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(mod, "CORPUS_DIR", tmp_path)
     with pytest.raises(AssertionError, match="skeleton"):
+        mod._load_rows()
+
+
+@pytest.mark.parametrize("bad_line,kind", [
+    ("42", "int"),                       # 老代码：set(42) → TypeError，逃出 assert
+    ('"trimmed AMZN"', "str"),           # 老代码：set("...") 拆成字符集，报错文不对题
+    ('["name", "text"]', "list"),
+    ("null", "NoneType"),
+])
+def test_non_object_row_keeps_file_line_attribution(tmp_path, monkeypatch,
+                                                    bad_line, kind):
+    """合法 JSON 但不是 object → 必须仍带 [corpus] file:line 归因（PR#2 review）。
+
+    _load_rows 存在的唯一理由就是"schema 错就近报文件+行号"；
+    裸 TypeError 逃出去等于这个函数白写。
+    """
+    import tests.test_corpus_replay as mod
+
+    (tmp_path / "bad.jsonl").write_text(bad_line + "\n", encoding="utf-8")
+    monkeypatch.setattr(mod, "CORPUS_DIR", tmp_path)
+    with pytest.raises(AssertionError, match=r"bad\.jsonl:1.*JSON object"):
+        mod._load_rows()
+
+
+@pytest.mark.parametrize("row,pattern", [
+    ({"name": "n", "text": "", "open_symbols": [],
+      "expect": {"detect": "CLOSE"}}, "text"),
+    ({"name": "n", "text": 123, "open_symbols": [],
+      "expect": {"detect": "CLOSE"}}, "text"),
+    ({"name": "n", "text": "trimmed AMZN", "open_symbols": "AMZN",
+      "expect": {"detect": "CLOSE"}}, "open_symbols"),
+])
+def test_parser_input_fields_are_type_checked(tmp_path, monkeypatch, row, pattern):
+    """喂 parser 的两个字段当场验型，别等 40 个参数化用例里抛 TypeError。"""
+    import tests.test_corpus_replay as mod
+
+    (tmp_path / "bad.jsonl").write_text(
+        json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+    monkeypatch.setattr(mod, "CORPUS_DIR", tmp_path)
+    with pytest.raises(AssertionError, match=pattern):
         mod._load_rows()
 
 

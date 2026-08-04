@@ -80,23 +80,62 @@ _WINDOW_END_HOUR, _WINDOW_END_MIN = 16, 5
 _EARLY_CLOSE_SHIFT_HOURS = 3
 
 
+# 无效配置**关窗**，不扩窗（PR#2 review）。
+# 老写法是 max(hour - shift, 0)，注释写的是"宁可窗口从 0 点开也不能让 tick 炸掉"——
+# 但那是个假二选一：第三条路（关窗 + 告警）既不抛异常也不开大窗。
+# 扩窗的具体后果：EOD_HOUR 被配成 <3 时，半日市当天窗口变成 00:50～13:05，
+# 十二个小时里每 30s 一轮，对**所有**当日到期/day_trade 仓位真下卖单。
+# EOD 是唯一会主动清仓的 watcher，误配的代价是钱不是噪音，必须 fail closed。
+#
+# 三类无效，处理一致（return False + 每种配置只告警一次；本函数每 30s 被调用）：
+#   a. hour/minute 越界        —— replace() 会抛 ValueError，老代码只挡了 hour<0；
+#   b. hour - shift < 0        —— 前移后落到当天 0 点之前，没有交易含义；
+#   c. cutoff > window_end     —— 窗口是空集，EOD **静默失效**。老代码这里也返回
+#      False，但一声不吭 = 风控悄悄下线，比 (a)(b) 更隐蔽。
+_bad_window_warned: set = set()
+
+
+def _warn_bad_window_once(key: tuple, msg: str) -> None:
+    if key in _bad_window_warned:
+        return
+    _bad_window_warned.add(key)
+    logger.error(msg)
+
+
 def _is_eod_window(now_et: datetime, hour: int, minute: int) -> bool:
     """是否在 EOD 强平时窗内。
 
     全日市：工作日 hour:minute ～ 16:05 ET。
     半日市（holidays.is_early_close）：整体前移 3h → 默认 12:50 ～ 13:05 ET。
+    配置无效时返回 False 并告警（见上方注释），绝不扩大时窗。
     """
     if now_et.weekday() >= 5:  # 周六/日
         return False
     shift = _EARLY_CLOSE_SHIFT_HOURS if is_early_close(now_et.date()) else 0
-    # max(0,...) 防御：EOD_HOUR 被配成 <3 时不让 replace 抛 ValueError
-    # （那种配置本身没有交易意义，宁可窗口从 0 点开也不能让 tick 整个炸掉）
-    cutoff = now_et.replace(
-        hour=max(hour - shift, 0), minute=minute, second=0, microsecond=0
-    )
+    cutoff_hour = hour - shift
+
+    if not (0 <= cutoff_hour <= 23) or not (0 <= minute <= 59):
+        _warn_bad_window_once(
+            ("range", hour, minute, shift),
+            f"[eod] 配置无效：EOD_HOUR={hour} EOD_MIN={minute}"
+            f"（半日市前移 {shift}h 后为 {cutoff_hour}:{minute}）"
+            f"——本轮不进 EOD 时窗，强平关闭。请修 .env 后重启",
+        )
+        return False
+
+    cutoff = now_et.replace(hour=cutoff_hour, minute=minute, second=0, microsecond=0)
     window_end = now_et.replace(
         hour=_WINDOW_END_HOUR - shift, minute=_WINDOW_END_MIN, second=0, microsecond=0
     )
+    if cutoff > window_end:
+        _warn_bad_window_once(
+            ("empty", hour, minute, shift),
+            f"[eod] 配置无效：cutoff {cutoff:%H:%M} 晚于窗口上界 "
+            f"{window_end:%H:%M}（EOD_HOUR={hour} EOD_MIN={minute} shift={shift}h）"
+            f"——时窗为空，EOD 强平永不触发",
+        )
+        return False
+
     return cutoff <= now_et <= window_end
 
 

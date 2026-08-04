@@ -180,14 +180,38 @@ async def _reconcile_tick() -> list[dict]:
     return diffs
 
 
+# interval<=0 时的空转轮询：只读 env、不碰 broker，用于探测被改回正数
+_DISABLED_POLL_SEC = 60
+
+
 async def run_reconciler():
     """后台主循环：启动先跑一次，之后每 RECONCILE_INTERVAL_MIN 分钟一轮。
 
     由 app.main 经 start_reconciler() 启动（env<=0 时根本不建 task）。
+    interval 每轮重读（同 sl_watcher 风格），**0 = 暂停也算数**——见下方注释。
     """
     logger.info(
         f"[reconcile] started: interval={_interval_min()}min（report-only，不写 DB）")
+    disabled_logged = False
     while True:
+        interval = _interval_min()
+        # 0 = 关，运行中改也生效（PR#2 review）。老写法只把 sleep clamp 到
+        # max(_,1)，_reconcile_tick() 照跑——"关掉"实际变成每分钟一轮的**加速**
+        # 轮询，而这一轮是要打 broker 的（get_open_option_positions）。
+        # 语义上更别扭：interval 支持热重读、文档写着 0=关，偏偏 0 不生效。
+        # 这里不结束 task，只空转——改回正数自动恢复，与热重读的初衷一致。
+        if interval <= 0:
+            if not disabled_logged:
+                logger.info(
+                    "[reconcile] RECONCILE_INTERVAL_MIN<=0，暂停对账"
+                    "（不查 broker；改回正数自动恢复）")
+                disabled_logged = True
+            await asyncio.sleep(_DISABLED_POLL_SEC)
+            continue
+        if disabled_logged:
+            logger.info(f"[reconcile] 恢复对账：interval={interval}min")
+            disabled_logged = False
+
         try:
             await _reconcile_tick()
             notify_tick_ok("reconcile")
@@ -195,9 +219,7 @@ async def run_reconciler():
             raise
         except Exception as e:
             notify_tick_error("reconcile", e)
-        # 实时重读 interval（同 sl_watcher 风格）；防御 max(_,1)：运行中被改成
-        # <=0 也不 busy-loop（正常路径 env<=0 时 task 压根不存在）
-        await asyncio.sleep(max(_interval_min(), 1) * 60)
+        await asyncio.sleep(interval * 60)
 
 
 def start_reconciler(task_set: set) -> "asyncio.Task | None":

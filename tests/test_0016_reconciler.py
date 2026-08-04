@@ -250,6 +250,45 @@ async def test_interval_positive_starts_strong_ref_task(monkeypatch):
     assert task not in tasks
 
 
+async def test_interval_zero_at_runtime_pauses_ticks(monkeypatch):
+    """运行中把 RECONCILE_INTERVAL_MIN 改成 0 → 真的停，而不是加速到每分钟一轮。
+
+    PR#2 review：老写法只把 sleep clamp 到 max(_,1)，_reconcile_tick() 照跑——
+    "0=关"实际变成每 60s 打一次 broker，与文档和热重读语义都相反。
+    """
+    monkeypatch.setenv("RECONCILE_INTERVAL_MIN", "0")
+    monkeypatch.setenv("DRY_RUN", "false")
+    probe = MagicMock(return_value={})
+    with patch.object(reconciler, "list_open_option_positions", probe), \
+         patch.object(reconciler, "send_telegram", AsyncMock()):
+        task = asyncio.create_task(reconciler.run_reconciler())
+        await asyncio.sleep(0.2)
+        assert not task.done()          # task 存活（改回正数能自动恢复）
+        probe.assert_not_called()       # 关键：一次 broker 都没打
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_interval_restored_resumes_ticks(monkeypatch):
+    """0 只是暂停不是终止：改回正数后自动恢复对账。"""
+    monkeypatch.setenv("RECONCILE_INTERVAL_MIN", "0")
+    monkeypatch.setenv("DRY_RUN", "false")
+    probe = MagicMock(return_value={})
+    with patch.object(reconciler, "list_open_option_positions", probe), \
+         patch.object(reconciler, "send_telegram", AsyncMock()), \
+         patch.object(reconciler, "_DISABLED_POLL_SEC", 0.01):
+        task = asyncio.create_task(reconciler.run_reconciler())
+        await asyncio.sleep(0.05)
+        probe.assert_not_called()
+        monkeypatch.setenv("RECONCILE_INTERVAL_MIN", "1")
+        await asyncio.sleep(0.2)
+        assert probe.call_count >= 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
 async def test_run_loop_survives_broker_failure(monkeypatch):
     """OpenD 半夜抖一下不能杀死对账循环：tick 异常被 catch、下一轮再试，
     且失败本身不发 TG（连接类故障每轮告警就是新的噪音源）。"""
