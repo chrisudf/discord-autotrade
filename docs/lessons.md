@@ -733,15 +733,36 @@ you can grep for. The tag is *used*, just not for the thing its name implies, an
 the two consumers (`guards` and `categorize`) sit in different modules with no
 reason to reference each other. Reading either one alone looks complete.
 
-**Defense**: `eod_force = (dte == 0) or ("day_trade" in tags)` in
-[policy/positions.py](../autotrade/policy/positions.py), returned from **all**
-branches — the three non-0DTE returns previously hardcoded `False`, which was
-equivalent when `dte == 0` was the only source and became the actual bug the
-moment it wasn't. Regression pins the whole matrix, not just the new row, so the
-next flag added to `eod_force` cannot quietly stop at the `weekly` branch again.
+**Defense** — and this is where it gets instructive, because the obvious fix was
+also inert. Three layers had to change, and the first two alone did nothing:
 
-General form: when adding a tag, write down its consumer in the same commit. A
-tag with zero behavioral consumers should fail review, not ship as documentation.
+1. `eod_force = (dte == 0) or ("day_trade" in tags)` in
+   [policy/positions.py](../autotrade/policy/positions.py);
+2. …returned from **all** branches — the three non-0DTE returns hardcoded
+   `False`, which was equivalent while `dte == 0` was the only source and became
+   the bug the moment it wasn't;
+3. …and `eod_watcher` had to *read* the flag. It didn't. An earlier fix (long ITM
+   options auto-exercising, lesson #14) had **replaced** the flag with
+   `expiry == today` as the selection criterion, correctly — a Monday-opened
+   weekly still has `flag=False` on Friday. But replacing it left
+   `eod_force_close` with zero behavioral consumers repo-wide, a write-only
+   column. So steps 1–2 wrote a truer value into a field nobody read: the same
+   lesson recurring one layer down, inside the fix for it.
+
+The selection is now `expiry == today OR eod_force_close`, two independent
+sources: (a) covers positions expiring today whatever their flag, (b) covers
+"close today" declared at open regardless of expiry. Either alone leaks a real
+case.
+
+Note the contract flip this forces: `test_eod_skips_future_expiry` asserted that
+`flag=1` + future expiry does *not* close — correct while the flag was
+informational and that state could only be synthetic. `day_trade` makes it a
+common legitimate state, so the test now asserts the opposite and says why.
+
+General form: when adding a tag, name its consumer in the same commit — and when
+*replacing* a field's consumer, delete the field or note that it is now inert.
+A write-only column is a loaded gun for the next person who "wires it up" and
+sees green tests.
 
 ---
 
@@ -1063,7 +1084,7 @@ python -m autotrade.diag.diag_handle_message_real
 | 19 | 磁盘写满会擦掉它自己造成的故障证据 | `test_overnight_0731.py::test_first_error_alerts_immediately`、`::test_burst_is_throttled_to_one_alert`、`::test_scopes_throttle_independently`、`::test_recovery_notifies_once_with_missed_count`、`::test_alerting_failure_never_escapes`、`::test_healthy_ticks_are_silent`。**磁盘闸门与日志尺寸上限尚未实现**（ROADMAP P1 #10），当前防御只覆盖"告警发得出去"，不覆盖"提前拒绝启动" |
 | 20 | 喊价/行权价语序会中途倒过来 | `test_overnight_0731.py::test_inverted_price_strike_now_parses`（EN+ZH 双播）、`::test_inverted_order_across_expiry_forms`、`::test_canonical_order_unaffected`、`::test_swap_guards_reject_non_premium`、`::test_price_levels_broadcast_still_skipped` |
 | 21 | 双语孪生同时降级 = 冗余归零 | 语义层：`test_overnight_0803.py::test_bare_out_ticker_routes_and_parses_as_full_close`、`::test_out_forms_keep_their_pct`、`::test_bare_out_does_not_fire_on_prose`（误报护栏）、`::test_conditional_close_is_not_an_instruction`（当晚双语原文）、`::test_negated_conditional_masks_the_main_clause`、`::test_author_holding_skips_whole_message`、`::test_real_close_instructions_still_execute`（反向：真 trim 不受影响）、`::test_out_fraction_routes_and_parses`、`::test_expiry_dates_are_not_fractions`。结构层（不依赖措辞）：`::test_zh_twin_blocked_after_en_twin_skipped`、`::test_en_close_after_zh_skip_still_executes`（方向不对称）、`::test_zh_close_without_prior_en_skip_executes`、`::test_zh_skip_does_not_register_en_marker`。**不变量**：`::test_zh_trim_verb_still_means_trim`（减持 仍是 33，修复不许外溢到 ZH 侧） |
-| 22 | tag 被解析/落库/展示 ≠ tag 有行为 | `test_overnight_0803.py::test_day_trade_forces_eod_close`、`::test_eod_force_matrix_otherwise_unchanged`（整张矩阵，防"新 flag 只改一个分支"复发）、`::test_zero_dte_unchanged`、`::test_open_signal_with_day_trade_still_routes_open`（tag 解析口径不变） |
+| 22 | tag 被解析/落库/展示 ≠ tag 有行为；write-only 字段是下一个人的陷阱 | 策略层：`test_overnight_0803.py::test_day_trade_forces_eod_close`、`::test_eod_force_matrix_otherwise_unchanged`（整张矩阵，防"新 flag 只改一个分支"复发）、`::test_zero_dte_unchanged`、`::test_open_signal_with_day_trade_still_routes_open`。**消费端**（缺了它前两层全是空转）：`test_watchers.py::test_eod_closes_day_trade_before_its_expiry`（契约翻转，前身断言相反行为）、`::test_eod_skips_future_expiry_without_force_flag`（反向安全属性：在途 swing 不许被碰）、`::test_eod_force_closes_weekly_expiring_today`（expiry 那条独立入选路径不受影响） |
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |

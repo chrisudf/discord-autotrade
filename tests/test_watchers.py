@@ -321,15 +321,17 @@ async def test_eod_force_closes_weekly_expiring_today():
 
 
 @pytest.mark.asyncio
-async def test_eod_skips_future_expiry():
-    """eod_force_close=True 但 expiry 不是今天 → 不动"""
+async def test_eod_skips_future_expiry_without_force_flag():
+    """expiry 在未来且无 eod_force_close → 不动（EOD 的核心安全属性）。
+
+    只碰"今天必须了结"的仓位，绝不碰在途的 weekly/swing。
+    """
     future = date(2026, 12, 19)
     code = _uniq_code("EOD2")
-    # 强行造一个"过去开的 0DTE 但 expiry 是未来"的怪状态
     positions_db.open_or_add(
         option_code=code, symbol="EODT2", strike=10.0, side="CALL",
         expiry=future, qty=1, fill_price=1.00,
-        category="0dte", apply_sl=False, eod_force_close=True, tags=[],
+        category="swing", apply_sl=False, eod_force_close=False, tags=[],
         channel_name="ut", msg_id="m1",
     )
 
@@ -343,6 +345,40 @@ async def test_eod_skips_future_expiry():
         #   周五 expiry < 真实 today,仓位会先被扫成 EXPIRED(挂钟依赖假失败)
         await eod_watcher._eod_tick(now_et)
     sell_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_eod_closes_day_trade_before_its_expiry():
+    """eod_force_close=True + expiry 在未来 → 当日强平（8/3 AMZN 回归）。
+
+    **契约变更（8/3）**：本用例的前身 test_eod_skips_future_expiry 断言的是
+    相反行为。当时 eod_force_close 已被 expiry==today 取代、退化成纯信息字段，
+    "flag=1 + 未来到期" 只可能是人造的怪状态，所以断言"不动"是对的。
+    day_trade 接进这个 flag 之后，该状态变成**合法且常见**的一类——
+    8/3 "AMZN 275p 4DTE @ 1.65 day trade" 就是 flag=1、4 天后到期。
+    此时"不动"等于让一笔日内单过夜，正是当晚的实际后果。
+    """
+    future = date(2026, 12, 19)
+    code = _uniq_code("EODD")
+    positions_db.open_or_add(
+        option_code=code, symbol="EODTD", strike=10.0, side="PUT",
+        expiry=future, qty=1, fill_price=1.65,
+        category="weekly", apply_sl=True, eod_force_close=True,
+        tags=["day_trade"], channel_name="ut", msg_id="m_daytrade",
+    )
+
+    now_et = datetime(2026, 6, 17, 15, 51, tzinfo=ET_TZ)
+    with patch("autotrade.position.eod_watcher.get_last_price", return_value=1.40), \
+         patch("autotrade.position.eod_watcher.place_sell_order",
+               return_value={"success": True, "qty": 1, "price": 1.26,
+                             "order_id": "EOD_ORD_D", "code": code}), \
+         patch("autotrade.position.eod_watcher.send_telegram", new_callable=AsyncMock), \
+         patch("autotrade.position.eod_watcher._is_eod_window", return_value=True), \
+         patch("autotrade.position.eod_watcher.sweep_expired_and_notify",
+               new_callable=AsyncMock):
+        await eod_watcher._eod_tick(now_et)
+
+    assert positions_db.get(code)["status"] == "CLOSED"
 
 
 @pytest.mark.asyncio

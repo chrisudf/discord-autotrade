@@ -2,10 +2,13 @@
 
 职责：
 - 每 EOD_CHECK_INTERVAL 秒检查 ET 时间
-- 到 EOD_HOUR:EOD_MIN（默认 15:50 ET）后，平掉所有
-  expiry==today_et 且 status IN (OPEN, PARTIAL) 的仓位
-  （不看 eod_force_close flag —— 该 flag 只反映开仓时刻 DTE==0，
-   周初开的 weekly 到周五到期时 flag 是 False，但同样必须在过期前平掉）
+- 到 EOD_HOUR:EOD_MIN（默认 15:50 ET）后，平掉 status IN (OPEN, PARTIAL) 且满足
+  以下**任一**条件的仓位：
+    a. expiry == today_et —— 今天到期，不平就是听任过期/被自动行权；
+    b. eod_force_close == 1 —— 开仓时就定性为"当日了结"（DTE==0，或信号
+       原文写了 day trade），与到期日无关。
+  两个条件是独立来源，缺一不可：只看 (a) 会漏掉 8/3 那笔 4DTE 的 day_trade；
+  只看 (b) 会漏掉周初开、周五到期的 weekly（开仓时 flag 就是 False）。
 - 是工作日才执行（避免周末本地测试误触发）
 
 设计：
@@ -244,16 +247,23 @@ async def _eod_tick(now_et: datetime):
     _gc_skip(now_et.date())
     ts_now = now_et.timestamp()
 
-    # 只看 expiry == today，不看 eod_force_close flag。
+    # 两个独立入选条件（见模块 docstring）：
     #
-    # 原因：eod_force_close 在**开仓时**由 categorize() 一次性算出（DTE==0 才 True），
-    # 之后不再重算。周一买的 weekly 周五到期时，它的 flag 还是 False —— 老逻辑
-    # 会让它在到期日直接过期（ITM 被自动行权，变成一笔没打算持有的正股/保证金头寸）。
-    # "0DTE 当天必过期，必须平"这个理由对**任何**到期日当天的仓位都成立，
-    # 所以这里用 expiry 本身判断。flag 保留在 DB 里仅作开仓时刻的信息性标注。
+    # a. expiry == today —— 这一条当初是**替换** flag 加进来的，因为
+    #    eod_force_close 在开仓时一次性算出、之后不重算：周一买的 weekly
+    #    到周五到期时 flag 仍是 False，只看 flag 会让它直接过期
+    #    （ITM 被自动行权，变成一笔没打算持有的正股/保证金头寸）。
+    # b. eod_force_close —— 8/3 实测：替换掉 flag 之后，这个字段就**没有任何
+    #    行为消费者了**（全仓库只剩写入点）。于是 day_trade → eod_force 的
+    #    修复写进 DB 却什么都没发生，正是 lessons #22 在低一层的复现。
+    #    day_trade 是"当日了结"的显式声明，与到期日无关，必须自己有一条入选路径。
+    #
+    # 幂等性不受影响：仍靠 status 转移（成功平掉 → CLOSED 自然剔除）。
+    # flag 是持久的，所以万一 15:50 之后才启动/重试失败，次日 15:50 会继续尝试——
+    # 对一笔本该当日了结的仓位，这就是想要的行为。
     positions = [
         p for p in position_mgr.get_open_positions()
-        if p["expiry"] == today_iso
+        if (p["expiry"] == today_iso or p.get("eod_force_close"))
         and p["qty_remaining"] > 0
         and _skip_until.get(p["option_code"], 0) <= ts_now
     ]
