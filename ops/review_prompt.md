@@ -8,9 +8,13 @@
 - **整晚终端日志** `autotrade_YYYY-MM-DD_overnight.txt`
 - **数据库摘要** `digest_YYYY-MM-DD.txt`（当晚开仓 / 事件流 / 下单记录 / 收到的全部原始消息 / 未平持仓，时间已转成本机本地时区）
 
-需要更细的数据就直接查 `data/trades.db`（表：positions / position_events /
-raw_signals / orders）；要判断解析为什么失败就读 `autotrade/parsing/signal_parser.py`
-和 `autotrade/listener/`。
+要判断解析为什么失败就读 `autotrade/parsing/signal_parser.py` 和 `autotrade/listener/`。
+
+**只用 Read / Glob / Grep 工具，不要调用 Bash。** 定时任务是无人值守跑的，
+Bash 会触发权限确认，而那时没人去点 —— 实测卡死过一次（2026-08-05 早上，
+一条 `ls` 把整个复盘挂了 2.5 小时）。摘要里已经有了当晚全部数据库记录，
+正常复盘用不到 `sqlite3`。真需要更细的数据，就在回答里说明要查什么，
+让人手动跑。
 
 先把摘要整个读完，再读日志。日志可能有几千行，别一次全灌进来 —— 用 grep 按下面的
 关键标记切片，只在需要确认上下文时才读原文附近几十行。
