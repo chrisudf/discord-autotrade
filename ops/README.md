@@ -28,7 +28,37 @@ app 开着时跑（app 关着的话推迟到下次打开），但那时取证文
 `positions`/`orders`，找哪些消息其实是有效信号但 `signal_parser.py` 没认出来。
 
 定时任务本身存在 `~/.claude/scheduled-tasks/autotrade-nightly-review/SKILL.md`，
-在 Claude 侧边栏的 "Scheduled" 里管理。
+在 Claude 侧边栏的 "Scheduled" 里管理（它产生的会话归在那儿，**不在普通聊天列表里**，
+所以常规列表翻不到）。
+
+### 仓库外的配置（换机器要手动重做）
+
+`~/.claude/settings.json`：
+
+```json
+{
+  "model": "claude-opus-5",
+  "effortLevel": "xhigh",
+  "permissions": {
+    "additionalDirectories": [
+      "<项目路径>",
+      "<输出目录路径>"
+    ]
+  }
+}
+```
+
+- `additionalDirectories` 是**必须的**：任务会话的 cwd 继承自创建它的会话，
+  多半不是本项目，读 cwd 之外的文件会触发权限确认 —— 无人值守时没人去点，
+  整个任务静默挂死。**不要**改成给 Bash 开全局白名单，权限面大得多且没必要。
+- `model` / `effortLevel` 是**全局**的，因为定时任务没有 per-task 的模型设置
+  （app 侧的 `scheduled-tasks.json` 记录里只有 cron / cwd / 权限，没有 model 字段）。
+  这套系统在管真钱，复盘用 Opus 5 + xhigh；代价是别的会话也会跟着用，
+  不想要就在那些会话里单独调。
+
+**换模型必须删掉任务重建。** "Run now" 会复用任务已绑定的那个会话，而模型在会话
+创建时就定死了 —— 光改 settings 不重建，它会一直挂在旧模型的会话上。
+（`SKILL.md` frontmatter 里的 `model:` 是否生效未经证实，当双保险留着。）
 
 ## 安装
 
