@@ -1,13 +1,17 @@
 #!/bin/zsh
-# 每早 07:00（本机时区）跑，只负责收尾取证三件事：
+# 每早 07:00（本机时区）跑：
 #   1. 优雅停掉夜里的 listener
 #   2. 把整晚 terminal log 存成桌面 txt
 #   3. 从 trades.db 抽一份当晚信号/成交摘要
+#   4. 调 opus_review.sh 出一份 Opus 5 + xhigh 的权威复盘（markdown，自动弹开）
 #
-# 复盘不在这里做 —— 由 Claude 的定时任务 autotrade-nightly-review（7:05）
-# 读这两份产物，直接在对话里回答。这么切分是因为停机和存日志不该依赖
-# Claude app 开着：app 没开时定时任务会推迟到下次打开才跑，但那时
-# 文件已经稳稳躺在桌面上了。
+# 1-3 步是纯 shell、不依赖任何 app，保证取证一定发生。第 4 步就算失败也不影响
+# 前三步的产物。
+#
+# 另有一条并行的路：Claude 的定时任务 autotrade-nightly-review（7:10）读同样这两份
+# 产物，在对话里给一份可追问的复盘。它锁死 Sonnet 5（见 opus_review.sh 注释），
+# 所以权威版走第 4 步的命令行。app 没开时定时任务会推迟到下次打开才跑，
+# 但那时文件已经稳稳躺在桌面上了。
 #
 # 本脚本在 Terminal.app 窗口里执行，不是由 launchd 直接执行 ——
 # launchd 读不了 ~/Desktop（TCC），中间隔着 launch_in_terminal.sh 这层垫片，
@@ -131,6 +135,11 @@ SQL
 log_ops "digest built -> $DIGEST"
 
 echo
-echo "取证完成，等 Claude 的 7:05 定时任务来复盘："
+echo "取证完成："
 echo "  整晚日志: $DEST"
 echo "  数据摘要: $DIGEST"
+
+# ---------- 4. Opus 5 权威复盘 ----------
+# 定时任务那条路锁死 Sonnet 5（见 opus_review.sh 顶部注释），所以权威版走命令行。
+# 两条路读的是同一份素材、同一份 review_prompt.md。
+[[ "${1:-}" == "--no-review" ]] || zsh "$PROJ/ops/opus_review.sh" "$STAMP"

@@ -10,11 +10,19 @@ launchd 用本机时区。作者机器是 Australia/Brisbane（UTC+10，无夏�
 |---|---|---|
 | 23:15 | launchd → `night_run.sh` | 开新 Terminal 窗口跑 `caffeinate -i make run`，输出 tee 到 `logs/session_YYYY-MM-DD.log` |
 | 07:00 | launchd → `morning_collect.sh` | SIGTERM 停 listener → 整晚日志存到桌面 → 从 `trades.db` 抽摘要 |
-| 07:10 | Claude 定时任务 `autotrade-nightly-review` | 读那两份产物，**直接在对话里回答复盘**，不写文件 |
+| 07:00 起约 8-9 分钟 | 同上 → `opus_review.sh` | **Opus 5 + xhigh** 出权威复盘 markdown，写完自动弹开 |
+| 07:10 | Claude 定时任务 `autotrade-nightly-review` | 读同样两份产物，**在对话里回答**一份可追问的复盘（Sonnet 5） |
 
-**为什么切成两段**：停机和存日志不该依赖 Claude app 开着。Claude 的定时任务只在
-app 开着时跑（app 关着的话推迟到下次打开），但那时取证文件已经稳稳躺在桌面上了 ——
+**为什么取证和复盘分开**：停机和存日志不该依赖 Claude app 开着。Claude 的定时任务
+只在 app 开着时跑（关着就推迟到下次打开），但那时取证文件已经稳稳躺在桌面上了 ——
 复盘晚点看没关系，日志丢了就没了。
+
+**为什么有两份复盘**：这个 app 版本把定时任务的模型**写死成 Sonnet 5**，没法改
+（证据和排查见下面「模型」一节）。权威版因此走命令行 `claude -p --model claude-opus-5
+--settings '{"effortLevel":"xhigh"}'` —— 命令行参数是唯一能硬控模型和 effort 的地方。
+对话版保留是因为它能追问。两条路读同一份素材、同一份 `review_prompt.md`，只是模型
+和载体不同。不想要对话版就在侧边栏 Scheduled 里禁用它；不想要权威版就
+`zsh ops/morning_collect.sh --no-review`。
 
 先停机再存日志，不是反过来：`app/main.py` 的 SIGTERM handler 会走 `shutdown()`，
 收尾日志也该进文件。
@@ -33,32 +41,42 @@ app 开着时跑（app 关着的话推迟到下次打开），但那时取证文
 
 ### 仓库外的配置（换机器要手动重做）
 
-`~/.claude/settings.json`：
+`~/.claude/settings.json` 只需要这一段：
 
 ```json
 {
-  "model": "claude-opus-5",
-  "effortLevel": "xhigh",
   "permissions": {
-    "additionalDirectories": [
-      "<项目路径>",
-      "<输出目录路径>"
-    ]
+    "additionalDirectories": ["<项目路径>", "<输出目录路径>"]
   }
 }
 ```
 
-- `additionalDirectories` 是**必须的**：任务会话的 cwd 继承自创建它的会话，
-  多半不是本项目，读 cwd 之外的文件会触发权限确认 —— 无人值守时没人去点，
-  整个任务静默挂死。**不要**改成给 Bash 开全局白名单，权限面大得多且没必要。
-- `model` / `effortLevel` 是**全局**的，因为定时任务没有 per-task 的模型设置
-  （app 侧的 `scheduled-tasks.json` 记录里只有 cron / cwd / 权限，没有 model 字段）。
-  这套系统在管真钱，复盘用 Opus 5 + xhigh；代价是别的会话也会跟着用，
-  不想要就在那些会话里单独调。
+**是必须项，不是优化**：定时任务会话的 cwd 继承自创建它的会话，多半不是本项目，
+读 cwd 之外的文件会触发权限确认 —— 无人值守时没人去点，整个任务静默挂死。
+**不要**改成给 Bash 开全局白名单，权限面大得多且没必要。
 
-**换模型必须删掉任务重建。** "Run now" 会复用任务已绑定的那个会话，而模型在会话
-创建时就定死了 —— 光改 settings 不重建，它会一直挂在旧模型的会话上。
-（`SKILL.md` frontmatter 里的 `model:` 是否生效未经证实，当双保险留着。）
+### 模型：定时任务锁死 Sonnet 5
+
+试过全部三条路，都无效：
+
+| 试法 | 结果 |
+|---|---|
+| `~/.claude/settings.json` 的 `model` / `effortLevel` | 无效（对 app 创建的会话不生效） |
+| `SKILL.md` frontmatter 的 `model:` | 无效 |
+| 删任务重建，让它在新配置下建全新会话 | 无效，新会话仍是 sonnet-5 |
+
+决定性证据：翻了 20 个会话记录，**唯二的两个 `claude-sonnet-5` 恰好就是那两次定时
+任务运行**，其余普通会话全是 `claude-opus-5`。所以不是配置漏了，是这个 app 版本对
+定时任务写死了模型。
+
+另外 app 有自己一份偏好覆盖 `settings.json`：
+`~/Library/Application Support/Claude/claude_desktop_config.json` 里的
+`preferences.epitaxyPrefs.ccd-effort-level`（作者机器上是 `"low"`）。这是 app UI
+的设置，影响所有 app 会话，要改在 UI 里改，别手改这个文件。
+
+所以权威复盘走 `opus_review.sh` 的命令行，`--model` / `--settings` 不受这些影响。
+排查过程中还摸到两件事：**"Run now" 会复用任务已绑定的会话**（所以光改配置不重建
+永远看不到变化），以及 **sessionId 与 transcript 文件名（cliSessionId）是两套 id**。
 
 ## 安装
 
@@ -102,8 +120,10 @@ launchd 拉起的进程默认没有这些目录的访问权。项目在 Desktop 
 
 - `autotrade_YYYY-MM-DD_overnight.txt` — 整晚终端日志
 - `digest_YYYY-MM-DD.txt` — DB 摘要（开仓/事件/下单/原始消息/未平持仓）
+- `review_YYYY-MM-DD.md` — Opus 5 + xhigh 权威复盘，写完自动弹开
+- `.opus_stdout_YYYY-MM-DD.log` — 那次 headless 运行的 stdout，报告没出来时查这个
 
-复盘结论不落盘，就是 Claude 那条回复。想存档就在对话里让它写。
+对话版复盘不落盘，就是 Claude 那条回复；想存档就在对话里让它写。
 
 运维流水账 `logs/ops.log`；launchd 自己的 stdout/stderr 在
 `~/Library/Application Support/autotrade-ops/launchd.*.log`（**不在项目里**，见上面 TCC 那段）。
