@@ -42,7 +42,17 @@ cd "$PROJ" || exit 1
 # PYTHONUNBUFFERED=1 必须有：接了管道后 python 默认块缓冲，
 # 不设的话日志要攒够几 KB 才落盘，早上 7 点收尾会丢掉最后一段。
 export PYTHONUNBUFFERED=1
-caffeinate -i make run 2>&1 | tee -a "$SESSION_LOG"
+# caffeinate 的 -i 只挡**空闲**睡眠，挡不住系统睡眠 —— 8/5 夜实测：进程在
+# 23:29:40 还是被睡进去了 8 分 44 秒（alive 心跳报 "挂钟跳变 524s"），
+# 恰好横跨 09:30 ET 开盘钟，那段时间 SL/TP/EOD watcher 全停、Discord 消息不收。
+# 加 -s（阻止系统睡眠，接电源时生效；纯电池下 macOS 会忽略它）。
+# connection.py 里 alive 心跳那段注释推荐的也正是 `caffeinate -is`。
+#
+# 注意这只保住**运行期间**。launchd 定的 23:15 若赶上 Mac 已经睡了，任务会被
+# 推迟到唤醒才跑（ops.log 实测 8/4 23:25:42、8/5 23:28:52 起，晚 10-14 分钟，
+# 距开盘只剩一分多钟）。那个要靠定时唤醒解决，见 ops/README 或：
+#   sudo pmset repeat wakeorpoweron MTWRF 23:05:00
+caffeinate -is make run 2>&1 | tee -a "$SESSION_LOG"
 
 echo "===== session end $(date '+%F %T %Z') =====" | tee -a "$SESSION_LOG"
 log_ops "exited"

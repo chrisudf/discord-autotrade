@@ -1,15 +1,16 @@
 #!/bin/zsh
-# 用 Opus 5 + xhigh effort 出一份权威复盘，写成 markdown 并弹开。
+# 用 Opus 5 + xhigh effort 出一份复盘，写成 markdown 并弹开。
 # 由 morning_collect.sh 在收尾取证之后调用；也可以手动跑（复盘昨晚：不带参数）。
 #
-# 为什么不用 Claude 的定时任务来跑 Opus：
-# 实测这个 app 版本把定时任务的模型写死成 Sonnet 5 —— 20 个会话里唯二的两个
-# sonnet 就是那两次定时任务，其余普通会话全是 opus-5。settings.json 的 model、
-# SKILL.md frontmatter 的 model、app 的模型选择器，对它统统无效。
-# 命令行的 --model / --settings 是唯一能硬控模型和 effort 的地方。
+# 这是**唯一**一条复盘路径。曾经并行跑过一条 Claude app 的定时任务
+# autotrade-nightly-review（同一份 review_prompt.md、同一份素材），
+# 理由是那时候 app 把定时任务的模型写死成 Sonnet 5，拿不到 Opus。
+# 2026-08-06 复查发现该限制已经没了（当天定时任务 29 次 API 调用全是 opus-5），
+# 于是两条路变成同一件事跑两遍 Opus —— 一个早上烧掉 5 小时额度的一半多。
+# 定时任务已停用（SKILL.md 还在，想要可追问的对话版就手动跑一次）。
 #
-# 定时任务仍然保留，跑的是同一份 review_prompt.md，给你一份可追问的对话版；
-# 这个脚本给的是权威版。两者素材相同、口径相同，只是模型和载体不同。
+# 命令行仍然是首选载体：--model / --settings 能硬控模型和 effort，
+# 不受 app 偏好影响；不依赖 app 开着；产物直接落盘。
 set -u
 
 PROJ="${0:A:h:h}"

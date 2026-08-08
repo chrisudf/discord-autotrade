@@ -10,34 +10,38 @@ launchd 用本机时区。作者机器是 Australia/Brisbane（UTC+10，无夏�
 |---|---|---|
 | 23:15 | launchd → `night_run.sh` | 开新 Terminal 窗口跑 `caffeinate -i make run`，输出 tee 到 `logs/session_YYYY-MM-DD.log` |
 | 07:00 | launchd → `morning_collect.sh` | SIGTERM 停 listener → 整晚日志存到桌面 → 从 `trades.db` 抽摘要 |
-| 07:00 起约 8-9 分钟 | 同上 → `opus_review.sh` | **Opus 5 + xhigh** 出权威复盘 markdown，写完自动弹开 |
-| 07:10 | Claude 定时任务 `autotrade-nightly-review` | 读同样两份产物，**在对话里回答**一份可追问的复盘（Sonnet 5） |
+| 07:00 起约 1-1.5 小时 | 同上 → `opus_review.sh` | **Opus 5 + xhigh** 出复盘 markdown，写完自动弹开 |
 
-**为什么取证和复盘分开**：停机和存日志不该依赖 Claude app 开着。Claude 的定时任务
-只在 app 开着时跑（关着就推迟到下次打开），但那时取证文件已经稳稳躺在桌面上了 ——
-复盘晚点看没关系，日志丢了就没了。
+**为什么取证和复盘分开**：停机和存日志不该依赖 Claude app 开着，也不该依赖模型跑得完。
+1-3 步是纯 shell，几秒钟结束；第 4 步失败也不影响前面的产物 —— 复盘晚点补没关系，
+日志丢了就没了。
 
-**为什么有两份复盘**：这个 app 版本把定时任务的模型**写死成 Sonnet 5**，没法改
-（证据和排查见下面「模型」一节）。权威版因此走命令行 `claude -p --model claude-opus-5
---settings '{"effortLevel":"xhigh"}'` —— 命令行参数是唯一能硬控模型和 effort 的地方。
-对话版保留是因为它能追问。两条路读同一份素材、同一份 `review_prompt.md`，只是模型
-和载体不同。不想要对话版就在侧边栏 Scheduled 里禁用它；不想要权威版就
-`zsh ops/morning_collect.sh --no-review`。
+**只有一份复盘**。曾经并行跑过 Claude app 的定时任务 `autotrade-nightly-review`
+（07:10，读同样两份产物，在对话里给一份可追问的版本），理由是那时 app 把定时任务
+的模型写死成 Sonnet 5、拿不到 Opus。**2026-08-06 停用**：复查发现该限制已经没了
+（当天那次定时任务 29 次 API 调用全是 `claude-opus-5`），两条路于是变成同一件事
+跑两遍 Opus，一个早上吃掉 5 小时额度的一半多。留命令行这条是因为它不依赖 app 开着、
+`--model` / `--settings` 能硬控模型和 effort、产物直接落盘。
+不想要复盘就 `zsh ops/morning_collect.sh --no-review`。
 
 先停机再存日志，不是反过来：`app/main.py` 的 SIGTERM handler 会走 `shutdown()`，
 收尾日志也该进文件。
 
 ## 改复盘的关注点
 
-改 `review_prompt.md` 就行，**不用碰定时任务**。定时任务的 prompt 只负责找文件、
-交代背景，具体看什么、怎么排序、怎么写全部指向 `review_prompt.md`，那是唯一事实来源。
+改 `review_prompt.md` 就行，**不用碰 `opus_review.sh`**。脚本里的 prompt 只负责指路
+（素材在哪、报告写到哪），具体看什么、怎么排序、怎么写全部指向 `review_prompt.md`，
+那是唯一事实来源。
 
 复盘的第一优先级是**查漏单** —— 拿 `raw_signals`（收到的全部原始消息）对照
 `positions`/`orders`，找哪些消息其实是有效信号但 `signal_parser.py` 没认出来。
 
-定时任务本身存在 `~/.claude/scheduled-tasks/autotrade-nightly-review/SKILL.md`，
-在 Claude 侧边栏的 "Scheduled" 里管理（它产生的会话归在那儿，**不在普通聊天列表里**，
-所以常规列表翻不到）。
+想要一份能追问的对话版：停用的定时任务还在
+`~/.claude/scheduled-tasks/autotrade-nightly-review/SKILL.md`，在 Claude 侧边栏
+"Scheduled" 里手动 Run now 即可（它产生的会话归在那儿，**不在普通聊天列表里**）。
+但**不要在跑完复盘的那个会话里继续追问** —— 复盘结束时 context 已经十几万 token，
+每追问一轮都要全量重读一遍，比整次复盘还贵。新开一个会话 Read
+`review_YYYY-MM-DD.md` 再问。
 
 ### 仓库外的配置（换机器要手动重做）
 
@@ -55,28 +59,24 @@ launchd 用本机时区。作者机器是 Australia/Brisbane（UTC+10，无夏�
 读 cwd 之外的文件会触发权限确认 —— 无人值守时没人去点，整个任务静默挂死。
 **不要**改成给 Bash 开全局白名单，权限面大得多且没必要。
 
-### 模型：定时任务锁死 Sonnet 5
+### 模型：定时任务曾经锁死 Sonnet 5（已不成立）
 
-试过全部三条路，都无效：
+2026-08-04 前后实测，定时任务无论怎么配都跑 Sonnet 5：`settings.json` 的 `model` /
+`effortLevel`、`SKILL.md` frontmatter 的 `model:`、删任务重建，三条路全无效。
+当时决定性证据是翻了 20 个会话记录，唯二两个 `claude-sonnet-5` 恰好是那两次定时任务。
 
-| 试法 | 结果 |
-|---|---|
-| `~/.claude/settings.json` 的 `model` / `effortLevel` | 无效（对 app 创建的会话不生效） |
-| `SKILL.md` frontmatter 的 `model:` | 无效 |
-| 删任务重建，让它在新配置下建全新会话 | 无效，新会话仍是 sonnet-5 |
+**2026-08-06 复查：限制没了**，那天早上定时任务 29 次 API 调用全是 `claude-opus-5`。
+换句话说 app 已经认 frontmatter 的 `model:` 了。这也正是要停掉它的原因 ——
+它不再是"便宜的对话版"，而是第二份全价 Opus。
 
-决定性证据：翻了 20 个会话记录，**唯二的两个 `claude-sonnet-5` 恰好就是那两次定时
-任务运行**，其余普通会话全是 `claude-opus-5`。所以不是配置漏了，是这个 app 版本对
-定时任务写死了模型。
-
-另外 app 有自己一份偏好覆盖 `settings.json`：
+app 有自己一份偏好覆盖 `settings.json`：
 `~/Library/Application Support/Claude/claude_desktop_config.json` 里的
 `preferences.epitaxyPrefs.ccd-effort-level`（作者机器上是 `"low"`）。这是 app UI
-的设置，影响所有 app 会话，要改在 UI 里改，别手改这个文件。
+的设置，影响所有 app 会话，要改在 UI 里改，别手改这个文件。命令行的
+`--model` / `--settings` 不受它影响，这仍是 `opus_review.sh` 走命令行的理由之一。
 
-所以权威复盘走 `opus_review.sh` 的命令行，`--model` / `--settings` 不受这些影响。
-排查过程中还摸到两件事：**"Run now" 会复用任务已绑定的会话**（所以光改配置不重建
-永远看不到变化），以及 **sessionId 与 transcript 文件名（cliSessionId）是两套 id**。
+排查过程中摸到的两件事仍然有效：**"Run now" 会复用任务已绑定的会话**（所以光改配置
+不重建永远看不到变化），以及 **sessionId 与 transcript 文件名（cliSessionId）是两套 id**。
 
 ## 安装
 
@@ -84,8 +84,8 @@ launchd 用本机时区。作者机器是 Australia/Brisbane（UTC+10，无夏�
 zsh ops/install.sh
 ```
 
-幂等，可重复跑。卸载 `zsh ops/install.sh --uninstall`（只卸 launchd 那两个，
-Claude 定时任务在侧边栏里删）。
+幂等，可重复跑。卸载 `zsh ops/install.sh --uninstall`（只卸 launchd 那两个；
+Claude 定时任务已停用，彻底不要就在侧边栏 "Scheduled" 里删）。
 
 装完还差一步（要密码，脚本不代跑）：
 
@@ -120,10 +120,9 @@ launchd 拉起的进程默认没有这些目录的访问权。项目在 Desktop 
 
 - `autotrade_YYYY-MM-DD_overnight.txt` — 整晚终端日志
 - `digest_YYYY-MM-DD.txt` — DB 摘要（开仓/事件/下单/原始消息/未平持仓）
-- `review_YYYY-MM-DD.md` — Opus 5 + xhigh 权威复盘，写完自动弹开
+- `review_YYYY-MM-DD.md` — Opus 5 + xhigh 复盘，写完自动弹开
 - `.opus_stdout_YYYY-MM-DD.log` — 那次 headless 运行的 stdout，报告没出来时查这个
-
-对话版复盘不落盘，就是 Claude 那条回复；想存档就在对话里让它写。
+- `.last_opus_session_id` — 最近一次 headless 运行的 session id，要复查那次跑了什么用得上
 
 运维流水账 `logs/ops.log`；launchd 自己的 stdout/stderr 在
 `~/Library/Application Support/autotrade-ops/launchd.*.log`（**不在项目里**，见上面 TCC 那段）。
@@ -164,13 +163,30 @@ grep 的 shell，而真正的 listener 反倒停不掉。
 在 launchd 这种非交互上下文里会卡死等一个没人点得到的弹窗（实测挂满 2 分钟且什么都没执行）。
 现在走 `.command` 文件 + `open -a Terminal`（LaunchServices），无需授权。
 
-**4. 机器睡着了就不会准点跑。**
-launchd 会推迟到唤醒后才执行。`caffeinate -i` 只挡"空闲睡眠"，挡不住合盖。
-所以上面那条 `pmset repeat` 要排，且**夜里别合盖**。
+**4. 机器睡着了就不会准点跑，跑起来了也可能中途睡过去。**
+两件不同的事，要分开治：
+
+- **起跑前**：launchd 会把错过的时点推迟到唤醒后才执行。ops.log 实测 8/4 是
+  23:25:42、8/5 是 23:28:52 才起来，晚了 10-14 分钟，距 23:30 开盘只剩一分多钟。
+  这个只能靠上面那条 `pmset repeat wakeorpoweron` 定时唤醒。
+- **跑起来之后**：`caffeinate -i` 只挡"空闲睡眠"。8/5 夜实测进程照样被睡进去
+  8 分 44 秒（alive 心跳报「挂钟跳变 524s」），**正好横跨 09:30 ET 开盘钟**，
+  那段时间 SL/TP/EOD watcher 全停、Discord 消息不收（靠重连回补捞回来）。
+  `night_run.sh` 已改成 **`caffeinate -is`**（`-s` 挡系统睡眠，接电源时生效；
+  纯电池下 macOS 会忽略它）。
+
+两条都挡不住**合盖**，夜里别合盖。
 
 **5. moomoo OpenD 要自己保持开着。**
 自动化不会帮你拉起它。没开的话 `app/preflight.py` 会 `sys.exit(1)` 快速失败 ——
 不会静默出错，窗口会报错退出，第二天 `logs/ops.log` 里是 `no listener running`。
+
+**6. 复盘很贵，一个早上能吃掉半个额度。** 2026-08-06 早上 07:15 起的 5 小时窗口用掉
+50%+，拆开是：定时任务追问 ~60 万、`opus_review.sh` ~37 万、定时任务自动跑 ~27 万
+（输入等价，cache_read 按 0.1× / output 按 5× 折算）。素材本身才 16KB —— 贵的是
+xhigh 的 thinking、一次吐 15KB 报告（单轮 12.8K output ×5），以及**在长会话里继续
+追问**：context 涨到 16 万后每轮都要全量重读。所以：同一件事只跑一遍、追问另开会话、
+日志平静的晚上可以把 `--settings` 的 `xhigh` 降成 `high`。
 
 ## 两个实现细节
 
