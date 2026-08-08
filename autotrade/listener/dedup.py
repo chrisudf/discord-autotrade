@@ -222,6 +222,31 @@ _runner_preserve_alerted: dict[str, datetime] = {}
 _stale_open_alerted: dict[str, datetime] = {}
 
 
+# 编辑后成为信号的告警节流：同一张合约 5 分钟内只提醒一次。
+# 独立 registry 的理由同 _stale_open_alerted —— 这条路径**不下单**，
+# 绝不能去占 _signal_fps 的坑：一旦占了，5 分钟内那张合约真来了实时信号
+# 会被当成孪生静默丢掉（拿"没下单的告警"顶掉真实入场，是 7/28 已经踩过
+# 一次的形状）。
+_edit_signal_alerted: dict[str, datetime] = {}
+
+
+def edit_signal_should_alert(fp: str, now: "datetime | None" = None) -> bool:
+    """查即登记：窗口内同一合约第二次起返回 False。
+
+    key 用 _signal_fingerprint(sig)（symbol|side|strike|expiry_date）而不是
+    symbol —— 喊单员连着编辑同一条消息两次（先补价再改错字）会重复触发，
+    但换了合约就该另外提醒一次。
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    _sweep_expired(_edit_signal_alerted, now, _ADDON_ALERT_WINDOW,
+                   cap=_ALERT_THROTTLE_MAX)
+    if fp in _edit_signal_alerted:
+        return False
+    _edit_signal_alerted[fp] = now
+    return True
+
+
 def stale_open_should_alert(symbol: str, now: "datetime | None" = None) -> bool:
     """查即登记：窗口内同 symbol 第二次起返回 False（双语孪生只告警一次）。"""
     if now is None:

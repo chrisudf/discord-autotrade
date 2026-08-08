@@ -17,7 +17,7 @@ from autotrade.config.channel_loader import registry
 # handle_message 以裸名 import:_backfill_missed 必须经由本模块的
 # `handle_message` 全局调用,tests(test_backfill)才能 monkeypatch 它。
 from autotrade.listener.router import handle_message
-from autotrade.notify.transport import send_telegram
+from autotrade.notify.transport import _safe_notify
 from autotrade.notify.watchdog import notify_tick_error, notify_tick_ok
 from autotrade.storage.logger_db import processed_msg_ids_since
 from autotrade.utils.envcfg import env_int
@@ -148,16 +148,14 @@ async def on_disconnect():
                 f"🌀 Discord storm: {n} disconnects in last "
                 f"{_STORM_WINDOW_SEC:.0f}s — bot may be offline soon"
             )
-            try:
-                # 用 plain text 避免 markdown 转义出意外
-                await send_telegram(
-                    f"🌀 Discord 重连风暴：{_STORM_WINDOW_SEC:.0f}s 内 {n} 次断线。\n"
-                    f"可能进入 identify-rate-limit 退避（最长 ~3min）。"
-                    f"建议盯一下盘，必要时手动重启 listener。",
-                    parse_mode=None,
-                )
-            except Exception as e:
-                logger.warning(f"storm TG notify failed: {e}")
+            # 用 plain text 避免 markdown 转义出意外；走 _safe_notify 拿送达可见性
+            # （理由同下面 _on_alive_gap 里那段注释）
+            await _safe_notify(
+                f"🌀 Discord 重连风暴：{_STORM_WINDOW_SEC:.0f}s 内 {n} 次断线。\n"
+                f"可能进入 identify-rate-limit 退避（最长 ~3min）。"
+                f"建议盯一下盘，必要时手动重启 listener。",
+                parse_mode=None,
+            )
 
     # 慢性 churn 检测：30min 窗口里累计 >= 5 次 → TG 告警一次
     # [7/28] churn 记账改用**挂钟**：monotonic 在系统睡眠中不走（macOS），
@@ -177,15 +175,12 @@ async def on_disconnect():
                 f"🌀 Discord churn: {n} disconnects in last "
                 f"{_CHURN_WINDOW_SEC/60:.0f}min — network likely flapping"
             )
-            try:
-                await send_telegram(
-                    f"🌀 Discord 慢性掉线：{_CHURN_WINDOW_SEC/60:.0f} 分钟内 {n} 次断线。\n"
-                    f"多为本机网络抖动（WiFi 省电 / 路由器丢空闲连接）。"
-                    f"完整重登录期间的信号已尝试自动回补，但建议检查网络。",
-                    parse_mode=None,
-                )
-            except Exception as e:
-                logger.warning(f"churn TG notify failed: {e}")
+            await _safe_notify(
+                f"🌀 Discord 慢性掉线：{_CHURN_WINDOW_SEC/60:.0f} 分钟内 {n} 次断线。\n"
+                f"多为本机网络抖动（WiFi 省电 / 路由器丢空闲连接）。"
+                f"完整重登录期间的信号已尝试自动回补，但建议检查网络。",
+                parse_mode=None,
+            )
 
 
 # ============================================================
@@ -231,16 +226,19 @@ async def _on_alive_gap(prev: datetime, now: datetime):
     if (_sleep_alerted_wall is None
             or (now - _sleep_alerted_wall).total_seconds() >= _SLEEP_ALERT_COOLDOWN_SEC):
         _sleep_alerted_wall = now
-        try:
-            await send_telegram(
-                f"😴 检测到系统睡眠/挂起 {gap/60:.0f} 分钟。\n"
-                f"睡眠期间 SL/TP/EOD watcher 停摆、Discord 消息不接收，"
-                f"已尝试回补漏掉的消息。\n"
-                f"跑 bot 请用 `caffeinate -is make run` 防止 Mac 入睡。",
-                parse_mode=None,
-            )
-        except Exception as e:
-            logger.warning(f"[alive] sleep TG notify failed: {e}")
+        # 走 _safe_notify 而非直连 send_telegram：后者成功只记 DEBUG，
+        # 日志里看不出到底送没送到。[8/5 复盘] 那晚机器在 09:30 开盘钟上
+        # 睡了 8 分 44 秒，这条是全晚最该让人知道的告警，事后翻日志却只能
+        # 看到"发起了"，无法确认落地——只好去翻 Telegram 会话对。
+        # parse_mode=None 保持不变：正文里有反引号和中文标点，没按
+        # MarkdownV2 转义过，套上会被 400（transport 会 fallback，但白跑一趟）。
+        await _safe_notify(
+            f"😴 检测到系统睡眠/挂起 {gap/60:.0f} 分钟。\n"
+            f"睡眠期间 SL/TP/EOD watcher 停摆、Discord 消息不接收，"
+            f"已尝试回补漏掉的消息。\n"
+            f"跑 bot 请用 `caffeinate -is make run` 防止 Mac 入睡。",
+            parse_mode=None,
+        )
 
 
 async def run_alive_heartbeat():

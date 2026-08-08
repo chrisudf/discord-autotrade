@@ -114,9 +114,10 @@ async def on_message(message):
 
 
 async def on_message_edit(before, after):
-    # 暂不触发下单，只记录（防止 KC 改单价导致重复触发）
-    if registry.is_monitored(after.channel.id):
-        logger.info(f"✏️  [edit] {after.channel.name}: {after.content[:80]}")
+    # 仍然不下单；编辑后才成为可执行信号时发 TG 让人工接管。
+    # 过滤/解析/去重/告警的实现在 listener.router.handle_message_edit
+    # （薄委托，同 on_disconnect → connection 的写法）。
+    await handle_message_edit(before, after)
 
 
 # on_disconnect / on_resumed 的实现（防抖/storm/churn/回补起点管理）在
@@ -177,7 +178,7 @@ _watcher_tasks: set = set()
 
 async def main():
     global client
-    global registry, validate_channels, handle_message
+    global registry, validate_channels, handle_message, handle_message_edit
     global send_telegram, format_error, close_ctx
     global _backfill_missed, _log_reconnect_time
     global _connection_on_disconnect, _connection_on_resumed
@@ -217,7 +218,11 @@ async def main():
     from autotrade.app.preflight import preflight
     from autotrade.broker.trade import close_ctx
     from autotrade.config.channel_loader import registry, validate_channels
-    from autotrade.listener.router import bind_client, handle_message
+    from autotrade.listener.router import (
+        bind_client,
+        handle_message,
+        handle_message_edit,
+    )
     from autotrade.notify.messages import format_error
     from autotrade.notify.transport import send_telegram
     from autotrade.position.eod_watcher import run_eod_watcher, sweep_expired_and_notify

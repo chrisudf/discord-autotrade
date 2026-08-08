@@ -53,7 +53,6 @@ from autotrade.utils.logger import logger
 # 注意：必须先于 ACTION 检测，因为 "scaled some yesterday" 含 "scaled" 但不动手
 RECAP_MARKERS = [
     "yesterday", "this morning", "earlier today",
-    "(so far)", "so far,",  # PnL 复盘 "(so far) the account"，不拦 "so far before FOMC"
     "the plan", "my plan", "here's my plan",
     "have an order", "will be ", "going to ",
     "out of 4", "out of 5",  # PnL 复盘 "2 losing out of 4"
@@ -64,6 +63,34 @@ RECAP_MARKERS = [
     # watchlist 帖本质是 recap——语料回放发现内文带 "lock in gains" 建议的
     # watchlist 会被 lock-in 动词路由成 CLOSE，这里统一拦掉
     "watchlist",
+]
+
+# 需要边界/上下文的 recap 标记，纯 substring 表达不了，与 RECAP_MARKERS 同权。
+# 两者都命中即跳过（见 _has_recap_marker）。
+RECAP_PATTERNS = [
+    # [8/5 复盘] "Controlled selling so far - let's EMAs catch up"（本地 02:03）
+    # 在有 RKLB 持仓时会被判成 CLOSE 2%（`2% in $RKLB` 的 2% 被 _extract_pct 抽走）。
+    # 老写法是两条字面量 "(so far)" / "so far,"，原意"只拦作为分句收尾的 so far，
+    # 不拦 'so far before FOMC'"是对的，但把收尾形态写死成了逗号和右括号 ——
+    # 喊单员用的是破折号，差一个标点就漏。改成"so far 后面跟任意分句收尾符或行尾"，
+    # 原意不变，覆盖 , - – — . : ; ) ! ? 和换行。
+    # "so far before FOMC" 仍不拦：so far 后面是空格+单词，不在收尾符里。
+    # 代价：像 "Trimmed 50% so far" 这种"已减完再报账"的句子现在也算 recap 被跳过。
+    # 方向上是对的（那是报账不是指令），且符合模块顶部"宁漏平不误平"的取舍。
+    re.compile(r"so far\s*(?:[,\-–—.:;)!?]|$)", re.M),
+
+    # [8/5 复盘] "will trim SOFI calls closer to $19 stock price"（本地 23:55）
+    # 是**未来条件意图**（等股价到 $19 再减），不是当下指令。但 STRONG_CLOSE_RE
+    # 的裸 `trim` 判成 CLOSE，_extract_pct 找不到百分比 → 落到默认 33%，
+    # 有 SOFI 持仓时会立刻减掉三分之一。
+    # 老表里的 "will be " / "going to " 接得住 "will be trimming"，唯独接不住
+    # 少了 be 的 "will trim"。这里补的就是这个形状。
+    # 动词表与 ACTION_VERBS 的词根同源（trim/cut/sell/close/dump/scale/lock），
+    # 加动词请两处一起看。
+    # 已知代价（与既有的 "will be " 逐字同款，不是新引入的风险）：一句话里
+    # 既有当下动作又有未来计划时整条被跳过，例如 "Out half here, will trim
+    # the rest at $19" —— 宁可漏平也不误平，见模块顶部。
+    re.compile(r"\b(?:will|'ll|’ll)\s+(?:be\s+)?(?:trim|cut|sell|close|dump|scale|lock)\w*"),
 ]
 
 # bulk action —— 不指定 symbol，对所有持仓批量 trim
@@ -351,6 +378,16 @@ ZH_RECAP_MARKERS = [
     "我的计划", "的计划是", "计划：",
     "打算", "准备", "即将", "将要", "将把",  # 未来意图
     "时卖出", "时减仓", "时清", "时砍", "时抛",  # "在 40% 时卖出"
+    # [8/5 复盘] "到目前为止控制性卖出 - 让我们的EMA追赶上来"（本地 02:03）
+    # 是 EN "Controlled selling so far - " 的孪生。EN 侧这次靠 RECAP_PATTERNS
+    # 的 so-far 规则拦下了，ZH 侧不补就是**白修** —— 双语各发一条，ZH 常先到
+    # （历史 63%），拦住一边另一边照样把 RKLB 平掉 2%。
+    # 用 "目前为止" 而非 "到目前为止"，顺带覆盖"截至目前为止"。
+    "目前为止",
+    # 注：EN 侧同批补的 "will trim" 未来意图，ZH 孪生
+    # "将在股价接近19美元时减仓SOFI看涨期权" 已被上面的 "时减仓" 拦住
+    # （实测 ZH skip (recap)），所以这里不重复加 "将减仓" 一类裸词 ——
+    # 没有语料证据的裸词正是本表下方 "不加裸缩减" 那条注释要避免的。
     "了一些",  # "卖出了一些" 多为复盘；与 "了一笔" / "了一份" 区分
     "每周回顾", "观察列表", "观察名单",  # 周报/watchlist（与 EN 侧对齐）
 ]
@@ -563,7 +600,10 @@ def _extract_exclude_symbols(text: str) -> list[str]:
 
 
 def _has_recap_marker(text_lower: str) -> bool:
-    return any(m in text_lower for m in RECAP_MARKERS)
+    return (
+        any(m in text_lower for m in RECAP_MARKERS)
+        or any(p.search(text_lower) for p in RECAP_PATTERNS)
+    )
 
 
 def _has_bulk_marker(text_lower: str) -> bool:

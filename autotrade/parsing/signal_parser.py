@@ -458,6 +458,44 @@ def _try_pattern_a(text: str, today: date):
     return None
 
 
+# B 系列尾段"从 calls/puts 走到喊价"的窗口。
+#
+# [8/5 实锤丢单] enrich 23:51 先发 "跟踪 $RKLB 每周 $80 看涨期权"（无价，正确
+# 拒单），14s 后**编辑**该消息补上 "\n\n$1.35 填充 2%"。喊价另起一段，而 B0 /
+# B0.5 / B1b / B2 / B3 的尾段一律是 `[^\$\n]*?` —— 字符类里的 \n 把喊价挡在
+# 换行外面，五个变体全落空（B1 用的是 .*?+DOTALL，本来就跨得过去）。
+# 实测：同一句写成一行 "…$80 calls $1.35 fill" 解析完全正常，唯一的差别就是
+# 那个换行。
+#
+# 放开 \n，仍然禁 $：`$` 是本频道 ticker 的固定前缀，禁掉它窗口就跨不到下一个
+# $TICKER 去（"$META 620 calls" 后面接 "$SPY 4.20" 拼不成混合单）。
+# 代价是窗口现在能吃到"目标价/止损价"那类**不是入场价**的数字——这条防线由
+# 下面 _b_match 里的 _price_qualified 接管（原是 Pattern D 的护栏，见
+# _PRICE_QUALIFIERS 注释里 7/29 那次对抗测试）。
+_B_PRICE_GAP = r"[^\$]*?"
+
+
+def _b_match(pattern, text: str, price_group: int):
+    """B 系列共用：finditer + 限定价护栏，返回第一个喊价可信的 match。
+
+    price_group 是该 pattern 里**喊价**的分组序号（各变体分组数不同，必须
+    逐个传对，传错等于护栏对着别的数字看）。
+
+    用 finditer + continue 而不是 search + return None：同一条消息里
+    "目标 $6.00" 后面若还跟着真喊价，后一个 match 仍有机会命中。
+    与 _try_pattern_d 的处理逐字同构。
+    """
+    for m in pattern.finditer(text):
+        if _price_qualified(text, m.start(price_group), m.start()):
+            logger.info(
+                f"[parser] Pattern B 跳过限定价（目标/止损/现价类，非入场价）: "
+                f"{m.group(0).strip()[:60]}"
+            )
+            continue
+        return m
+    return None
+
+
 def _try_pattern_b(text: str, today: date):
     """Pattern B: 多种 $SYMBOL 形态。
 
@@ -467,6 +505,9 @@ def _try_pattern_b(text: str, today: date):
     B1:    含 NDTE
     B2:    weekly 无日期 → 默认本周五
     B3:    $STRIKE 在 calls 前的倒序写法
+
+    全系列的喊价段用 _B_PRICE_GAP（可跨行）并经 _b_match 过限定价护栏，
+    见该常量注释里的 8/5 RKLB 实锤。
     """
 
     # ----- B0: 含 MM/DD -----
@@ -474,10 +515,10 @@ def _try_pattern_b(text: str, today: date):
         r"\$([A-Z]{1,5})\b"
         r"[^\$\n]*?(\d{1,2})/(\d{1,2})"
         r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
-        r"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)",
+        + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
     )
-    m = p_mmdd.search(text)
+    m = _b_match(p_mmdd, text, 6)
     if m:
         symbol, mm, dd, strike, side, price = m.groups()
         return {
@@ -495,14 +536,26 @@ def _try_pattern_b(text: str, today: date):
         }
 
     # ----- B0.5: $SYMBOL ... Month DD ... $STRIKE calls $PRICE -----
+    # [8/5 复盘发现] 下面那行的 {{0,3}} 之前写成 {0,3} —— 这是 rf 字符串，
+    # 单括号会被当成 f-string 替换字段：f"{0,3}" 渲染成字面量 "(0, 3)"。
+    # 编译出来的正则实际是 `(?:[a-z0-9]+\s+)(0, 3)?(calls?|puts?)`，后果有两层：
+    #   1. "0-3 个填充词"变成"**必须恰好一个**填充词"；
+    #   2. 凭空多出第 7 个捕获组，一旦命中，下面 6 元解包抛
+    #      ValueError: too many values to unpack —— 而 parse_signal 的
+    #      `except ValueError` 本是给 smart_expiry 的非法日期准备的，
+    #      把它一并吞掉，日志报成 "[parser] invalid date in signal"，
+    #      **信号静默丢失且归因错误**。
+    # 没填充词时则整条 B0.5 不匹配 → 落到 B2 → 英文月份日期被无视，
+    # expiry 悄悄退成 next Friday（买错到期日的合约）。
+    # B0.5 自写下起就没真正生效过；修正后它才第一次按 docstring 工作。
     p_month_name = re.compile(
         rf"\$([A-Z]{{1,5}})\b"
         rf"[^\$\n]*?({MONTH_NAMES_RE})\s+(\d{{1,2}})(?:st|nd|rd|th)?"
-        rf"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
-        rf"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)",
+        rf"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){{0,3}}?(calls?|puts?)"
+        + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
     )
-    m = p_month_name.search(text)
+    m = _b_match(p_month_name, text, 6)
     if m:
         symbol, month_name, dd, strike, side, price = m.groups()
         mm = MONTH_NAME_TO_NUM[month_name.lower()]
@@ -529,7 +582,9 @@ def _try_pattern_b(text: str, today: date):
         r".*?\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE | re.DOTALL,
     )
-    m = p_dte_first.search(text)
+    # B1 的 .*?+DOTALL 本来就跨行，不改窗口；补上与其它变体同一套限定价护栏
+    # （之前 B1 是全系列唯一既能跨行、又完全没有护栏的一支）。
+    m = _b_match(p_dte_first, text, 5)
     if m:
         symbol, dte, strike, side, price = m.groups()
         return {
@@ -551,10 +606,10 @@ def _try_pattern_b(text: str, today: date):
         r"\$([A-Z]{1,5})\b"
         r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
         r"[^\$\n]*?(\d+)DTE"
-        r"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)",
+        + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
     )
-    m = p_dte_mid.search(text)
+    m = _b_match(p_dte_mid, text, 5)
     if m:
         symbol, strike, side, dte, price = m.groups()
         return {
@@ -575,10 +630,10 @@ def _try_pattern_b(text: str, today: date):
     p_weekly = re.compile(
         r"\$([A-Z]{1,5})\b"
         r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
-        r"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)",
+        + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
     )
-    m = p_weekly.search(text)
+    m = _b_match(p_weekly, text, 4)
     if m:
         symbol, strike, side, price = m.groups()
         return {
@@ -601,10 +656,10 @@ def _try_pattern_b(text: str, today: date):
         r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*"
         r"\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
         r"[^\$\n]*?(\d{1,2})/(\d{1,2})"
-        r"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)",
+        + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
     )
-    m = p_alt.search(text)
+    m = _b_match(p_alt, text, 6)
     if m:
         symbol, strike, side, mm, dd, price = m.groups()
         return {

@@ -220,15 +220,20 @@ def send_telegram_sync(text: str, parse_mode: str = "MarkdownV2") -> bool:
 # ============================================================
 # 工具：Telegram 通知
 # ============================================================
-async def _safe_notify(msg: str):
+async def _safe_notify(msg: str, parse_mode: str = "MarkdownV2"):
     """发 Telegram，失败只 log 不抛。
 
     return 值打 log 是为了让运营在 log 里能确认 TG 链路是否工作
     （send_telegram 成功只在 debug 级；6/23 OSCR 拒单 TG 是否发出去看不出）。
+
+    parse_mode 透传给 send_telegram，缺省与它一致。加这个参数是为了让
+    「正文没按 MarkdownV2 转义、必须走纯文本」的告警也能享受上面那行
+    可见性 —— 8/5 夜的睡眠告警就是这种：它直连 send_telegram(parse_mode=None)
+    绕开本函数，结果全晚最该让人知道的一条告警，运维在日志里查不到送没送到。
     """
     head = msg.replace("\n", " ")[:60]
     try:
-        ok = await send_telegram(msg)
+        ok = await send_telegram(msg, parse_mode=parse_mode)
         if ok:
             logger.info(f"[notify] TG sent: {head}")
         else:

@@ -108,6 +108,34 @@ def format_addon_alert(symbol: str, raw: str) -> str:
     )
 
 
+def format_edited_signal_alert(channel_name: str, symbol: str, strike: float,
+                               side: str, expiry: str, price: float,
+                               age_sec: float, raw: str) -> str:
+    """原消息被**编辑**后才成为可执行信号 → 提醒人工，不自动下单。
+
+    背景 8/5：enrich 23:51:00 发 "跟踪 $RKLB 每周 $80 看涨期权"（无喊价，
+    按规则 3 正确拒单），14s 后编辑该消息补上 "$1.35 填充 2%"。
+    on_message_edit 当时只写日志不重解析，这单整个丢掉。
+
+    刻意**不自动下单**：编辑可能发生在几分钟甚至几小时后，限价会锚在
+    早已走掉的喊价上；而且 on_message 与 on_message_edit 的去重语义不同
+    （_seen 按 msg_id，编辑不改 id），自动执行的竞态面比收益大。
+    先让人看见，跟不跟由人定。
+    """
+    minutes = age_sec / 60
+    age_str = f"{age_sec:.0f} 秒前" if age_sec < 90 else f"{minutes:.0f} 分钟前"
+    return (
+        f"✏️ *消息编辑后成为信号（未自动下单）*\n"
+        f"频道: `{escape_md(channel_name)}`\n"
+        f"标的: *{escape_md(symbol)}* {escape_md(strike)}"
+        f"{escape_md(side.upper()[:1])} {escape_md(expiry)}\n"
+        f"喊价: ${escape_md(f'{price}')}\n"
+        f"原消息发出于: {escape_md(age_str)}\n"
+        f"要跟请**手动**下单\n"
+        f"编辑后原文: ```\n{escape_md((raw or '')[:300])}\n```"
+    )
+
+
 def format_daily_summary(orders: int, total_cost: float,
                          max_orders: int, max_cost: float) -> str:
     """格式化每日统计"""

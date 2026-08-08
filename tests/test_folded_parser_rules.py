@@ -43,19 +43,13 @@ SAMPLES = [
     ("KC TSLA Sept 19", "@everyone\nKC Trades Bot:TSLA 350p Sept 19 @ 4.50", "TSLA"),
 
     # === [新增] 英文月份 - Pattern B0.5 ===
-    # 已知缺口：老 repo 原样复现 "invalid date in signal: too many values to
-    # unpack (expected 6)" → None（脚本原输出 21/22 passed）。按契约不修
-    # known-weird 行为，这条标 xfail 锁定缺口，期望 symbol 不变。
-    pytest.param(
-        "enrich NVDA June 20",
-        "enrich:\n$NVDA June 20 $180 calls $2.50\n\n@everyone $alert",
-        "NVDA",
-        marks=pytest.mark.xfail(
-            reason="Pattern B0.5 月份日期解析缺口（老 repo 同样失败，21/22）",
-            strict=False,
-        ),
-        id="enrich NVDA June 20",
-    ),
+    # [8/5 复盘解锁] 这条曾标 xfail，reason 写的是"老 repo 同样失败的已知缺口"，
+    # 报错原文 "invalid date in signal: too many values to unpack (expected 6)"。
+    # 根因不是解析能力缺口，是 signal_parser.py 里 B0.5 那行 rf 字符串把
+    # {0,3} 当成 f-string 替换字段渲染成了字面量 "(0, 3)"（多出第 7 个捕获组，
+    # 6 元解包抛 ValueError，又被 except ValueError 吞成"日期非法"）。
+    # 改成 {{0,3}} 后 B0.5 第一次真正生效，缺口不存在了 → 转普通用例。
+    ("enrich NVDA June 20", "enrich:\n$NVDA June 20 $180 calls $2.50\n\n@everyone $alert", "NVDA"),
 ]
 
 
