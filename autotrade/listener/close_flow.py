@@ -31,6 +31,7 @@ from autotrade.utils.envcfg import env_float
 from autotrade.policy.pricing import calc_sell_limit
 from autotrade.position import fill_checker
 from autotrade.position import manager as position_mgr
+from autotrade.position import retry_guard
 from autotrade.position.sell_executor import (
     Outcome,
     SellPlan,
@@ -294,6 +295,13 @@ async def _kc_sell(
     """
     code = pos["option_code"]
 
+    # [8/13] 确定性拒单熔断后不再对同一合约下单。结局取 SKIPPED_NOTIFIED：
+    # 熔断那一刻已经发过专属 TG，这里算"处理过了"，不能落到外层
+    # "no matching open positions" 兜底文案（6/18 IWM 的误导形状）。
+    if retry_guard.is_tripped(f"kc:{code}"):
+        logger.warning(f"[CLOSE] {code} 跳过：{retry_guard.blocked(f'kc:{code}')}")
+        return Outcome.SKIPPED_NOTIFIED, None
+
     async def _plan(fresh: dict):
         qty_to_sell = position_mgr.calc_qty_to_sell(fresh, pct)
         # [0011] 该仓位实际执行口径的 pct：默认=信号 pct；策略B SELL_ALL
@@ -425,17 +433,38 @@ async def _kc_sell(
             f"[CLOSE] {code} already closed while waiting for lock, skip"
         )
 
+    async def _on_failed_attempt(title: str, err: str, qty_desc: str):
+        """[8/13] 只吃 retry_guard 的熔断那一半（backoff=False）。
+
+        瞬时拒单原样放过：0005 的设计是"指纹回滚 + 1-3s 后的双语孪生天然重试
+        一次"，在这里插退避会把那条链打断。要挡的只有 naked-short 这类确定性
+        拒单 —— 喊单员一夜喊 7 次 trim（7/23 AVGO 的形状），本地仓位却早已在
+        broker 侧消失，那就是 7 次同样的拒单 + 7 条同样的 TG。
+        """
+        d = retry_guard.on_reject(f"kc:{code}", err, backoff=False)
+        hint = ""
+        if d.tripped:
+            logger.error(f"[CLOSE] ⛔ {code} 熔断（确定性拒单）：{err}")
+            hint = (
+                "\n\n⛔ **本合约的自动平仓已熔断**，后续同标的的 CLOSE 信号不再下单"
+                "（重启即恢复）。"
+                "\nbroker 侧很可能已经没有这张仓、本地 DB 陈旧：跑 "
+                "`python -m autotrade.ops.sync_positions --dry-run` 对账。"
+                "\n在此之前请在 moomoo 手动确认。"
+            )
+        else:
+            logger.error(f"[CLOSE] sell rejected: {err}")
+        await _safe_notify(format_error(title, f"{code} {qty_desc}\n{err}{hint}"))
+
     async def _sell_error(e: Exception, plan):
         logger.exception("place_sell_order failed")
-        await _safe_notify(format_error("Sell order error", str(e)))
+        await _on_failed_attempt("Sell order error", f"{type(e).__name__}: {e}",
+                                 f"qty={plan.qty}")
 
     async def _sell_rejected(result: dict, plan):
-        err = result.get("message", "unknown")
-        logger.error(f"[CLOSE] sell rejected: {err}")
-        await _safe_notify(format_error(
-            "Sell rejected by broker",
-            f"{code} qty={plan.qty}\n{err}",
-        ))
+        await _on_failed_attempt("Sell rejected by broker",
+                                 result.get("message", "unknown"),
+                                 f"qty={plan.qty}")
 
     async def _record_failure(e: Exception, result: dict):
         logger.error(f"on_close_filled failed: {e}")

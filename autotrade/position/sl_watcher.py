@@ -40,11 +40,13 @@ from autotrade.broker.trade import place_sell_order
 from autotrade.broker.quote import get_last_prices
 from autotrade.position import manager as position_mgr
 from autotrade.position import fill_checker
-from autotrade.position.sell_executor import SellPlan, execute_sell
+from autotrade.position import retry_guard
+from autotrade.position.sell_executor import Outcome, SellPlan, execute_sell
 from autotrade.notify.transport import send_telegram
 # format_close_filled 已随成交 TG 收进 sell_executor（0015），此处只剩错误文案
 from autotrade.notify.messages import format_error
 from autotrade.notify.watchdog import notify_tick_error, notify_tick_ok
+from autotrade.utils import logdedup
 from autotrade.utils.envcfg import env_int
 from autotrade.utils.logger import logger
 
@@ -110,6 +112,16 @@ async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip:
         return
     _triggered.add(code)
 
+    # [8/13] 拒单熔断：SL 的失败路径全部 discard 让下轮重试，而 tick 是 5s 一轮
+    # ——跟 TP 一模一样的硬打形状，只是那晚先炸的是 TP。退避期/熔断后直接返回，
+    # 不打日志（每 5s 一条跳过日志就是把刷屏换个措辞，见 tp_watcher 同处注释）。
+    guard = f"sl:{code}"
+    blocked_reason = retry_guard.blocked(guard)
+    if blocked_reason is not None:
+        logger.debug(f"[sl] {code} 跳过：{blocked_reason}")
+        _triggered.discard(code)  # 没有卖出发生，维持 set 的不变式
+        return
+
     async def _plan(fresh: dict):
         """锁内决策：SL 全平剩余，限价 = last × (1-slip)，0.01 兜底。"""
         qty = fresh["qty_remaining"]
@@ -133,17 +145,59 @@ async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip:
         logger.debug(f"[sl] {code} already closed while waiting for lock, skip")
         _triggered.discard(code)  # 没有卖出发生，维持 set 只含"已卖未落库"的不变式
 
+    async def _on_failed_attempt(title: str, err: str, qty_desc: str):
+        """拒单/异常共用收尾：熔断登记 + 收敛日志 + 按需 TG，最后 discard 让下轮重试。
+
+        熔断了也照样 discard —— 挡住下一轮的是 blocked()，不是 _triggered。
+        那个 set 的不变式（只含"已卖未落库"）必须保持干净，否则同 code 日后
+        reopen 时 SL 会永久失效。
+        """
+        d = retry_guard.on_reject(guard, err)
+
+        level = "ERROR" if (d.tripped or d.fails == 1) else "WARNING"
+        if d.tripped:
+            tail = ("确定性拒单，重试无意义" if d.deterministic
+                    else f"连续 {d.fails} 次失败")
+            logger.log(level, f"[sl] ⛔ {code} 熔断（{tail}）：{err}")
+        else:
+            logdedup.log_throttled(
+                f"sl-reject:{guard}",
+                f"[sl] sell rejected: {err} → 第 {d.fails} 次，退避 {d.retry_after:.0f}s",
+                level=level,
+            )
+
+        if d.alert:
+            suffix = (f"\n（上次告警以来另有 {d.suppressed} 次同类失败未单独告警）"
+                      if d.suppressed else "")
+            if d.tripped:
+                # SL 熔断比 TP 熔断严重一档：这张仓从此没有自动止损。
+                # 措辞按最坏情况写，别让人在半夜把它当成一条普通拒单划走。
+                hint = (
+                    "\n\n⛔ **本合约的 SL 已熔断，本进程内不再重试 —— "
+                    "它现在没有自动止损**（重启即恢复）。"
+                )
+                if d.deterministic:
+                    hint += (
+                        "\n若是 naked-short 拒单，说明 broker 侧已经没有这张仓，"
+                        "本地 DB 陈旧：跑 "
+                        "`python -m autotrade.ops.sync_positions --dry-run` 对账。"
+                    )
+                hint += "\n否则请立刻在 moomoo 手动处理。"
+            else:
+                hint = f"\n\n将在 {d.retry_after:.0f}s 后重试（连续第 {d.fails} 次失败）。"
+            await send_telegram(format_error(title, f"{code} {qty_desc}\n{err}{suffix}{hint}"))
+
+        _triggered.discard(code)  # 让下一轮重试（能不能真重试由 blocked() 说了算）
+
     async def _sell_error(e: Exception, plan):
         logger.exception("[sl] place_sell_order failed")
-        await send_telegram(format_error("SL sell error", f"{code}\n{e}"))
-        _triggered.discard(code)  # 让下一轮重试
+        await _on_failed_attempt("SL sell error", f"{type(e).__name__}: {e}",
+                                 f"qty={plan.qty}")
 
     async def _sell_rejected(result: dict, plan):
-        err = result.get("message", "unknown")
-        logger.error(f"[sl] sell rejected: {err}")
-        await send_telegram(format_error(
-            "SL sell rejected", f"{code} qty={plan.qty}\n{err}"))
-        _triggered.discard(code)
+        await _on_failed_attempt("SL sell rejected",
+                                 result.get("message", "unknown"),
+                                 f"qty={plan.qty}")
 
     # 卖出成功但落库失败：DB 仍显示 OPEN。保留在 _triggered 里
     # 冻结该 code 的 SL，防止下轮对已卖出的仓位重复挂卖单。
@@ -158,7 +212,7 @@ async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip:
             f"然后重启 bot 恢复该合约的 SL。"
         ))
 
-    await execute_sell(
+    outcome, _ = await execute_sell(
         pos,
         trigger_source="sl_polling",
         notify_trigger="sl_polling",
@@ -175,6 +229,12 @@ async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip:
         on_record_success=lambda: _triggered.discard(code),
         on_record_failure=_record_failure,
     )
+
+    if outcome is Outcome.SOLD:
+        cleared = retry_guard.on_success(guard)
+        if cleared:
+            logger.info(f"[sl] ✅ {code} 卖出成功，清除 {cleared} 次连续失败的退避状态")
+        logdedup.flush(f"sl-reject:{guard}")
 
 
 async def _sl_tick():

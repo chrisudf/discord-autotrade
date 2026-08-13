@@ -18,6 +18,7 @@ from autotrade.parsing.holidays import adjust_to_trading_day, is_trading_day
 # 这里 import 复用：路由与解析必须同进同退。close_parser 只依赖 re/logger，
 # 不反向 import 本模块，无循环风险。
 from autotrade.parsing.close_parser import (
+    _CHOP_HALF_PATTERN,
     _OUT_BARE_SYM_PATTERN,
     _OUT_FRACTION_PATTERN,
     _OUT_PCT_PATTERN,
@@ -163,17 +164,35 @@ CHINESE_MARKERS = ["美股会员网rich", "美股会员网机器人"]
 # 一次语序归一化，改写成规范序后复用既有 B 阶梯——到期日/tag 逻辑自动继承，
 # 与上面 ZH 方向词归一化是同一套路子。
 #
-# 两道护栏防止把 strike 和 price 换反（换反 = 用 $98 的限价买 $0.70 的合约）：
+# [8/10 实锤丢单] "$DELL - weekly - $3.50 - $530 calls / Scaling in 1% now"
+# （10:12 ET 盘中）——同样是倒序，但两个 $ 之间隔着**字段分隔符** " - "，
+# 而不是空白。后果是双重的：归一化不触发 → 文本原样进 _has_price_range →
+# "$3.50 - $530" 逐字命中 PRICE_RANGE_PATTERN 的 "$数字 - $数字" → 判成喊价
+# 区间跳过，中英双播两条全丢且**一条 TG 都没发**（见 open_flow 的 skip 分支）。
+# 放开分隔符后文本先被改写成 "$DELL - weekly - $530 calls $3.50"，区间正则
+# 自然不再命中（$530 前面是 "weekly - " 不是 $数字）——归一化跑在
+# _has_price_range **之前**，所以**不需要动 PRICE_RANGE_PATTERN 本身**，
+# 真区间（"$740 - $745 calls"）的拦截能力完整保留。
+#
+# 三道护栏防止把 strike 和 price 换反（换反 = 用 $98 的限价买 $0.70 的合约）：
 #   1. price 必须带小数点（".70" / "1.50"）——本频道喊价一律带分位，
 #      行权价一律整数；这条直接排掉 "$740 $745 calls" 这类价差写法
 #   2. price < strike——期权权利金没有高过行权价的
+#   3. strike >= price * 10——放开分隔符**新引入**的形状：真喊价区间
+#      "$3.50 - $4.00 calls" 两个数都带小数、且 3.50 < 4.00，前两道全过，
+#      会被错换成"用 $3.50 买 $4.00 行权价"。数量级差挡住它（4.00 < 35 → 不换，
+#      原样留给区间 pre-filter 正确拦下）；真信号绰绰有余（DELL 530 ≥ 35、
+#      AAOI 98 ≥ 7）。
 _INVERTED_PRICE_STRIKE_RE = re.compile(
     r"\$(\.\d+|\d+\.\d+)"                             # $PRICE（必须带小数点）
-    r"\s+"
+    r"[\s\-–—]+"                                      # 空白 / 字段分隔破折号（含中文全角）
     r"\$(\d+(?:\.\d+)?)"                              # $STRIKE
     r"(\s*(?:[a-z0-9]+\s+){0,3}?(?:calls?|puts?))",   # [填充词] calls/puts
     re.IGNORECASE,
 )
+
+# 护栏 3 的数量级下限（strike 至少是 price 的 10 倍）
+_INVERTED_STRIKE_PRICE_RATIO = 10
 
 
 def _normalize_inverted_price(text: str) -> str:
@@ -184,6 +203,9 @@ def _normalize_inverted_price(text: str) -> str:
     def _swap(m):
         price, strike, tail = m.group(1), m.group(2), m.group(3)
         if float(price) >= float(strike):
+            return m.group(0)
+        if float(strike) < float(price) * _INVERTED_STRIKE_PRICE_RATIO:
+            # 两数量级太近 → 更可能是喊价区间而非 price/strike 对，不换
             return m.group(0)
         return f"${strike}{tail} ${price}"
 
@@ -970,6 +992,11 @@ STRONG_CLOSE_RE = re.compile(
     # 8/3 同型漏检：enrich "$TSLA 出 1/2"（EN "$TSLA out 1/2"）双语双漏。
     # 边界与 close_parser.ZH_OUT_FRACTION_RE 共用同一份 pattern 串。
     r"|" + _ZH_OUT_FRACTION_PATTERN
+    # 8/10 DELL：EN "chopping in half" 的 ZH 机翻"削减一半"。EN 侧进 WEAK
+    # （见下），ZH 侧进 STRONG——理由同 "出半"：机翻句里几乎不会夹开仓意图词，
+    # 而 ZH 独有的 OPEN_INTENT 误否决过一次（7/15 "all out" 案例）。
+    # 只认带"半"的组合，与 close_parser.ZH_ACTION_VERBS 的收词口径一致。
+    + r"|削减一半|削减半"
     + r"|锁定",
     re.I,
 )
@@ -990,6 +1017,12 @@ WEAK_CLOSE_RE = re.compile(
     # "out of the money" 会被当平仓，理由详见 _OUT_BARE_SYM_PATTERN。
     + r"|" + _OUT_FRACTION_PATTERN
     + r"|(?-i:" + _OUT_BARE_SYM_PATTERN + r")"
+    # 8/10 实测：enrich 收盘前 "$DELL - … - chopping in half" 双语双漏，
+    # detect_action 根本没路由成 CLOSE（两条都落到 OPEN 侧 Parse failed）。
+    # pattern 同样 import 自 close_parser，路由与解析同进同退。
+    # 放 WEAK：原文里 "I will hold a 1% lotto position" 这类措辞常与开仓意图
+    # 混排，保留 OPEN_INTENT 一票否决（宁漏平不误平）。
+    + r"|" + _CHOP_HALF_PATTERN
     + r"|\bselling\b"
     r"|\bscaling\s+down\b",
     re.I,

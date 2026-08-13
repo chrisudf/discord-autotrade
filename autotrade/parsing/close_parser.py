@@ -172,13 +172,29 @@ _OUT_FRACTION_PATTERN = (
     r"\bout\s+(?:1\s*/\s*[2-5]|2\s*/\s*[3-5]|3\s*/\s*[45]|4\s*/\s*5)\b"
 )
 
+# "chop(ping) in half" —— 8/10 enrich 收盘前 3 分钟
+# "$DELL - gross price action into the end of the day - I will hold a 1% lotto
+# position - chopping in half"（ZH 孪生"…削减一半"）双语双漏：detect_action
+# 压根没路由成 CLOSE（日志实证：两条都走了 OPEN 侧的 Parse failed）。
+# 当晚零损失（无 DELL 持仓），但与"放开倒序分隔符"那条修复是**耦合**的——
+# 改完 parser 后 DELL 那族信号能自动买入，平仓动词再接不住就是"买得进卖不出"，
+# 比原来的漏单更糟（该标的当日收盘 -52%）。
+#
+# **必须带 "in half"**：裸 chop/chopping 在盘面黑话里是"横盘震荡"
+# （"market is chopping around"、"choppy price action"），单独入表等于每条
+# 行情吐槽都变平仓指令。同理不收 "chopped"（过去式多为 recap）。
+_CHOP_HALF_PATTERN = (
+    r"\bchop(?:ping|s)?\s+(?:it\s+|them\s+|these\s+|the\s+position\s+)?in\s+half\b"
+)
+
 # "out" 短语统一走词边界 regex（勿放回 ACTION_VERBS/FULL_CLOSE_VERBS 的
 # substring 匹配——见上方 "overall outlook" 案例）
 _OUT_PHRASE_RE = re.compile(
     r"\ball\s+out\b|\bout\s+(?:half|full|majority)\b"
     r"|" + _OUT_PCT_PATTERN
     + r"|" + _OUT_FRACTION_PATTERN
-    + r"|(?-i:" + _OUT_BARE_SYM_PATTERN + r")",
+    + r"|(?-i:" + _OUT_BARE_SYM_PATTERN + r")"
+    + r"|" + _CHOP_HALF_PATTERN,
     re.IGNORECASE,
 )
 # 裸 "out AMZN" 无 %/分数时是**全平**语义（"out X" = 清掉 X），
@@ -198,9 +214,21 @@ FULL_CLOSE_VERBS = ["closed", "cutting", "cut ", "dumped", "dumping"]
 # 排除 "1% position" / "99% cash" / "2% 的仓位/头寸" 这类**仓位大小标注**
 # （7/8 实测：enrich "Closing all positions ... this is a 1% position -
 # I am 99% cash" 被读成 trim 1%，BULK 遍历全部持仓刷了 8 连 TG）
+#
+# [8/10 DELL] 仓位标注和名词之间会夹一个修饰词："I will hold a 1% **lotto**
+# position - chopping in half"。老 lookahead 只认紧邻的 position，于是 1% 被当成
+# trim 比例 → EN 侧 pct=1，而 ZH 孪生"削减一半"走"一半"→50，**同一条消息双语
+# 解析出两个比例**（谁先到就按谁执行，另一条被指纹 dedup 吞掉）。
+# 放宽成"可夹一个**仓位形容词**"，用白名单而不是通配 \w+：通配会把
+# "trimming 50% of position" 的 "of" 也当修饰词，把真 trim 比例排除掉，
+# pct 悄悄掉回默认 33（比原缺陷更贵）。只收描述仓位大小/性质的词。
+_PCT_SIZE_ADJ = r"(?:lotto|starter|core|runner|swing|scalp|day|initial|small|full|tiny)"
+_PCT_SIZE_NOUN = r"(?:position|pos\b|sizing|cash)"
 PCT_PATTERN = re.compile(
     r"(?<![-+\d.])(\d{1,3})\s*%"
-    r"(?!\s*(?:position\b|pos\b|sizing\b|cash\b|的?\s*仓位|的?\s*头寸|的?\s*现金))"
+    r"(?!\s*(?:(?:" + _PCT_SIZE_ADJ + r"\s+)?" + _PCT_SIZE_NOUN
+    + r"|的?\s*仓位|的?\s*头寸|的?\s*现金))",
+    re.IGNORECASE,
 )
 
 # 提取 $SYMBOL（强信号）
@@ -410,6 +438,11 @@ ZH_ACTION_VERBS = [
     "减持", "缩减至", "缩减到",
     "出清",
     "减半",   # "减半仓于2.45"（7/9 实测；"减仓" 不是它的连续子串，接不住）
+    # EN "chopping in half" 的 ZH 机翻（8/10 DELL，见 _CHOP_HALF_PATTERN）。
+    # 只收带"半"的组合，不收裸"削减"——机翻里"削减利率/削减开支"太常见，
+    # 而 ZH 路径一旦命中动词就直接对白名单里的持仓挂卖单。
+    # pct 由既有的 "一半"→50 分支给出，不新开管道。
+    "削减一半", "削减半",
     # "出半"（7/23 NBIS）不进本表：裸子串会命中"冲出半年新高"类评论，
     # 由 ZH_OUT_HALF_RE 带边界匹配后归一化成"减半"（见 _parse_close_zh 入口）
     "锁定",   # "$XOM 全部锁定"（7/17，enrich 止盈口头禅的 ZH 版）
@@ -639,7 +672,8 @@ _ACTION_RE = re.compile(
     r"|\btrim\s|\bcut\s|\bsold\s+here\b|\bscaling\s+(?:out|down)\b|bang!|\bbang\s+-"
     r"|\ball\s+out\b|\bout\s+(?:half|full|majority)\b"
     r"|" + _OUT_FRACTION_PATTERN
-    + r"|(?-i:" + _OUT_BARE_SYM_PATTERN + r")",
+    + r"|(?-i:" + _OUT_BARE_SYM_PATTERN + r")"
+    + r"|" + _CHOP_HALF_PATTERN,
     re.IGNORECASE,
 )
 
@@ -803,7 +837,9 @@ def _extract_pct(text: str, text_lower: str) -> int:
 
     # 显式份额短语：比 33% 默认值语义更强，但弱于明确的数字 %
     # "out half" = 卖一半；"out majority/most" = 卖大部分（75% 经验值，实测调整）
-    if re.search(r"\bout\s+half\b", scope, re.I):
+    # "chopping in half" 同为 50%（8/10 DELL，见 _CHOP_HALF_PATTERN）——不写这条
+    # 就会掉回默认 33，和 ZH 孪生"削减一半"（"一半"→50）指纹不一致
+    if re.search(r"\bout\s+half\b", scope, re.I) or re.search(_CHOP_HALF_PATTERN, scope, re.I):
         return 50
     if re.search(r"\bout\s+(?:majority|most)\b", scope, re.I):
         return 75

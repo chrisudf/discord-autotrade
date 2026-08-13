@@ -15,16 +15,20 @@ broker 真实持仓会静默脱钩，实际见过的来源：
 
 之前对账只发生在"有人想起来手动跑 ops/sync_positions"的时刻。本模块把
 sync_positions 的 diff 逻辑抽成纯函数（diff_positions），套上与 watcher
-同款的后台循环：启动先跑一次，之后每 RECONCILE_INTERVAL_MIN 分钟一轮，
-发现漂移只发 TG —— **report-only，绝不写 DB**。
+同款的后台循环：启动先跑一次，之后每 RECONCILE_INTERVAL_MIN 分钟一轮。
 
-v1 只做可见性。升级路径（显式推迟的设计决策，需单独拍板后另开 WP）：
-  1. 对 broker 的**确定性响应**自动落账（broker 明确回答"没有该仓" →
-     record_close(fill_price=0, trigger_source="broker_sync")，即把
-     ops/sync_positions 的写库分支搬进来）；
-  2. qty 不一致时自动收敛 qty_remaining。
-  两者都会改变 close 白名单和 watcher 选仓 —— 影响"是否下单"，按契约
-  铁律 2 属钱路行为，v1 一概不做，只报告。
+v1（0016）只做可见性，report-only。**v2（0018，2026-08-13）落地了升级路径 1**：
+对 broker 的确定性响应自动落账。触发它的是 8/13 夜的实证 —— 00:11 TP 开始
+对着一张 broker 侧不存在的 MU 945C 硬打，00:27 本模块**看见并报了**
+（db_only db=2 broker=0），然后按签名节流沉默，那条陈旧 OPEN 一直挂到 06:00，
+1918 次拒单。可见性到位而手没伸出去，等于把止血完全押在"半夜有人看 TG"上。
+
+现在的分工：
+  - db_only（broker 明确说没有）→ **自动 record_close(fill_price=0,
+    "broker_sync")**，三道闸门见 _auto_close_veto；RECONCILE_AUTO_CLOSE=0 可关。
+  - qty_mismatch（升级路径 2）→ 仍然只报告。收敛 qty 会改变 SL/TP 的卖出
+    张数，按契约铁律 2 属钱路行为，需单独拍板。
+  - broker_only（幽灵仓）→ 仍然只报告。凭空造记录要猜入场价/category/频道。
 
 生产机验证（本模块自身不需要 diag 脚本 —— broker 查询与人工对账脚本
 共用同一 SDK 调用）：
@@ -56,6 +60,92 @@ KIND_QTY_MISMATCH = "qty_mismatch"  # 两边都有但张数不同：部分场外
 # 已知边界（与 runner-preserve 节流同语义）：签名在发送前登记，若那一条
 # TG 恰好发送失败，同一份漂移不会重试——log 里每轮都有完整记录兜底。
 _last_signature: "tuple | None" = None
+
+
+# ---- 自动落账（0018，2026-08-13）----------------------------------------
+# 8/13 夜实证：reconciler **看见了**（00:27 一条 db_only: MU 945C db=2 broker=0，
+# storm 起于 00:11），报了一次 TG 之后按签名节流沉默，DB 里那条陈旧 OPEN 一直
+# 挂到 06:00 —— TP 对着一张 broker 侧不存在的仓打了 1918 次。可见性到位、
+# 手却没伸出去，这正是模块 docstring 里"升级路径 1"要解决的事。
+#
+# 落地范围严格限定在**确定性响应**这一类：broker 明确回答"这个 code 我没有"
+# （db_only，broker_qty==0）→ record_close(fill_price=0, "broker_sync")，与
+# ops/sync_positions 的写法逐字同款。
+#   - qty_mismatch **不动**（升级路径 2，仍未拍板）：张数对不上可能是部分成交
+#     在途，收敛 qty 会改变 SL/TP 的卖出张数，是另一个量级的决定。
+#   - broker_only（幽灵仓）**不动**：DB 里没有的仓凭空造一条记录，入场价、
+#     category、频道全是猜的，猜错比不写更糟。
+#
+# 三道闸门（任一不满足 → 退回 report-only，本轮不写库）：
+#   1. RECONCILE_AUTO_CLOSE=1（默认开；出事时可以一个 env 关掉）
+#   2. broker 侧期权持仓数为 0 时**绝不落账**：分不清"确实全平了"和
+#      "position_list_query 返回了个空 df"，而后者会把全部活仓一次清空。
+#   3. 单轮最多落账 RECONCILE_AUTO_CLOSE_MAX 条（默认 3）：超过这个数更像
+#      查询侧出了问题，不像真有那么多仓同时消失。
+_DEFAULT_AUTO_CLOSE_MAX = 3
+
+
+def _auto_close_enabled() -> bool:
+    return env_int("RECONCILE_AUTO_CLOSE", 1, minimum=0) > 0
+
+
+def _auto_close_max() -> int:
+    return env_int("RECONCILE_AUTO_CLOSE_MAX", _DEFAULT_AUTO_CLOSE_MAX, minimum=1)
+
+
+def _auto_close_veto(diffs: list[dict], broker_rows: dict[str, int]) -> "str | None":
+    """返回本轮拒绝落账的理由；None = 可以落账。纯函数，便于单测穷举闸门。"""
+    if not _auto_close_enabled():
+        return "RECONCILE_AUTO_CLOSE=0（已关闭自动落账）"
+    if not any(int(q or 0) > 0 for q in broker_rows.values()):
+        return ("broker 侧期权持仓为 0 —— 分不清真全平还是查询返回空，"
+                "本轮不写库")
+    stale = [d for d in diffs if d["kind"] == KIND_DB_ONLY]
+    if len(stale) > _auto_close_max():
+        return (f"本轮 db_only 有 {len(stale)} 条，超过上限 {_auto_close_max()} "
+                f"—— 更像查询侧异常，本轮不写库")
+    return None
+
+
+def _auto_close(diffs: list[dict], broker_rows: dict[str, int]) -> tuple[list[str], str]:
+    """把确定性 db_only 落账为 CLOSED。返回 (已落账的 code 列表, 说明串)。
+
+    单条失败不影响其余（逐条 try）：对账是止血路径，一条写不进去不该让
+    另外几条也留在陈旧状态。
+    """
+    stale = [d for d in diffs if d["kind"] == KIND_DB_ONLY]
+    if not stale:
+        return [], ""
+
+    veto = _auto_close_veto(diffs, broker_rows)
+    if veto is not None:
+        logger.warning(f"[reconcile] 自动落账跳过：{veto}")
+        return [], f"⚠️ 自动落账跳过：{veto}"
+
+    closed: list[str] = []
+    for d in stale:
+        code = d["option_code"]
+        try:
+            positions_db.record_close(
+                option_code=code, qty_sold=d["db_qty"], fill_price=0.0,
+                trigger_source="broker_sync",
+                note="reconcile auto-close: broker no longer has this position "
+                     "(auto-exercise / expired / manual close)",
+            )
+            closed.append(code)
+            logger.warning(
+                f"[reconcile] ✅ 自动落账 CLOSED: {code} qty={d['db_qty']} "
+                f"（fill_price=0，非成交价；PnL 需人工核）")
+        except Exception as e:
+            logger.error(f"[reconcile] ❌ 自动落账失败 {code}: {type(e).__name__}: {e}")
+
+    if not closed:
+        return [], ""
+    return closed, (
+        f"✅ 已自动落账 {len(closed)} 条陈旧 OPEN 为 CLOSED（fill_price=0，非成交价）：\n"
+        + "\n".join(f"  - {c}" for c in closed)
+        + "\n这些仓位从此掉出 SL/TP/EOD 选仓，止盈不会再对着空仓硬打。PnL 需人工核。"
+    )
 
 
 def _interval_min() -> int:
@@ -112,14 +202,17 @@ def diff_positions(db_rows: list[dict], broker_rows: dict[str, int]) -> list[dic
     return diffs
 
 
-def _format_report(diffs: list[dict]) -> str:
+def _format_report(diffs: list[dict], auto_note: str = "") -> str:
     """漂移列表 → TG 纯文本（parse_mode=None，同 storm/churn/睡眠告警惯例，
-    option_code 里的下划线/点号不用管转义）。纯函数。"""
+    option_code 里的下划线/点号不用管转义）。纯函数。
+
+    auto_note：本轮自动落账的结果（或跳过理由），由 _auto_close 给出。
+    空串 = 这一轮没碰 DB。"""
     by_kind: dict[str, list[dict]] = {}
     for d in diffs:
         by_kind.setdefault(d["kind"], []).append(d)
 
-    lines = [f"🔍 持仓对账：发现 {len(diffs)} 处漂移（report-only，DB 未改）"]
+    lines = [f"🔍 持仓对账：发现 {len(diffs)} 处漂移"]
     if KIND_DB_ONLY in by_kind:
         lines.append("• DB 有 / broker 无（疑似已行权或场外平仓，本地记账已陈旧）:")
         for d in by_kind[KIND_DB_ONLY]:
@@ -133,6 +226,9 @@ def _format_report(diffs: list[dict]) -> str:
         for d in by_kind[KIND_QTY_MISMATCH]:
             lines.append(
                 f"  - {d['option_code']} DB {d['db_qty']} vs broker {d['broker_qty']}")
+    if auto_note:
+        lines.append("")
+        lines.append(auto_note)
     lines.append(
         "处理：人工核对 moomoo 持仓 → "
         "python -m autotrade.ops.sync_positions（先 --dry-run）→ 重启 bot")
@@ -169,14 +265,18 @@ async def _reconcile_tick() -> list[dict]:
             f"[reconcile] drift {d['kind']}: {d['option_code']} "
             f"db={d['db_qty']} broker={d['broker_qty']}")
 
+    # [0018] 确定性漂移自动落账。放在 TG 节流**之前**：这一轮真的动了 DB，
+    # 那就是新事件，不能被"与上一轮签名相同"压掉（8/13 那一夜正是被压掉的）。
+    closed, auto_note = _auto_close(diffs, broker_rows)
+
     signature = tuple(sorted(
         (d["kind"], d["option_code"], d["db_qty"], d["broker_qty"]) for d in diffs))
-    if signature == _last_signature:
+    if signature == _last_signature and not closed:
         logger.info(f"[reconcile] {len(diffs)} 处漂移与上一轮相同，TG 不重发（log 照记）")
         return diffs
     _last_signature = signature
 
-    await send_telegram(_format_report(diffs), parse_mode=None)
+    await send_telegram(_format_report(diffs, auto_note), parse_mode=None)
     return diffs
 
 

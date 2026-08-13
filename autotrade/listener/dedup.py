@@ -216,6 +216,13 @@ _ALERT_THROTTLE_MAX = 200
 _runner_preserve_alerted: dict[str, datetime] = {}
 
 
+# parser 主动 skip 的"疑似信号"告警节流：同 (原因, symbol) 5 分钟内只提醒一次。
+# 8/10 DELL：一条五要素齐全的开仓信号被 price_range pre-filter 吞掉，
+# 零下单 + 零告警 + 零 WARNING。语义同 _stale_open_alerted（不下单的告警，
+# 独立 registry，不占真实入场告警的节流位）。
+_parser_skip_alerted: dict[str, datetime] = {}
+
+
 # 陈旧 OPEN(回补重放)告警节流：同 symbol 5 分钟内只提醒一次。
 # 语义等同 _sized_entry_alerted，独立一个 registry 是为了不让"没下单的告警"
 # 去顶掉真实入场告警的节流位。
@@ -244,6 +251,23 @@ def edit_signal_should_alert(fp: str, now: "datetime | None" = None) -> bool:
     if fp in _edit_signal_alerted:
         return False
     _edit_signal_alerted[fp] = now
+    return True
+
+
+def parser_skip_should_alert(key: str, now: "datetime | None" = None) -> bool:
+    """查即登记：窗口内同 key 第二次起返回 False（中英孪生 + 编辑重发只告警一次）。
+
+    key 形如 "price_range:DELL"（skip 原因 + symbol）——换了原因或换了标的
+    都该另外提醒一次。独立 registry 的理由同 _stale_open_alerted：这条路径
+    **不下单**，不能去顶掉真实入场告警的节流位。
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    _sweep_expired(_parser_skip_alerted, now, _ADDON_ALERT_WINDOW,
+                   cap=_ALERT_THROTTLE_MAX)
+    if key in _parser_skip_alerted:
+        return False
+    _parser_skip_alerted[key] = now
     return True
 
 

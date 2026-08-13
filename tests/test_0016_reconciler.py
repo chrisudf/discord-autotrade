@@ -1,4 +1,4 @@
-"""0016: 定时对账 reconciler（report-only）测试
+"""0016: 定时对账 reconciler 测试（0018 起：db_only 自动落账）
 
 背景：本地 trades.db 与 broker 静默脱钩的实锤——7/2 OCC 自动行权
 （lessons #14/#15）、7/25 夜 AVGO 415C 强平失败过期后本地仍挂 OPEN。
@@ -8,9 +8,13 @@
 - diff 纯函数矩阵（同步/db_only/broker_only/qty 不一致/边界 qty<=0）
 - interval=0 不起 task
 - 有差异发 TG / 无差异沉默（mock broker + TG）
-另加：report-only 不写 DB、DRY_RUN 跳过（不打 broker）、同一份漂移 TG
-不重复轰炸（0002 runner-preserve 节流同哲学）、主循环吞 tick 异常继续跑、
+另加：DRY_RUN 跳过（不打 broker）、同一份漂移 TG 不重复轰炸（0002
+runner-preserve 节流同哲学）、主循环吞 tick 异常继续跑、
 trade.list_open_option_positions 的期权过滤与失败不静默。
+
+[0018] 自动落账（文件末尾 test_auto_close_*）：8/13 夜 reconciler 看见了
+MU 945C 的 db_only 却只报不动手，TP 对着空仓打了 1918 次。现在 db_only
+自动 record_close，qty_mismatch / 幽灵仓仍只报告，另有三道闸门。
 """
 import asyncio
 from datetime import date, datetime
@@ -124,7 +128,12 @@ def test_diff_mixed_matrix_deterministic_order():
 # ============ tick：有差异发 TG / 无差异沉默 / 不写 DB ============
 
 async def test_tick_diff_sends_tg_and_never_writes_db(monkeypatch):
-    """有漂移 → TG 一条（纯文本）；report-only：DB 分毫不动。"""
+    """有漂移 → TG 一条（纯文本）。
+
+    [0018] 这个用例的 broker 侧返回 `{}` —— 正好落在自动落账的第二道闸门上
+    （持仓为 0 时分不清"真全平"和"查询返回空 df"）。所以 DB 仍然分毫不动，
+    但理由从"v1 一律 report-only"变成了"本轮被闸门拦下"，TG 里要说清楚。
+    非空 broker 的落账行为见 test_auto_close_* 系列。"""
     monkeypatch.setenv("DRY_RUN", "false")
     code = _uniq_code("RC1")
     _open_pos("RC1", code, qty=2)
@@ -139,10 +148,10 @@ async def test_tick_diff_sends_tg_and_never_writes_db(monkeypatch):
     text = tg.await_args.args[0]
     assert code in text
     assert "行权" in text          # 类别文案：疑似已行权/场外平仓
-    assert "report-only" in text
+    assert "自动落账跳过" in text and "broker 侧期权持仓为 0" in text
     assert tg.await_args.kwargs.get("parse_mode") is None  # 纯文本，免转义事故
 
-    pos = positions_db.get(code)   # v1 只做可见性：不 record_close、不改 status
+    pos = positions_db.get(code)   # 闸门拦下：不 record_close、不改 status
     assert pos["status"] == "OPEN"
     assert pos["qty_remaining"] == 2
     assert all(e["trigger_source"] == "kc_signal"
@@ -387,3 +396,139 @@ def test_sub_100_strike_not_reported_as_phantom_drift():
     db_rows = [{"option_code": "US.SOFI270115C20000", "qty_remaining": 1}]
     broker_rows = {"US.SOFI270115C20000": 1}
     assert reconciler.diff_positions(db_rows, broker_rows) == []
+
+
+# ============================================================
+# [0018] 确定性漂移自动落账（8/13 MU 事故的直接对策）
+# ============================================================
+# 那一夜的完整形状：00:11 TP 开始对着 broker 侧不存在的 MU 945C 硬打，
+# 00:27 reconciler 看见了 db_only(db=2, broker=0) 并报了一条 TG，之后按签名
+# 节流沉默 —— DB 里那条陈旧 OPEN 一直挂到 06:00。下面这组用例钉住"看见之后
+# 要动手"，以及三道不许动手的闸门。
+
+async def test_auto_close_writes_db_and_drops_position_from_watchers(monkeypatch):
+    """db_only + broker 侧还有别的仓 → 落账 CLOSED，掉出 watcher 选仓。"""
+    monkeypatch.setenv("DRY_RUN", "false")
+    stale = _uniq_code("AC1")
+    alive = _uniq_code("AC2")
+    _open_pos("AC1", stale, qty=2)
+    _open_pos("AC2", alive, qty=1)
+
+    tg = AsyncMock(return_value=True)
+    with patch.object(reconciler, "list_open_option_positions",
+                      return_value={alive: 1}), \
+         patch.object(reconciler, "send_telegram", tg):
+        diffs = await reconciler._reconcile_tick()
+
+    assert [d["kind"] for d in diffs] == [reconciler.KIND_DB_ONLY]
+    assert positions_db.get(stale)["status"] == "CLOSED"
+    assert positions_db.get(alive)["status"] == "OPEN"  # 活仓一根汗毛都不许动
+    # 掉出 open 列表 = SL/TP/EOD 不会再选中它 = 不会再有 1918 次拒单
+    assert stale not in {p["option_code"] for p in positions_db.get_open_positions()}
+    assert any(e["trigger_source"] == "broker_sync"
+               for e in positions_db.get_events(stale))
+    assert "已自动落账 1 条" in tg.await_args.args[0]
+
+
+async def test_auto_close_never_touches_qty_mismatch_or_ghost(monkeypatch):
+    """只落 db_only：qty 不一致（升级路径 2 未拍板）和幽灵仓都不动。"""
+    monkeypatch.setenv("DRY_RUN", "false")
+    mismatch = _uniq_code("AC3")
+    _open_pos("AC3", mismatch, qty=2)
+
+    tg = AsyncMock(return_value=True)
+    with patch.object(reconciler, "list_open_option_positions",
+                      return_value={mismatch: 1, _uniq_code("GHOST"): 3}), \
+         patch.object(reconciler, "send_telegram", tg):
+        diffs = await reconciler._reconcile_tick()
+
+    kinds = {d["kind"] for d in diffs}
+    assert kinds == {reconciler.KIND_QTY_MISMATCH, reconciler.KIND_BROKER_ONLY}
+    pos = positions_db.get(mismatch)
+    assert pos["status"] == "OPEN" and pos["qty_remaining"] == 2
+    assert "已自动落账" not in tg.await_args.args[0]
+
+
+async def test_auto_close_vetoed_when_broker_returns_empty(monkeypatch):
+    """闸门 2：broker 一张期权都没有 → 分不清真全平和查询返回空，绝不落账。
+
+    这一条是全组里最要命的：position_list_query 抖一下返回空 df，若照落，
+    会把当晚所有活仓一次性标成 CLOSED —— 全部掉出 SL/TP/EOD，裸放到天亮。
+    """
+    monkeypatch.setenv("DRY_RUN", "false")
+    a, b = _uniq_code("AC4"), _uniq_code("AC5")
+    _open_pos("AC4", a, qty=2)
+    _open_pos("AC5", b, qty=2)
+
+    tg = AsyncMock(return_value=True)
+    with patch.object(reconciler, "list_open_option_positions", return_value={}), \
+         patch.object(reconciler, "send_telegram", tg):
+        await reconciler._reconcile_tick()
+
+    assert positions_db.get(a)["status"] == "OPEN"
+    assert positions_db.get(b)["status"] == "OPEN"
+    assert "自动落账跳过" in tg.await_args.args[0]
+
+
+async def test_auto_close_vetoed_above_max(monkeypatch):
+    """闸门 3：单轮 db_only 超过上限 → 更像查询侧异常，本轮不写库。"""
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("RECONCILE_AUTO_CLOSE_MAX", "2")
+    alive = _uniq_code("AC9")
+    stales = [_uniq_code(f"AC{i}") for i in (6, 7, 8)]
+    for i, c in enumerate(stales):
+        _open_pos(f"AC{i}", c, qty=1)
+    _open_pos("AC9", alive, qty=1)
+
+    tg = AsyncMock(return_value=True)
+    with patch.object(reconciler, "list_open_option_positions",
+                      return_value={alive: 1}), \
+         patch.object(reconciler, "send_telegram", tg):
+        await reconciler._reconcile_tick()
+
+    assert all(positions_db.get(c)["status"] == "OPEN" for c in stales)
+    assert "超过上限 2" in tg.await_args.args[0]
+
+
+async def test_auto_close_can_be_switched_off(monkeypatch):
+    """RECONCILE_AUTO_CLOSE=0 → 退回 0016 的 report-only 行为。"""
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("RECONCILE_AUTO_CLOSE", "0")
+    stale, alive = _uniq_code("ACA"), _uniq_code("ACB")
+    _open_pos("ACA", stale, qty=2)
+    _open_pos("ACB", alive, qty=1)
+
+    tg = AsyncMock(return_value=True)
+    with patch.object(reconciler, "list_open_option_positions",
+                      return_value={alive: 1}), \
+         patch.object(reconciler, "send_telegram", tg):
+        await reconciler._reconcile_tick()
+
+    assert positions_db.get(stale)["status"] == "OPEN"
+    assert "RECONCILE_AUTO_CLOSE=0" in tg.await_args.args[0]
+
+
+async def test_auto_close_breaks_signature_throttle(monkeypatch):
+    """落账那一轮必须发 TG —— 8/13 的漂移正是被"与上一轮签名相同"压掉的。"""
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("RECONCILE_AUTO_CLOSE", "0")   # 第一轮：只报告
+    stale, alive = _uniq_code("ACC"), _uniq_code("ACD")
+    _open_pos("ACC", stale, qty=2)
+    _open_pos("ACD", alive, qty=1)
+
+    tg = AsyncMock(return_value=True)
+    with patch.object(reconciler, "list_open_option_positions",
+                      return_value={alive: 1}), \
+         patch.object(reconciler, "send_telegram", tg):
+        await reconciler._reconcile_tick()
+        assert tg.await_count == 1
+        # 第二轮漂移签名一模一样：0016 的节流会把它压掉
+        await reconciler._reconcile_tick()
+        assert tg.await_count == 1
+
+        # 第三轮打开自动落账：签名依旧相同，但这一轮真动了 DB，必须出声
+        monkeypatch.setenv("RECONCILE_AUTO_CLOSE", "1")
+        await reconciler._reconcile_tick()
+
+    assert tg.await_count == 2
+    assert positions_db.get(stale)["status"] == "CLOSED"

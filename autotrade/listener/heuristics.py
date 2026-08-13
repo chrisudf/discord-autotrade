@@ -79,6 +79,19 @@ def _looks_like_open_attempt(text: str) -> bool:
     )
 
 
+def _open_attempt_symbol(text: str) -> "str | None":
+    """三件套命中时返回第一个 ticker，否则 None。
+
+    [8/10 DELL] parser 主动 skip 的分支需要一个节流 key（中英孪生 + 编辑重发
+    会把同一条消息送进来三四次）。判定逻辑与 _looks_like_open_attempt 完全同源，
+    只是多回传一个 symbol —— 不新开一套启发式。
+    """
+    if not _looks_like_open_attempt(text):
+        return None
+    m = _OPEN_TICKER_RE.search(_strip_bot_noise(text))
+    return m.group(0).lstrip("$") if m else None
+
+
 # ============================================================
 # 启发：enrich 风格"带仓位比例、无方向"的入场
 # ============================================================

@@ -18,6 +18,7 @@ from autotrade.listener.dedup import (
     _is_duplicate_signal,
     _sized_entry_alerted,
     _sweep_expired,
+    parser_skip_should_alert,
     stale_open_should_alert,
 )
 from autotrade.listener.heuristics import (
@@ -25,6 +26,7 @@ from autotrade.listener.heuristics import (
     _looks_like_addon_attempt,
     _looks_like_open_attempt,
     _looks_like_sized_entry,
+    _open_attempt_symbol,
     _record_recent_exec,
     _twin_of_recent_exec,
 )
@@ -111,8 +113,31 @@ async def process_open(message, raw, cfg, cid, t0, msg_date_et):
         return
 
     if signal.get("skip"):
-        # parser 主动 skip（holding / price_range / no_price），属于正常过滤，不发 TG
-        logger.debug(f"Parser intentional skip: {signal['skip']}")
+        # parser 主动 skip（holding / price_range / no_price），绝大多数是正常过滤。
+        #
+        # [8/10 DELL] 但 pre-filter 也会误伤真信号："$DELL - weekly - $3.50 - $530
+        # calls" 被 price_range 当成喊价区间吞掉，中英两条全跳，**一条 TG 都没发**
+        # （这里原本只有 logger.debug）——人工零补救机会。parser 侧已修那一族写法
+        # （见 signal_parser._INVERTED_PRICE_STRIKE_RE），但那只修好**已知**的一种；
+        # 这里是安全网：下次某个 pre-filter 误伤没见过的写法时，至少有人能在几分钟内
+        # 手工补单。
+        #
+        # 噪音闸门用与 parse-fail triage 同一套三件套启发式（$TICKER + calls/puts
+        # + 喊价），闲聊/持仓状态贴发不出来——8/10 整晚 9 条语义消息里只有 DELL
+        # 那条会命中。中英孪生 + 编辑重发靠 (原因, symbol) 节流收敛成 1 条。
+        reason = signal["skip"]
+        skip_sym = _open_attempt_symbol(raw)
+        if not skip_sym:
+            logger.debug(f"Parser intentional skip: {reason}")
+        elif parser_skip_should_alert(f"{reason}:{skip_sym}"):
+            logger.warning(
+                f"Parser intentional skip on signal-shaped text: {reason} | {skip_sym}"
+            )
+            await _safe_notify(format_error(
+                f"疑似信号被 pre-filter 跳过（{reason}，未自动下单）", raw
+            ))
+        else:
+            logger.info(f"🔁 parser-skip alert dedup: {reason}:{skip_sym}")
         return
 
     # ---- 多信号（防御层，parser 当前不返 list） ----

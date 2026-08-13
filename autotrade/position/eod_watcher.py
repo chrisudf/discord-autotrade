@@ -45,6 +45,7 @@ from autotrade.broker.quote import get_last_price
 from autotrade.parsing.holidays import is_early_close
 from autotrade.position import manager as position_mgr
 from autotrade.position import fill_checker
+from autotrade.position import retry_guard
 from autotrade.position.sell_executor import Outcome, SellPlan, SkipSell, execute_sell
 from autotrade.notify.transport import send_telegram
 # format_close_filled 已随成交 TG 收进 sell_executor（0015），此处只剩错误文案
@@ -160,6 +161,8 @@ def _gc_skip(today_et: date_cls):
     if _skip_until_date != today_et:
         _skip_until.clear()
         _alerted_until.clear()
+        # 熔断同理跨日清空：昨天那张仓的确定性拒单不该挡住今天的强平
+        retry_guard.clear_prefix("eod:")
         _skip_until_date = today_et
 
 
@@ -175,6 +178,15 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float):
       - 10% 卖出 slip（临近收盘 spread 跳水，比 SL 更激进）
     """
     code = pos["option_code"]
+
+    # [8/13] 确定性拒单熔断。EOD 只吃 retry_guard 的**熔断**那一半（backoff=False）：
+    # 瞬时失败的节奏由 0007 调好的 60s `_skip_until` 管，强平窗口只有十来分钟，
+    # 再叠一层指数退避会把仅有的几次机会吃光。naked-short 这类确定性拒单则
+    # 一次就够——broker 没这张仓，重试到收盘也是同一个答案。
+    guard = f"eod:{code}"
+    if retry_guard.is_tripped(guard):
+        logger.debug(f"[eod] {code} 跳过：{retry_guard.blocked(guard)}")
+        return
 
     async def _plan(fresh: dict):
         """锁内决策：先取价（无报价拒绝 entry-fallback 自残卖），再定限价。"""
@@ -214,17 +226,34 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float):
     def _already_closed(fresh: dict):
         logger.debug(f"[eod] {code} already closed while waiting for lock, skip")
 
+    async def _on_failed_attempt(title: str, err: str, qty_desc: str):
+        """拒单/异常共用收尾。60s `_skip_until` 原样保留（0007 调好的节奏），
+        确定性拒单额外熔断：不再等 60s 后重来，直接停手喊人。"""
+        _skip_until[code] = ts_now + 60  # 1 分钟后再试
+        d = retry_guard.on_reject(guard, err, backoff=False)
+
+        hint = ""
+        if d.tripped:
+            logger.error(f"[eod] ⛔ {code} 熔断（确定性拒单，重试无意义）：{err}")
+            hint = (
+                "\n\n⛔ **本合约的 EOD 强平已熔断**（确定性拒单，重试到收盘也是同一个答案）。"
+                "\n若是 naked-short 拒单，说明 broker 侧已经没有这张仓、本地 DB 陈旧："
+                "跑 `python -m autotrade.ops.sync_positions --dry-run` 对账。"
+                "\n否则请立刻在 moomoo 手动平仓 —— 今天不平就要过夜。"
+            )
+        else:
+            logger.error(f"[eod] sell rejected: {err}")
+        await send_telegram(format_error(title, f"{code} {qty_desc}\n{err}{hint}"))
+
     async def _sell_error(e: Exception, plan):
         logger.exception("[eod] place_sell_order failed")
-        _skip_until[code] = ts_now + 60  # 1 分钟后再试
-        await send_telegram(format_error("EOD sell error", f"{code}\n{e}"))
+        await _on_failed_attempt("EOD sell error", f"{type(e).__name__}: {e}",
+                                 f"qty={plan.qty}")
 
     async def _sell_rejected(result: dict, plan):
-        err = result.get("message", "unknown")
-        logger.error(f"[eod] sell rejected: {err}")
-        _skip_until[code] = ts_now + 60
-        await send_telegram(format_error(
-            "EOD sell rejected", f"{code} qty={plan.qty}\n{err}"))
+        await _on_failed_attempt("EOD sell rejected",
+                                 result.get("message", "unknown"),
+                                 f"qty={plan.qty}")
 
     async def _record_failure(e: Exception, result: dict):
         logger.error(f"[eod] on_close_filled failed: {e}")

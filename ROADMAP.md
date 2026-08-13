@@ -5,6 +5,30 @@
 
 ## P0 — 上线前必须
 
+### 0.0 实盘前回滚:模拟盘期间人为放大的额度(2026-08-11 起)
+
+模拟盘积累数据阶段,为了让 TP 阶梯在数学上成立(qty=1 时"卖剩余 50%"要么全平要么不卖,
+见 `review_2026-08-11.md` 第 ③ 项与 XOM 的 ~$185/张机会成本),把下单张数与配套额度整体
+翻倍。**两个配置文件都在 .gitignore 里,这份清单是唯一入库的记录。**
+
+切 `MOOMOO_TRD_ENV=REAL` 之前逐项减半:
+
+| 文件 | 键 | 模拟盘现值 | 实盘改回 |
+|---|---|---|---|
+| `config/channels.json` | `default_qty`(两个频道) | 2 | 1 |
+| `config/channels.json` | `max_price`(两个频道) | 2000.0 | 1000.0 |
+| `config/.env` | `MAX_PRICE_PER_CONTRACT` | 10.0 | 5.0 |
+| `config/.env` | `MAX_DAILY_COST` | 4000 | 2000 |
+| `config/.env` | `DEFAULT_QTY`(仅兜底) | 2 | 1 |
+
+`MAX_DAILY_ORDERS=10` 刻意**没**翻倍:翻倍的是每单张数,不是每日单数,当晚实际只下 1 单。
+`MAX_COST_PER_ORDER` 同样不动(SIMULATE 下写大方便测试,REAL 另有 `risk.py` 的 $1000 硬顶)。
+
+⚠️ 顺带发现:Layer 1 的价格上限实际由 `channels.json` 的 `max_price` 覆盖
+(`risk.py:250`),`MAX_PRICE_PER_CONTRACT` 对这两个频道**从来没生效过**。
+`max_price=2000` 等于没有单张价格上限。要真正启用 Layer 1,应把 `max_price`
+降到 10.0 量级——这是独立决策,没有随本次翻倍一起做。
+
 ### 0. 切换检查单(cutover)
 - [ ] 生产 `config/.env` / `channels.json` 拷入新仓库并跑 preflight 全绿;
 - [ ] `data/trades.db` 由老仓库拷贝(schema 未变,直接复用);盘后进行,拷完跑

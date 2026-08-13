@@ -63,6 +63,19 @@ def _clear_runner_preserve_throttle():
 
 
 @pytest.fixture(autouse=True)
+def _clear_sell_retry_guard():
+    # 8/13 新增的拒单熔断 + 日志收敛也是模块级 dict：一个用例里触发过熔断，
+    # 后跑的用例同名合约会被静默挡在 blocked() 门外（顺序相关的假失败）。
+    from autotrade.position import retry_guard
+    from autotrade.utils import logdedup
+    retry_guard.reset_state()
+    logdedup.reset_state()
+    yield
+    retry_guard.reset_state()
+    logdedup.reset_state()
+
+
+@pytest.fixture(autouse=True)
 def _clear_envcfg_warned():
     # envcfg 的"同一坏值只告警一次"去重集同样是模块级——断言 warning 的测试
     # 会被先跑的测试压掉（同 _clear_runner_preserve_throttle 的坑）
