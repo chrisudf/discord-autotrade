@@ -32,6 +32,7 @@ fi
 
 LOG="$OUT_DIR/autotrade_${STAMP}_overnight.txt"
 DIGEST="$OUT_DIR/digest_${STAMP}.txt"
+LOGDIGEST="$OUT_DIR/logdigest_${STAMP}.txt"
 REPORT="$OUT_DIR/review_${STAMP}.md"
 
 if [[ ! -f "$LOG" || ! -f "$DIGEST" ]]; then
@@ -40,15 +41,24 @@ if [[ ! -f "$LOG" || ! -f "$DIGEST" ]]; then
   exit 0
 fi
 
+# 日志摘要正常由 morning_collect.sh 的 3b 步生成；手动补跑旧日期时它不存在，
+# 这里现补一份（纯读原始日志，幂等）。
+if [[ ! -f "$LOGDIGEST" ]]; then
+  log_ops "logdigest 缺失，现场生成"
+  zsh "$PROJ/ops/build_logdigest.sh" "$LOG" "$LOGDIGEST" > /dev/null 2>&1 \
+    || log_ops "⚠️ logdigest 生成失败，复盘将回退到读原始日志"
+fi
+
 SID=$(uuidgen | tr 'A-Z' 'a-z')
 echo "$SID" > "$OUT_DIR/.last_opus_session_id"
 
 read -r -d '' PROMPT <<EOF || true
 复盘 discord-autotrade 昨晚（$STAMP 收盘）的运行情况。
 
-素材：
-- 整晚终端日志：$LOG
+素材（**先读日志摘要和数据库摘要，原始日志只在需要细节时按需回查**）：
+- 日志摘要（统计 + ERROR 直方图 + 折叠掉重复刷屏之后的整晚日志全文）：$LOGDIGEST
 - 数据库摘要（开仓/事件/下单/收到的全部原始消息/未平持仓，本机本地时区）：$DIGEST
+- 整晚终端日志原文（可能上千行，多数情况下不需要通读）：$LOG
 
 评判标准和输出格式以 $PROJ/ops/review_prompt.md 为准，先把它读完再动手，严格照办。
 它说"输出位置由调用方指定"——**本次要求写成 markdown 文件到 $REPORT**，不要只在
@@ -61,20 +71,64 @@ EOF
 log_ops "start (opus-5/xhigh, session $SID)"
 cd "$PROJ"
 
-# --model / --settings 是硬控制，不受 app 偏好影响。
-# 工具只给读 + 写报告；不给 Bash —— 摘要里已有当晚全部数据库记录，用不到 sqlite3。
-"$CLAUDE_BIN" -p "$PROMPT" \
-  --model claude-opus-5 \
-  --settings '{"effortLevel":"xhigh"}' \
-  --session-id "$SID" \
-  --add-dir "$OUT_DIR" \
-  --permission-mode acceptEdits \
-  --allowedTools "Read" "Grep" "Glob" "Write" \
-  > "$OUT_DIR/.opus_stdout_${STAMP}.log" 2>&1
-RC=$?
-log_ops "exit=$RC -> $REPORT"
+STDOUT_LOG="$OUT_DIR/.opus_stdout_${STAMP}.log"
 
-if [[ -f "$REPORT" ]]; then
+# 报告算不算"出来了"：文件在 + 有最后一节（review_prompt.md 规定 §5 是末节）。
+# 只判 -f 不够 —— 连接断在写文件中途会留下半份报告，那比没有更糟：看起来
+# 有产出，实际缺的正是"今天要动的事"。
+report_ok() {
+  [[ -f "$REPORT" ]] && grep -qE '^##[[:space:]]*5\.' "$REPORT"
+}
+
+run_review() {
+  # $1 = "" 表示首轮（新 session）；否则续跑同一 session
+  local extra_prompt="$1"
+  if [[ -z "$extra_prompt" ]]; then
+    "$CLAUDE_BIN" -p "$PROMPT" \
+      --model claude-opus-5 \
+      --settings '{"effortLevel":"xhigh"}' \
+      --session-id "$SID" \
+      --add-dir "$OUT_DIR" \
+      --permission-mode acceptEdits \
+      --allowedTools "Read" "Grep" "Glob" "Write" \
+      >> "$STDOUT_LOG" 2>&1
+  else
+    "$CLAUDE_BIN" -p "$extra_prompt" \
+      --model claude-opus-5 \
+      --settings '{"effortLevel":"xhigh"}' \
+      --resume "$SID" \
+      --add-dir "$OUT_DIR" \
+      --permission-mode acceptEdits \
+      --allowedTools "Read" "Grep" "Glob" "Write" \
+      >> "$STDOUT_LOG" 2>&1
+  fi
+}
+
+: > "$STDOUT_LOG"
+run_review ""
+RC=$?
+log_ops "attempt 1 exit=$RC, report_ok=$(report_ok && echo yes || echo no)"
+
+# ---- 断点续跑 ----
+# [8/13 + 8/14] 连续两晚同一个死法：跑满 44-61 分钟、证据都核完了，最后
+# `API Error: Connection closed mid-response` 断在写文件之前，exit=1，
+# 一个字没留 —— 两晚各烧掉 38 万 / 75 万 token 换来零产出。
+# 单次长跑没有任何中断保护，而 --resume 能带着已有上下文接着跑（实测
+# `--resume <sid> -p` 保留全部对话），续一轮只要再吃一遍缓存读，很便宜。
+# 最多重试 2 次：还不行就是真出事了，别把额度耗在死循环上。
+ATTEMPT=1
+while ! report_ok && (( ATTEMPT < 3 )); do
+  ATTEMPT=$(( ATTEMPT + 1 ))
+  log_ops "报告缺失/不完整，第 $ATTEMPT 次尝试（--resume $SID）"
+  sleep 10
+  run_review "上一轮在写报告前中断了（连接断开），证据分析已经做完，不用重来。\
+直接把复盘按 ops/review_prompt.md 的结构写进 $REPORT（§1 到 §5 一节都不能少），\
+然后在 stdout 上重复一遍 TL;DR。如果文件已经写了一部分，补齐缺的小节即可。"
+  RC=$?
+  log_ops "attempt $ATTEMPT exit=$RC, report_ok=$(report_ok && echo yes || echo no)"
+done
+
+if report_ok; then
   open "$REPORT"
   echo "Opus 5 复盘已生成并打开：$REPORT"
 else

@@ -81,7 +81,13 @@ DIGEST="$OUT_DIR/digest_${STAMP}.txt"
 
 # list 模式：box/markdown 模式会按终端宽度折行，长消息会被切成续行，喂给模型会串行。
 # note/content 里的换行压平成 " / "，竖线换成 "/"，保证一行一条记录。
-sqlite3 "$PROJ/data/trades.db" <<SQL > "$DIGEST" 2>&1
+#
+# stderr **不再** 混进 $DIGEST（老写法是 `> "$DIGEST" 2>&1`）：写错一个列名不会
+# 让脚本失败，只会把 `Error: no such column: xxx` 悄悄写进摘要，那一节就变成一行
+# 错误字符串交给复盘，而复盘只会觉得"当晚没有这类记录"。改成 stderr 单独收，
+# 非空就大声报进 ops.log 并在摘要顶部留一条醒目的提示。
+DIGEST_ERR=$(mktemp)
+sqlite3 "$PROJ/data/trades.db" <<SQL > "$DIGEST" 2>"$DIGEST_ERR"
 .mode list
 .separator ' | '
 .headers on
@@ -131,12 +137,36 @@ WHERE status = 'OPEN'
 ORDER BY opened_at;
 SQL
 
+if [[ -s "$DIGEST_ERR" ]]; then
+  log_ops "⚠️ digest SQL 报错: $(tr '\n' ' ' < "$DIGEST_ERR")"
+  # 顶部插一条，让复盘一眼看见"这份摘要不完整"，而不是把缺失当成"当晚没有"
+  { echo "⚠️⚠️⚠️ 本摘要生成时 SQL 有报错，下面某些小节可能是空的或不完整："
+    sed 's/^/    /' "$DIGEST_ERR"
+    echo
+    cat "$DIGEST"
+  } > "$DIGEST.tmp" && mv "$DIGEST.tmp" "$DIGEST"
+fi
+rm -f "$DIGEST_ERR"
 log_ops "digest built -> $DIGEST"
+
+# ---------- 3b. 日志摘要（折叠重复行）----------
+# [8/13 + 8/14] 两晚连续被同一条拒单循环刷屏（1918 / 812 组）。日志摘要要解决
+# 两件事：
+#   1. **DB 摘要看不见卖出侧。** orders 表只记买单 —— 8/13 那晚它 success=0 是
+#      0 行，1918 次拒单和 EOD 卖单在整个 trades.db 里查无此事。只读 $DIGEST
+#      会得出"3 单全成、一夜平静"的结论，风暴只存在于终端日志里。
+#   2. opus_review.sh 的工具集是 Read/Grep/Glob/Write，**没有 Bash** —— 复盘
+#      自己压不了日志。那就在这里先压好。
+# 折叠只动"同一条记录重复 > 20 次"的部分，安静的夜晚输出与输入逐字节相同。
+LOGDIGEST="$OUT_DIR/logdigest_${STAMP}.txt"
+zsh "$PROJ/ops/build_logdigest.sh" "$DEST" "$LOGDIGEST" > /dev/null 2>&1
+log_ops "logdigest built -> $LOGDIGEST ($(wc -l < "$LOGDIGEST" | tr -d ' ') lines, 原始 $(wc -l < "$DEST" | tr -d ' '))"
 
 echo
 echo "取证完成："
 echo "  整晚日志: $DEST"
 echo "  数据摘要: $DIGEST"
+echo "  日志摘要: $LOGDIGEST"
 
 # ---------- 4. Opus 5 复盘 ----------
 # 唯一一条复盘路径。曾经并行的 Claude 定时任务已停用，原因见 opus_review.sh 顶部注释。
