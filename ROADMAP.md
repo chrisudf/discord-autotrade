@@ -158,9 +158,12 @@ TP 先标 tier 再记账、EOD 锁内取价 + 无价拒卖 + backoff。
   日志摘要把墙上时间从 61 分钟压到 11 分钟,但 token 没降(660k,仍在历史
   410k-680k 区间)。要压成本得动 effort 或报告篇幅,不是动素材。值得试一次
   `high` 做 A/B。
-- **listener 没有部署自检。** 8/14 那晚跑的是 `d6fe50c` 之前的旧进程,两个
-  修复一个都没生效,而**日志里看不出来**。启动时打一行 `git rev-parse --short HEAD`
-  + 工作区是否 dirty,复盘就能一眼判断"这晚跑的是哪个构建"。零风险,最高性价比。
+- ~~**listener 没有部署自检。**~~ **已做**(2026-08-14):`app/preflight.py::build_identity`
+  在启动横幅第一行打 `构建 = <sha> @<branch> (<commit 时间>) 工作区干净/有未提交改动`。
+  起因是 8/14 那晚跑的是 `d6fe50c` 之前的旧进程、两个修复一个都没生效,而日志里
+  完全看不出来——当时是靠比对 commit 时间戳和 session start 才推断出来的。
+  git 不可用时返回占位串、绝不抛异常(它在启动路径上,回归见
+  `test_overnight_0814.py::test_build_identity_*`)。
 
 ## P2 — 值得做,不急
 

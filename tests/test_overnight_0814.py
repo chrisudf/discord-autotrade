@@ -32,8 +32,11 @@
    SQL 口径的回归靠 `WHERE status IN ('OPEN','PARTIAL')` 与 position_mgr
    选仓口径对齐（那边一直是两个状态都算）。
 """
+from unittest.mock import patch
+
 import pytest
 
+from autotrade.app import preflight
 from autotrade.parsing.close_parser import parse_close
 from autotrade.parsing.signal_parser import parse_signal
 
@@ -110,3 +113,52 @@ def test_buy_and_hold_phrasing_still_opens():
     sig = parse_signal("$UBER 8/21 $78 看涨期权 $0.56，打算持有到 9 月")
     assert sig is not None
     assert sig["symbol"] == "UBER"
+
+
+# ============================================================
+# 3. 部署自检：启动日志要说清"这一晚跑的是哪个构建"
+# ============================================================
+# 8/14 那晚 listener 23:15 起来，熔断和自动落账 00:53 才提交 —— 跑的是旧进程，
+# 两个修复一个都没生效，而日志里完全看不出来（复盘是靠比对 commit 时间戳
+# 和 session start 才推断出来的）。现在 preflight 会打一行构建标识。
+#
+# 这里钉的是**安全属性**而不是格式：它在启动路径上，任何环境问题都不许让它
+# 把 listener 拽崩 —— 一行诊断日志的价值远低于"半夜起不来"的代价。
+
+
+def test_build_identity_reports_sha_and_dirty_state():
+    with patch.object(preflight, "_git", side_effect=[
+        "abc1234",                    # rev-parse --short HEAD
+        "2026-08-14 10:51",           # log -1 --format=%cd
+        " M some/file.py",            # status --porcelain（非空 = dirty）
+        "main",                       # rev-parse --abbrev-ref HEAD
+    ]):
+        out = preflight.build_identity()
+    assert "abc1234" in out
+    assert "@main" in out
+    assert "2026-08-14 10:51" in out
+    assert "未提交改动" in out
+
+
+def test_build_identity_reports_clean_tree():
+    with patch.object(preflight, "_git", side_effect=[
+        "abc1234", "2026-08-14 10:51", "", "main",
+    ]):
+        out = preflight.build_identity()
+    assert "干净" in out
+    assert "未提交改动" not in out
+
+
+def test_build_identity_never_raises_without_git():
+    """git 不可用 / 不是仓库 → 返回占位串，绝不抛异常（它在启动路径上）。"""
+    with patch.object(preflight, "_git", return_value=""):
+        assert preflight.build_identity() == "unknown（非 git 仓库或 git 不可用）"
+
+
+def test_git_helper_swallows_subprocess_failures():
+    with patch("autotrade.app.preflight.subprocess.run",
+               side_effect=OSError("git not found")):
+        assert preflight._git("rev-parse", "HEAD") == ""
+    with patch("autotrade.app.preflight.subprocess.run",
+               side_effect=Exception("timeout")):
+        assert preflight._git("status") == ""
