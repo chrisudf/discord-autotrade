@@ -129,11 +129,16 @@ ORDER BY received_at;
 
 .print ''
 .print '## 停机时仍未平的持仓（含更早开的）'
-SELECT option_code, channel_name, qty_remaining AS qty_left,
+-- [8/14] status 必须含 PARTIAL：部分平仓过的仓位 status 会从 OPEN 变成
+-- PARTIAL，老写法 `WHERE status = 'OPEN'` 把它们整行漏掉 —— 8/13 夜真实过夜
+-- 是 6 个合约 10 张，摘要只显示了 4 个 8 张，SPCX 120P 在两张持仓表里完全隐身。
+-- 复盘据此答"持仓状态"这一节，等于系统性少报被 trim 过的仓（恰恰是最该盯的那些）。
+-- 判据与 position_mgr / watcher 选仓口径对齐（那边一直是 IN ('OPEN','PARTIAL')）。
+SELECT option_code, channel_name, status, qty_remaining AS qty_left,
        avg_entry_price AS entry, tp_hits, eod_force_close, apply_sl,
        expiry, datetime(opened_at, 'localtime') AS opened_local
 FROM positions
-WHERE status = 'OPEN'
+WHERE status IN ('OPEN', 'PARTIAL')
 ORDER BY opened_at;
 SQL
 

@@ -418,6 +418,26 @@ ZH_RECAP_MARKERS = [
     # 没有语料证据的裸词正是本表下方 "不加裸缩减" 那条注释要避免的。
     "了一些",  # "卖出了一些" 多为复盘；与 "了一笔" / "了一份" 区分
     "每周回顾", "观察列表", "观察名单",  # 周报/watchlist（与 EN 侧对齐）
+
+    # [8/14 SPCX] 昨晚离误平最近的一次。原文：
+    #   ZH  "临收盘SPCX跌得漂亮，早间利润减仓后仍持有看跌期权✅" → **判成 CLOSE 33%**
+    #   EN  "nice drop on SPCX into end of day, still in the puts after the
+    #        profit trims this morning ✅"                        → 正确 no signal
+    # 三个因素叠出来的：`减仓` 在 ZH_ACTION_VERBS；`早间` 不在本表（有 今早 /
+    # 今天早些 / 早些时候，唯独缺它）；整句用逗号不用句号，_zh_action_sentences
+    # 切不开，SPCX 是拉丁 ticker 所以 symbol 照样抽得到。
+    # **只因为 SPCX 当时剩 1 张、撞上 runner-preserve 才没卖出去** —— 剩 2 张
+    # 这条明说"仍持有"的复盘就会直接减掉 1 张。
+    # `早间` 补进过去时间锚那一组（与 今早 同族）。
+    "早间",
+    # "仍持有 / 仍在持有" 是比时间锚更硬的证据：它明说仓位还在，不可能是平仓指令。
+    # EN 侧对应的是 signal_parser.SKIP_KEYWORDS 里的 "still holding"（那边是
+    # 开仓路径的守卫），close 路径的 ZH 侧一直没有等价物。
+    # 同批实测的良性样本：03:19:38 "$ASTS 仍在持有" 当时落到 no signal，
+    # 属于侥幸而不是被拦住。
+    # 仍收带前缀的形态、不加裸"持有"——理由同 signal_parser.SKIP_KEYWORDS 的
+    # 注释：裸"持有"会误伤"买入 X 打算持有到 9 月"这类真信号。
+    "仍持有", "仍在持有", "还持有", "还在持有",
 ]
 
 # bulk action

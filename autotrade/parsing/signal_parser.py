@@ -135,6 +135,11 @@ SKIP_KEYWORDS = [
     # 触发 looks-like-signal 误报，EN 孪生 "Only holding my" 正确 skip）。
     # 只收带前缀的形态——裸"持有"太宽，会误伤"买入 X 打算持有到 9 月"这类真开仓
     "只持有", "仅持有", "继续持有", "暂时持有",
+    # [8/14] "$ASTS 仍在持有"（03:19:38）当时落到 no signal 是侥幸不是拦截；
+    # 同一晚的 close 路径上，同族的"仍持有"差点把 SPCX 误平（见
+    # close_parser.ZH_RECAP_MARKERS 的 8/14 注释）。两边一起补，别只修一侧 ——
+    # "拦住一边另一边照样平掉" 是 8/5 已经学过一次的形状。
+    "仍持有", "仍在持有", "还持有", "还在持有",
     # 第一人称主语 + holding
     "i'm holding", "im holding", "i am holding",
     # 状语 + holding
