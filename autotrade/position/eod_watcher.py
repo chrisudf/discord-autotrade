@@ -166,7 +166,7 @@ def _gc_skip(today_et: date_cls):
         _skip_until_date = today_et
 
 
-async def _force_close(pos: dict, sell_slip: float, ts_now: float):
+async def _force_close(pos: dict, sell_slip: float, ts_now: float, today_iso: str = ""):
     """单仓位强平。
 
     [0015] 执行骨架合并进 sell_executor.execute_sell；EOD 专属差异保留在钩子：
@@ -196,16 +196,30 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float):
             # 没 quote 时不挂 entry-based 卖单——0DTE ITM 会被自残卖在远低于真实市价。
             # [7/25 事故] 不再进重试 backoff(见 _alerted_until 注释):下个 tick
             # 继续试,迟到的报价还能接住;只有 TG 按 30min 节流。
-            if _alerted_until.get(code, 0) <= ts_now:
-                _alerted_until[code] = ts_now + 1800
+            # 到期日的 no-quote 是**今天不处理就归零**，与普通 no-quote 不是
+            # 一个量级：普通仓位明天还有机会，到期仓位的强平窗口一天只有一次。
+            # [8/22 实锤 -$540] AMD 520C 到期日整个窗口拿不到报价，
+            # `refusing entry-fallback sell` 一路拒到收摊，次日 expiry_sweep
+            # 记 `EXPIRE ... 1 contract(s) unclosed @ entry 5.40`。
+            # 当晚同批的 ASTS 重试 3.5 分钟后拿到 0.01 卖掉了，AMD 一直没有。
+            # 拒绝 entry-fallback 本身是对的（7/25 事故），缺的是升级路径：
+            # 到期日**不节流**（每 tick 都喊）+ 文案写清后果。
+            is_expiry_today = fresh.get("expiry") == today_iso
+            if is_expiry_today or _alerted_until.get(code, 0) <= ts_now:
+                if not is_expiry_today:
+                    _alerted_until[code] = ts_now + 1800
                 logger.warning(
                     f"[eod] no quote for {code}, refusing entry-fallback sell, "
-                    f"manual close required (每 tick 重试中,TG 30min 一次)"
+                    f"manual close required ("
+                    + ("**今天到期**,每 tick 重试并告警" if is_expiry_today
+                       else "每 tick 重试中,TG 30min 一次") + ")"
                 )
                 ok = await send_telegram(format_error(
-                    "EOD 强平跳过：无报价",
+                    "⚠️ 到期日强平跳过：无报价" if is_expiry_today else "EOD 强平跳过：无报价",
                     f"{code} qty={qty} entry=${fresh['avg_entry_price']:.2f}\n"
-                    f"原因：OPRA 不可用，避免 entry × 0.9 自残卖\n"
+                    + ("**今天到期 —— 不处理就是归零**（8/22 AMD 520C 这么丢了 $540）\n"
+                       if is_expiry_today else "")
+                    + f"原因：OPRA 不可用，避免 entry × 0.9 自残卖\n"
                     f"收盘前每 30s 继续重试；若一直无报价请在 moomoo 手动平仓"
                 ))
                 # 裸 send_telegram 成功只记 debug,出过"告警到底发没发"说不清的账
@@ -343,7 +357,7 @@ async def _eod_tick(now_et: datetime):
         f"closing {len(positions)} position(s)"
     )
     for pos in positions:
-        await _force_close(pos, cfg["sell_slip"], ts_now)
+        await _force_close(pos, cfg["sell_slip"], ts_now, today_iso)
 
 
 async def run_eod_watcher():

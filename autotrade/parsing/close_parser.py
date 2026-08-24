@@ -1047,6 +1047,22 @@ def _zh_action_sentences(text: str) -> str:
     return " ".join(hit) if hit else text
 
 
+class _AnySymbols(frozenset):
+    """诊断专用的"白名单全通过"哨兵。
+
+    只给 [zh_unrecognized] 的日志文案用：区分"整段没抽到 ticker"和
+    "抽到了但不在当前持仓"。**不参与任何下单路径** —— 传它进来意味着
+    跳过白名单消歧，那正是 open_symbols 存在的理由（"NOW" 既是副词
+    也是 ServiceNow，见模块顶部）。
+    """
+
+    def __contains__(self, item):  # noqa: D105
+        return True
+
+
+_ANY_SYMBOLS = _AnySymbols()
+
+
 def _extract_zh_symbols(text: str, open_symbols: set[str]) -> list[str]:
     """中文版 symbol 抽取：$SYMBOL → 裸 ticker 白名单。
 
@@ -1171,10 +1187,22 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
 
     symbols = _extract_zh_symbols(text, open_symbols)
     if not symbols:
-        logger.warning(
-            f"[close_parser] [zh_unrecognized] ZH close intent but symbol "
-            f"not extractable (likely Chinese company name): {text[:120]}"
-        )
+        # 区分两种"抽不到" —— 文案写错会把下一次复盘引向错误的方向。
+        # [8/19 实测] 当晚 4 次 [zh_unrecognized] 里有 3 次原文的 ticker 是
+        # 明晃晃的拉丁字母（SPCX / META / 仅持仓SPY），真实原因是**白名单过滤后
+        # 为空**（SPCX 5 秒前刚被全平、我们没有 META 持仓），行为完全正确，
+        # 却被记成"中文公司名抓不到"。
+        seen_any = _extract_zh_symbols(text, _ANY_SYMBOLS)
+        if seen_any:
+            logger.info(
+                f"[close_parser] ZH close intent, symbols={seen_any} 不在当前持仓 "
+                f"({sorted(open_symbols)}) —— 无仓可平，跳过: {text[:80]}"
+            )
+        else:
+            logger.warning(
+                f"[close_parser] [zh_unrecognized] ZH close intent but symbol "
+                f"not extractable (likely Chinese company name): {text[:120]}"
+            )
         return None
     pct = _extract_zh_pct(text)
     hint_strike, hint_side = _extract_strike_hint(scope_zh, symbols, full_text=text)

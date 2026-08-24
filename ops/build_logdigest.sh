@@ -31,7 +31,18 @@ HERE="${0:A:h}"
   echo "行数          : $(wc -l < "$SRC" | tr -d ' ')"
   echo "ERROR 行数    : $(grep -c '| ERROR |' "$SRC" || true)"
   echo "WARNING 行数  : $(grep -c '| WARNING |' "$SRC" || true)"
-  echo "Discord 掉线  : $(grep -c 'on_disconnect fired' "$SRC" || true) 次（恢复 $(grep -c 'session resumed' "$SRC" || true) 次）"
+  # 恢复有两条路径，只数 RESUMED 会少算：
+  #   a. `session resumed`   —— gateway RESUME（秒级，session id 不变）
+  #   b. `logged back in`    —— 完整重登录（gateway session 已失效，on_ready
+  #                             会走 _backfill_missed 补回窗口内的消息）
+  # [8/20 实测] 那晚 6 次掉线里有一次是 CloudFlare 重启导致的完整重登录，
+  # 摘要报成"恢复 4 次"，看上去像有两次没恢复 —— 实际是 5 次恢复 + 1 次
+  # 我们自己 SIGTERM 关的（code=1000）。复盘每次都要被这行误导一遍。
+  _dc=$(grep -c 'on_disconnect fired' "$SRC" || true)
+  _resumed=$(grep -c 'session resumed' "$SRC" || true)
+  _relogin=$(grep -c 'logged back in' "$SRC" || true)
+  _shutdown=$(grep -c 'on_disconnect fired.*code=1000' "$SRC" || true)
+  echo "Discord 掉线  : ${_dc} 次（RESUME ${_resumed} + 重登录 ${_relogin}，主动关闭 ${_shutdown}）"
   echo "Parse failed  : $(grep -c 'Parse failed' "$SRC" || true)"
   echo "收到消息      : $(grep -c '📩' "$SRC" || true)"
   echo

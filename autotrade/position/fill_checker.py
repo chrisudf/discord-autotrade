@@ -93,6 +93,16 @@ async def confirm_buy_fill(order_id: str, option_code: str, qty: int, limit_pric
         res = await _poll_until_terminal(order_id)
         if res["outcome"] == "filled":
             dealt = res.get("filled_avg_price") or 0.0
+            # [ROADMAP P1 #14 (a)] filled 分支无论走哪条都留一行。
+            # 原来只在 dealt != limit 时才打日志，成交价正好等于限价就静默 return
+            # —— "什么都没有" 和 "压根没跑" 在日志上无法区分（8/13 MU 那单全日志
+            # 零 [fill] 行，同晚 ASTS/SPCX 都在 15s 内出了 FILL_ADJUST）。
+            # 8/20 CRWV 88P 也踩过同一处：复盘要靠"四笔有 FILL_ADJUST、一笔没有"
+            # 才能反推它是正常成交而不是任务没跑。
+            logger.info(
+                f"[fill] buy {option_code} filled dealt_avg={dealt:.2f} "
+                f"(limit {limit_price:.2f}) order={order_id}"
+            )
             if dealt > 0 and abs(dealt - limit_price) > 1e-9:
                 lo = limit_price * _DEALT_MIN_RATIO
                 hi = limit_price * _DEALT_MAX_RATIO

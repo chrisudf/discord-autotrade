@@ -38,10 +38,14 @@
 6. **`$MRVL $252.50 SCALP***** calls $1.69 weekly` 因五个星号整条消失**（8/21）。
    `p_weekly` 的填充段只收字母数字；实测一个星号就够。当晚 KC 报 two baggers。
 """
+from datetime import date as _date, timedelta as _timedelta
+
 import pytest
 
+from autotrade.listener.heuristics import _looks_like_close_attempt
 from autotrade.parsing.close_parser import parse_close
 from autotrade.parsing.signal_parser import detect_action, parse_signal
+from autotrade.policy.positions import categorize
 
 OPEN = {"AMZN", "SPY", "MSFT", "UBER", "PLTR", "TSLA", "LLY", "MRVL"}
 
@@ -214,3 +218,75 @@ def test_strike_side_gap_tolerates_emphasis(filler):
 def test_asterisk_fix_does_not_widen_recall(text):
     sig = parse_signal(text)
     assert sig is None or "skip" in sig
+
+
+# ============================================================
+# 7. weekly 的 DTE 上界 —— 本周最贵的一条（$976）
+# ============================================================
+class TestWeeklyDteBoundary:
+    """ASTS 80C / AMD 520C 都是 8/13 开、8/21 到期，DTE=8 → 旧规则归 swing、
+    apply_sl=False，八天里没有任何机制碰过它们，一路走到归零。
+    """
+
+    OPEN = _date(2026, 8, 13)
+
+    @pytest.mark.parametrize("dte,expect_sl", [
+        (1, True),
+        (7, True),
+        (8, True),    # ← 8/22 的 $976 就死在这一天上
+        (10, True),
+        (11, False),  # 真波段，仍然按 swing 处理
+        (35, False),
+    ])
+    def test_near_expiry_keeps_stop_loss(self, dte, expect_sl):
+        category, apply_sl, _ = categorize(
+            self.OPEN + _timedelta(days=dte), self.OPEN, [],
+        )
+        assert apply_sl is expect_sl
+        assert category == ("weekly" if expect_sl else "swing")
+
+    def test_asts_and_amd_would_have_had_a_stop(self):
+        """8/13 开、8/21 到期的两个真实仓位。"""
+        category, apply_sl, _ = categorize(_date(2026, 8, 21), self.OPEN, [])
+        assert (category, apply_sl) == ("weekly", True)
+
+    @pytest.mark.parametrize("tags,expected", [
+        (["lotto"], ("lotto", False)),      # 彩票放飞不受影响
+        (["day_trade"], ("weekly", True)),
+    ])
+    def test_tag_semantics_unchanged(self, tags, expected):
+        category, apply_sl, _ = categorize(_date(2026, 8, 21), self.OPEN, tags)
+        assert (category, apply_sl) == expected
+
+    def test_zero_dte_unchanged(self):
+        assert categorize(self.OPEN, self.OPEN, []) == ("0dte", False, True)
+
+
+# ============================================================
+# 8. 无 ticker 的 CLOSE 尝试 —— 只有一个 day_trade 活仓时也要提醒
+# ============================================================
+@pytest.mark.parametrize("text", [
+    "@everyone\nKC Trades Bot:small safety trim @ 2.60 to de-risk after the 2.20 add",
+    "@everyone\nKC Trades Bot:small trim @ 2.60",
+    "@everyone\nKC Trades Bot:BANG! Out half 2.80 💰",
+    "@everyone\nKC Trades Bot:BANG! Out majority @ 3.05 🚀",
+])
+def test_no_ticker_close_alerts_when_single_day_trade(text):
+    """8/19-8/20 这四条全是对当时唯一那个 day_trade（SPY）说的，全部静默丢弃。"""
+    assert _looks_like_close_attempt(text, lone_day_trade=True) is True
+    # 有多个 day_trade（有歧义）时维持原行为：不提醒
+    assert _looks_like_close_attempt(text, lone_day_trade=False) is False
+
+
+@pytest.mark.parametrize("text", [
+    "just hanging out now, market is boring",   # 无价格 hint
+    "great work today 💙",
+])
+def test_no_price_hint_stays_silent(text):
+    """放宽的是 ticker 那一侧，价格 hint 仍然是硬条件。"""
+    assert _looks_like_close_attempt(text, lone_day_trade=True) is False
+
+
+def test_ticker_path_unchanged():
+    """原有判据（有 ticker + 价格）不依赖 day_trade 数量。"""
+    assert _looks_like_close_attempt("trimmed MSFT @ 2.45", lone_day_trade=False) is True

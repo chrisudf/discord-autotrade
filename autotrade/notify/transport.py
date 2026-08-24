@@ -110,7 +110,12 @@ async def send_telegram(text: str, parse_mode: str = "MarkdownV2") -> bool:
                 return False
 
             if resp.status_code == 200:
-                logger.debug(f"[Telegram] 发送成功: {text[:50]}")
+                # [ROADMAP P1 #15] 成功原本只记 DEBUG，而错误路径上有一批**裸调**
+                # send_telegram 的地方（不走 notify() 包装、不打 `[notify] TG sent`）
+                # —— 日志里于是完全查不到"发没发"。8/14 的复盘据此得出
+                # "操作者手机上零告警"的**反向结论**（实际很可能收到了近千条）。
+                # 提到 INFO：多一行日志的成本，远低于"复盘把告警数量看反"。
+                logger.info(f"[Telegram] 发送成功: {text[:50]}")
                 return True
 
             if resp.status_code == 429 and attempt < MAX_RETRY_ON_429:
@@ -133,7 +138,7 @@ async def send_telegram(text: str, parse_mode: str = "MarkdownV2") -> bool:
                     logger.error(f"[Telegram] fallback 请求异常: {type(e).__name__}: {e}")
                     return False
                 if resp2.status_code == 200:
-                    logger.debug("[Telegram] 纯文本 fallback 成功")
+                    logger.info("[Telegram] 纯文本 fallback 成功")
                     return True
                 logger.error(f"[Telegram] fallback 也失败 status={resp2.status_code} body={resp2.text[:200]}")
                 return False
