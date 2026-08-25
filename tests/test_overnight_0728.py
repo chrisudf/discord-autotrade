@@ -115,7 +115,7 @@ async def test_churn_counts_wall_clock_window(monkeypatch):
         conn, "_time",
         SimpleNamespace(monotonic=lambda: mono[0], time=lambda: wall[0]),
     )
-    monkeypatch.setattr(conn, "send_telegram", AsyncMock())
+    monkeypatch.setattr(conn, "_safe_notify", AsyncMock())
     monkeypatch.setattr(conn, "_churn_disconnects", [])
     monkeypatch.setattr(conn, "_churn_notified_at", 0.0)
     monkeypatch.setattr(conn, "_recent_disconnects", [])
@@ -138,7 +138,7 @@ async def test_churn_counts_wall_clock_window(monkeypatch):
 
 async def test_alive_gap_pulls_backfill_anchor_and_alerts_once(monkeypatch):
     tg = AsyncMock()
-    monkeypatch.setattr(conn, "send_telegram", tg)
+    monkeypatch.setattr(conn, "_safe_notify", tg)
     monkeypatch.setattr(conn, "_last_disconnect_wall", None)
     monkeypatch.setattr(conn, "_sleep_alerted_wall", None)
     monkeypatch.setattr(conn, "client", None)  # 未就绪 → 不立即回补,只回拨锚
@@ -157,7 +157,7 @@ async def test_alive_gap_pulls_backfill_anchor_and_alerts_once(monkeypatch):
 
 
 async def test_alive_gap_backfills_immediately_when_client_ready(monkeypatch):
-    monkeypatch.setattr(conn, "send_telegram", AsyncMock())
+    monkeypatch.setattr(conn, "_safe_notify", AsyncMock())
     monkeypatch.setattr(conn, "_sleep_alerted_wall", None)
     monkeypatch.setattr(conn, "_last_disconnect_wall", None)
     backfill = AsyncMock()

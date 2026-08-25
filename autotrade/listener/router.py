@@ -13,7 +13,9 @@ Discord self-bot 监听器（多频道版）
     ↓ telegram 通知
 
 注意：
-- on_message_edit 只记录日志，不重新触发下单
+- on_message_edit **不下单**，只在"编辑后才成为可执行信号"时发 TG 让人工接管
+  （8/5 RKLB 实锤：原消息无喊价被正确拒单，14s 后编辑补上 $1.35，当时只写了
+  一行日志，整单丢失）。见 handle_message_edit。
 - 一切异常都吞掉只 log，不让 Discord 链路崩
 - broker.place_order 是同步函数，必须用 asyncio.to_thread 包
 
@@ -24,11 +26,17 @@ from datetime import datetime, timezone
 
 from autotrade.config.channel_loader import registry
 from autotrade.listener.close_flow import handle_close_signal
-from autotrade.listener.dedup import _is_duplicate_raw, _seen
+from autotrade.listener.dedup import (
+    _is_duplicate_raw,
+    _seen,
+    _signal_fingerprint,
+    edit_signal_should_alert,
+)
+from autotrade.listener.heuristics import _twin_of_recent_exec
 from autotrade.listener.open_flow import process_open
-from autotrade.notify.messages import format_error
+from autotrade.notify.messages import format_edited_signal_alert, format_error
 from autotrade.notify.transport import _safe_notify
-from autotrade.parsing.signal_parser import detect_action
+from autotrade.parsing.signal_parser import detect_action, parse_signal
 from autotrade.storage.logger_db import log_raw_signal
 from autotrade.utils.logger import logger
 from autotrade.utils.timeutil import ET_TZ
@@ -161,3 +169,106 @@ async def _handle_message_inner(message):
     # open_flow 不反向 import（避免循环依赖）。
     msg_date_et = _extract_et_date(message)
     await process_open(message, raw, cfg, cid, t0, msg_date_et)
+
+
+# ============================================================
+# 消息编辑
+# ============================================================
+async def handle_message_edit(before, after):
+    """编辑后才成为可执行信号 → TG 告警，**不下单**。
+
+    [8/5 实锤丢单] enrich 23:51:00 发 "跟踪 $RKLB 每周 $80 看涨期权"（无喊价，
+    按契约规则 3 正确拒单 + TG 告警），23:51:15 编辑该消息补上 "$1.35 填充 2%"。
+    老实现只 `logger.info` 一行就返回，补进来的喊价从未进过解析链路 ——
+    一张 RKLB weekly 80C @1.35 就这么丢了。
+
+    为什么不直接喂回 handle_message 自动下单：
+      1. `_seen(msg_id)` 是按 msg_id 去重的，编辑不改 id —— 原消息已处理过，
+         再喂进去会被第 4 道过滤直接吞掉，看起来"接上了"实则一条不走；
+      2. 绕过 _seen 就等于给同一 msg_id 开了第二条执行路径，与
+         30s 原文去重 / 5min 指纹去重的语义全部错位；
+      3. 编辑可能发生在几分钟甚至几小时后，限价会锚在早已走掉的喊价上
+         （与 open_flow 信号年龄闸门要治的是同一个病）。
+    所以这里只做"让人看见"，跟不跟由人定。真要自动化，先攒几晚误报率再说。
+
+    只管 OPEN：编辑成平仓指令的情形没有实测语料，而 close 链路的误平代价
+    远高于漏平（见 close_parser 顶部注释），不在没有证据时放开。
+    """
+    try:
+        await _handle_message_edit_inner(before, after)
+    except Exception:
+        # 与 handle_message 同样的兜底：编辑路径再怎么样也不能崩 Discord 链路。
+        # 这条路径不下单，所以只记日志不发 TG（避免故障时反复刷屏）。
+        logger.exception("handle_message_edit crashed")
+
+
+async def _handle_message_edit_inner(before, after):
+    cid = after.channel.id
+    if not registry.is_monitored(cid):
+        return
+
+    new_raw = after.content or ""
+    old_raw = getattr(before, "content", "") or ""
+
+    # Discord 会为"链接预览生成完毕"之类的纯 embed 变化也触发 edit 事件，
+    # 此时 content 逐字未变 —— 那不是喊单员改了单，直接跳过。
+    if new_raw == old_raw:
+        return
+
+    # 老行为保留：受监听频道的编辑一律留一行日志（复盘时的时间锚）
+    logger.info(f"✏️  [edit] {after.channel.name}: {new_raw[:80]}")
+
+    cfg = registry.get(cid)
+    if not cfg.is_trigger_user(after.author.id):
+        return
+    if not new_raw.strip():
+        return
+
+    # 编辑成平仓指令不在本路径处理（见 docstring）
+    if detect_action(new_raw) == "CLOSE":
+        logger.info("[edit] 编辑后是 CLOSE 语义，本路径只管 OPEN，跳过")
+        return
+
+    msg_date_et = _extract_et_date(after)
+    sig = parse_signal(new_raw, msg_ts=msg_date_et)
+    if not isinstance(sig, dict) or sig.get("skip") or sig.get("price") is None:
+        return
+
+    # 编辑**前**就已经能解析 → 这是价格修正/错字修正，不是"补全了一个漏掉的
+    # 信号"。原消息当时该下单已经下过，指纹去重也按"订阅第一信号"拦过了，
+    # 再提醒只是噪音。
+    old_sig = parse_signal(old_raw, msg_ts=msg_date_et) if old_raw.strip() else None
+    if isinstance(old_sig, dict) and not old_sig.get("skip"):
+        logger.info(
+            f"[edit] 编辑前已可解析（{old_sig['symbol']} @ {old_sig.get('price')}"
+            f" → {sig.get('price')}），按价格修正处理，不提醒"
+        )
+        return
+
+    # 这一单刚从本频道成交过（多半是我们已经跟上的双语孪生）→ 不是漏单
+    twin = _twin_of_recent_exec(new_raw, cid)
+    if twin:
+        logger.info(f"[edit] {twin} 刚从本频道成交过，编辑告警抑制（疑似孪生）")
+        return
+
+    fp = _signal_fingerprint(sig)
+    if not edit_signal_should_alert(fp):
+        logger.info(f"🔁 edit alert dedup: {fp}")
+        return
+
+    created = getattr(after, "created_at", None)
+    if created is not None and created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    age_sec = (
+        (datetime.now(timezone.utc) - created).total_seconds()
+        if created is not None else 0.0
+    )
+
+    logger.warning(
+        f"✏️  [edit] 编辑后成为可执行信号（未下单）: {sig['symbol']} "
+        f"{sig['strike']}{sig['side'][0]} {sig.get('expiry')} @ {sig.get('price')}"
+    )
+    await _safe_notify(format_edited_signal_alert(
+        cfg.name, sig["symbol"], sig["strike"], sig["side"],
+        sig.get("expiry", ""), sig["price"], age_sec, new_raw,
+    ))

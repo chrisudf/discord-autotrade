@@ -14,8 +14,13 @@ expiry 列存 ISO date 字符串（YYYY-MM-DD），category 决定 SL 策略。
 category 是纯展示标签（用于日志/TG/复盘），行为靠两个独立 flag：
 
 - apply_sl         = 是否挂止损（DTE 1-7 且非 lotto 才挂）
-- eod_force_close  = 是否当日 EOD 强平（只看 DTE==0，不管 lotto 标签——
-                     0DTE 当天必过期，必须平；周内 lotto 要放飞到 expiry）
+- eod_force_close  = 是否 EOD 强平：DTE==0，**或**信号带 day_trade tag（8/3 起）。
+                     前者当天必过期、不平就归零/被行权；后者是作者显式声明
+                     "当日了结"，与到期日无关。lotto 标签不影响这一位——
+                     周内 lotto 能放飞到 expiry 是因为它自己不带 day_trade。
+                     消费端 = eod_watcher 的入选条件之一（另一条是
+                     expiry == today，两者取并集）。本字段一度**没有任何行为
+                     消费者**（被 expiry 判据取代后遗留），见 lessons #22。
 
 category 命名（信息性）：
 - 0dte          DTE == 0 且非 lotto
@@ -452,25 +457,71 @@ def sweep_expired(today_et: date) -> list[dict]:
     return swept
 
 
-def adjust_entry_price(option_code: str, expect_qty_total: int, dealt_avg: float) -> bool:
+def adjust_entry_price(
+    option_code: str,
+    expect_qty_total: int,
+    dealt_avg: float,
+    assumed_price: "float | None" = None,
+) -> bool:
     """买单 fill 确认后，用真实成交均价回填 avg_entry_price。
 
-    仅当 qty_total 仍等于 expect_qty_total（提交到确认之间没有加仓/reopen）
-    且仓位还活着时更新；否则加权关系已变，保守跳过。
+    两条路径：
+
+    1. **新开仓**（qty_total == expect_qty_total）：整仓只有这一笔，直接覆盖。
+    2. **加仓**（qty_total > expect_qty_total）：整仓均价是多笔的加权平均，
+       直接覆盖会把别的腿一起抹掉。改为只修正**本笔**那条腿的价格：
+
+           new_avg = old_avg + qty_this * (dealt - assumed) / qty_total
+
+       因为 avg = Σ(qty_i × price_i) / qty_total，把某一腿的价格从 assumed
+       改成 dealt，分子正好变化 qty_this × (dealt − assumed)。除以**当前**
+       qty_total，所以期间又来了几笔加仓也不影响结果的正确性。
+       需要 assumed_price（提交时按限价入账的那个值）才能算，缺了就保守跳过。
+
+    [8/18 SPCX 实锤] 这个函数此前只有路径 1，且 `WHERE qty_total = ?` 对加仓
+    **必然** rowcount=0 → 返回 False → 调用方静默 return，一行日志都没有。
+    当晚 SPCX 120P 的 add-on 就这么把限价 2.33（比喊价高 7.9%）当成了成交价，
+    整仓均价记成 2.74。8/19 平仓时账面 -5.5%，KC 报的是 **+40%** ——
+    从"成本基准偏高一点"升级成了"盈亏方向都反了"。
 
     Returns:
-        True = 已更新；False = 条件不满足跳过
+        True = 已更新；False = 条件不满足跳过（调用方负责告警，别再静默）
     """
     now = _utc_iso()
     with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("""
+            SELECT qty_total, avg_entry_price FROM positions
+            WHERE option_code = ? AND status IN ('OPEN', 'PARTIAL')
+        """, (option_code,)).fetchone()
+        if row is None:
+            return False
+
+        qty_total = row["qty_total"]
+        if qty_total == expect_qty_total:
+            new_avg = dealt_avg
+            note = f"avg_entry backfilled from dealt_avg (expect_qty={expect_qty_total})"
+        elif qty_total > expect_qty_total and assumed_price is not None:
+            # 只修正本笔那条腿，别的腿原样保留
+            new_avg = row["avg_entry_price"] + (
+                expect_qty_total * (dealt_avg - assumed_price) / qty_total
+            )
+            note = (
+                f"add-on leg repriced {assumed_price:.2f}→{dealt_avg:.2f} "
+                f"(qty_this={expect_qty_total}, qty_total={qty_total})"
+            )
+        else:
+            return False
+
         cur = conn.execute("""
             UPDATE positions
             SET avg_entry_price = ?, last_action_at = ?
             WHERE option_code = ? AND qty_total = ?
               AND status IN ('OPEN', 'PARTIAL')
-        """, (dealt_avg, now, option_code, expect_qty_total))
+        """, (new_avg, now, option_code, qty_total))
         if cur.rowcount == 0:
             return False
+        dealt_avg = new_avg
         conn.execute("""
             INSERT INTO position_events (
                 option_code, event_type, qty_delta, price, pct,
@@ -478,8 +529,7 @@ def adjust_entry_price(option_code: str, expect_qty_total: int, dealt_avg: float
             ) VALUES (?,?,?,?,?,?,?,?,?)
         """, (
             option_code, "FILL_ADJUST", 0, dealt_avg, None,
-            "fill_checker", None, now,
-            f"avg_entry backfilled from dealt_avg (expect_qty={expect_qty_total})",
+            "fill_checker", None, now, note,
         ))
     logger.info(f"[positions] FILL_ADJUST {option_code}: avg_entry → {dealt_avg:.2f}")
     return True

@@ -3,7 +3,9 @@
 组合根 app.main 在 load_dotenv 之后调用;返回 Discord token。
 """
 import os
+import subprocess
 import sys
+from pathlib import Path
 
 from loguru import logger
 
@@ -17,6 +19,48 @@ from autotrade.broker.quote import (
 from autotrade.broker.trade import probe_broker
 from autotrade.config.channel_loader import registry
 from autotrade.risk import get_daily_stats
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _git(*args: str) -> str:
+    """跑一条 git，失败一律返回空串。启动路径上不许因为环境问题崩掉。"""
+    try:
+        out = subprocess.run(
+            ("git", "-C", str(_REPO_ROOT)) + args,
+            capture_output=True, text=True, timeout=3,
+        )
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def build_identity() -> str:
+    """"这一晚跑的到底是哪个构建" —— 一行说清。
+
+    [8/14] 那晚 listener 在 23:15 起来，`d6fe50c` 的熔断和自动落账在 00:53
+    才提交 —— 跑的是旧进程，两个修复一个都没生效。而**日志里完全看不出来**：
+    复盘是靠比对 commit 时间戳和 session start 才推断出来的，属于事后考古。
+    夜里出问题时第一个要排除的就是"改的东西到底上没上"，这行日志把它变成
+    零成本的一眼可见。
+
+    dirty 标记同样要紧：工作区有未提交改动时，HEAD 并不能代表实际跑的代码
+    （8/13 那晚跑的就是 fa3a994 + 一批未提交的 parser 修复）。
+    """
+    sha = _git("rev-parse", "--short", "HEAD")
+    if not sha:
+        return "unknown（非 git 仓库或 git 不可用）"
+    when = _git("log", "-1", "--format=%cd", "--date=format:%Y-%m-%d %H:%M")
+    dirty = "有未提交改动 ⚠️" if _git("status", "--porcelain") else "干净"
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+    parts = [sha]
+    if branch and branch != "HEAD":
+        parts.append(f"@{branch}")
+    if when:
+        parts.append(f"({when})")
+    parts.append(f"工作区{dirty}")
+    return " ".join(parts)
 
 
 def preflight() -> str:
@@ -52,6 +96,8 @@ def preflight() -> str:
     logger.info("=" * 60)
     logger.info("🚀 Discord Copytrade Listener 启动")
     logger.info("=" * 60)
+    # 构建标识排在最前：夜里出问题时第一个要排除的就是"改的东西到底上没上"
+    logger.info(f"构建          = {build_identity()}")
     logger.info(f"DRY_RUN       = {dry_run}  {'(不会真下单)' if dry_run else '⚠️  真实下单!'}")
     logger.info(f"MOOMOO_TRD_ENV = {trd_env}")
     logger.info(f"监听频道数    = {len(enabled_ids)}")

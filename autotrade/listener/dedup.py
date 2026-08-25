@@ -216,10 +216,59 @@ _ALERT_THROTTLE_MAX = 200
 _runner_preserve_alerted: dict[str, datetime] = {}
 
 
+# parser 主动 skip 的"疑似信号"告警节流：同 (原因, symbol) 5 分钟内只提醒一次。
+# 8/10 DELL：一条五要素齐全的开仓信号被 price_range pre-filter 吞掉，
+# 零下单 + 零告警 + 零 WARNING。语义同 _stale_open_alerted（不下单的告警，
+# 独立 registry，不占真实入场告警的节流位）。
+_parser_skip_alerted: dict[str, datetime] = {}
+
+
 # 陈旧 OPEN(回补重放)告警节流：同 symbol 5 分钟内只提醒一次。
 # 语义等同 _sized_entry_alerted，独立一个 registry 是为了不让"没下单的告警"
 # 去顶掉真实入场告警的节流位。
 _stale_open_alerted: dict[str, datetime] = {}
+
+
+# 编辑后成为信号的告警节流：同一张合约 5 分钟内只提醒一次。
+# 独立 registry 的理由同 _stale_open_alerted —— 这条路径**不下单**，
+# 绝不能去占 _signal_fps 的坑：一旦占了，5 分钟内那张合约真来了实时信号
+# 会被当成孪生静默丢掉（拿"没下单的告警"顶掉真实入场，是 7/28 已经踩过
+# 一次的形状）。
+_edit_signal_alerted: dict[str, datetime] = {}
+
+
+def edit_signal_should_alert(fp: str, now: "datetime | None" = None) -> bool:
+    """查即登记：窗口内同一合约第二次起返回 False。
+
+    key 用 _signal_fingerprint(sig)（symbol|side|strike|expiry_date）而不是
+    symbol —— 喊单员连着编辑同一条消息两次（先补价再改错字）会重复触发，
+    但换了合约就该另外提醒一次。
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    _sweep_expired(_edit_signal_alerted, now, _ADDON_ALERT_WINDOW,
+                   cap=_ALERT_THROTTLE_MAX)
+    if fp in _edit_signal_alerted:
+        return False
+    _edit_signal_alerted[fp] = now
+    return True
+
+
+def parser_skip_should_alert(key: str, now: "datetime | None" = None) -> bool:
+    """查即登记：窗口内同 key 第二次起返回 False（中英孪生 + 编辑重发只告警一次）。
+
+    key 形如 "price_range:DELL"（skip 原因 + symbol）——换了原因或换了标的
+    都该另外提醒一次。独立 registry 的理由同 _stale_open_alerted：这条路径
+    **不下单**，不能去顶掉真实入场告警的节流位。
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    _sweep_expired(_parser_skip_alerted, now, _ADDON_ALERT_WINDOW,
+                   cap=_ALERT_THROTTLE_MAX)
+    if key in _parser_skip_alerted:
+        return False
+    _parser_skip_alerted[key] = now
+    return True
 
 
 def stale_open_should_alert(symbol: str, now: "datetime | None" = None) -> bool:

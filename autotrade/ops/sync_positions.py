@@ -68,13 +68,24 @@ def _query_broker_positions() -> dict:
 
 
 def _looks_like_option(code: str) -> bool:
-    """粗略判断 US 期权代码：US.SYMBOL<数字><C|P><数字>"""
+    """判断 US 期权代码：US.SYMBOL + YYMMDD + C|P + strike×1000。
+
+    [7/29 修正] 原实现 `[CP]\\d{6,}$` 与本 docstring 自己写的规格不符：
+    它要求 strike 字段至少 6 位，而 moomoo 的 strike×1000 **不补零**，
+    strike < $100 就只有 5 位 —— US.SOFI270115C20000($20) 被判成正股。
+
+    这个脚本**会写库**，误判的代价最重：漏判的期权不进 broker_positions
+    → 本地同名 OPEN 仓被当成 stale → record_close(fill_price=0) 把活仓
+    错标 CLOSED → 掉出 SL/TP/EOD 选仓，裸放。
+    （broker/trade.py::_looks_like_option_code 是 reconciler 侧的同款判据，
+    已同步修正；两处各自自包含，但必须同时正确。）
+    """
     if not code.startswith("US."):
         return False
-    body = code[3:]
-    # 找最后一个 C 或 P 后面接数字的位置
+    # 结构锚定：日期段恰好 6 位 + 行权价至少 1 位。正股不会误命中
+    # （股票代码里没有数字，BRK.B 之类含点的也不匹配）。
     import re
-    return bool(re.search(r"[CP]\d{6,}$", body))
+    return bool(re.match(r"^[A-Z]+\d{6}[CP]\d+$", code[3:]))
 
 
 def sync(dry_run: bool = False):

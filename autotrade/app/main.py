@@ -114,9 +114,10 @@ async def on_message(message):
 
 
 async def on_message_edit(before, after):
-    # 暂不触发下单，只记录（防止 KC 改单价导致重复触发）
-    if registry.is_monitored(after.channel.id):
-        logger.info(f"✏️  [edit] {after.channel.name}: {after.content[:80]}")
+    # 仍然不下单；编辑后才成为可执行信号时发 TG 让人工接管。
+    # 过滤/解析/去重/告警的实现在 listener.router.handle_message_edit
+    # （薄委托，同 on_disconnect → connection 的写法）。
+    await handle_message_edit(before, after)
 
 
 # on_disconnect / on_resumed 的实现（防抖/storm/churn/回补起点管理）在
@@ -177,7 +178,7 @@ _watcher_tasks: set = set()
 
 async def main():
     global client
-    global registry, validate_channels, handle_message
+    global registry, validate_channels, handle_message, handle_message_edit
     global send_telegram, format_error, close_ctx
     global _backfill_missed, _log_reconnect_time
     global _connection_on_disconnect, _connection_on_resumed
@@ -217,10 +218,15 @@ async def main():
     from autotrade.app.preflight import preflight
     from autotrade.broker.trade import close_ctx
     from autotrade.config.channel_loader import registry, validate_channels
-    from autotrade.listener.router import bind_client, handle_message
+    from autotrade.listener.router import (
+        bind_client,
+        handle_message,
+        handle_message_edit,
+    )
     from autotrade.notify.messages import format_error
     from autotrade.notify.transport import send_telegram
     from autotrade.position.eod_watcher import run_eod_watcher, sweep_expired_and_notify
+    from autotrade.position.reconciler import start_reconciler
     from autotrade.position.sl_watcher import run_sl_watcher
     from autotrade.position.tp_watcher import run_tp_watcher
 
@@ -268,6 +274,15 @@ async def main():
         _watcher_tasks.add(task)
         task.add_done_callback(_watcher_tasks.discard)
     logger.info("🛡️  watchers started: sl / eod / tp / alive-heartbeat")
+
+    # [0016] 定时对账 reconciler（report-only）：broker 持仓 vs DB open 仓位
+    # 定时 diff，漂移只发 TG 不写 DB。背景：7/25 夜 AVGO 强平失败过期后本地
+    # 仍挂 OPEN、7/2 自动行权脱钩（lessons #14/#15）——之前只有人工跑
+    # ops/sync_positions 才能发现。RECONCILE_INTERVAL_MIN<=0（缺省 "0"）
+    # 不建 task；接线与 alive_heartbeat 同款（上面的 _watcher_tasks 强引用
+    # set + done_callback discard），逻辑收在 reconciler.start_reconciler
+    # 里以便单测覆盖"env=0 不起"。
+    start_reconciler(_watcher_tasks)
 
     try:
         await client.start(token)

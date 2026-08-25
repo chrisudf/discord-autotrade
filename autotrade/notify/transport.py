@@ -110,7 +110,12 @@ async def send_telegram(text: str, parse_mode: str = "MarkdownV2") -> bool:
                 return False
 
             if resp.status_code == 200:
-                logger.debug(f"[Telegram] 发送成功: {text[:50]}")
+                # [ROADMAP P1 #15] 成功原本只记 DEBUG，而错误路径上有一批**裸调**
+                # send_telegram 的地方（不走 notify() 包装、不打 `[notify] TG sent`）
+                # —— 日志里于是完全查不到"发没发"。8/14 的复盘据此得出
+                # "操作者手机上零告警"的**反向结论**（实际很可能收到了近千条）。
+                # 提到 INFO：多一行日志的成本，远低于"复盘把告警数量看反"。
+                logger.info(f"[Telegram] 发送成功: {text[:50]}")
                 return True
 
             if resp.status_code == 429 and attempt < MAX_RETRY_ON_429:
@@ -133,7 +138,7 @@ async def send_telegram(text: str, parse_mode: str = "MarkdownV2") -> bool:
                     logger.error(f"[Telegram] fallback 请求异常: {type(e).__name__}: {e}")
                     return False
                 if resp2.status_code == 200:
-                    logger.debug("[Telegram] 纯文本 fallback 成功")
+                    logger.info("[Telegram] 纯文本 fallback 成功")
                     return True
                 logger.error(f"[Telegram] fallback 也失败 status={resp2.status_code} body={resp2.text[:200]}")
                 return False
@@ -220,15 +225,20 @@ def send_telegram_sync(text: str, parse_mode: str = "MarkdownV2") -> bool:
 # ============================================================
 # 工具：Telegram 通知
 # ============================================================
-async def _safe_notify(msg: str):
+async def _safe_notify(msg: str, parse_mode: str = "MarkdownV2"):
     """发 Telegram，失败只 log 不抛。
 
     return 值打 log 是为了让运营在 log 里能确认 TG 链路是否工作
     （send_telegram 成功只在 debug 级；6/23 OSCR 拒单 TG 是否发出去看不出）。
+
+    parse_mode 透传给 send_telegram，缺省与它一致。加这个参数是为了让
+    「正文没按 MarkdownV2 转义、必须走纯文本」的告警也能享受上面那行
+    可见性 —— 8/5 夜的睡眠告警就是这种：它直连 send_telegram(parse_mode=None)
+    绕开本函数，结果全晚最该让人知道的一条告警，运维在日志里查不到送没送到。
     """
     head = msg.replace("\n", " ")[:60]
     try:
-        ok = await send_telegram(msg)
+        ok = await send_telegram(msg, parse_mode=parse_mode)
         if ok:
             logger.info(f"[notify] TG sent: {head}")
         else:

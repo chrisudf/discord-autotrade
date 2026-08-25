@@ -79,6 +79,19 @@ def _looks_like_open_attempt(text: str) -> bool:
     )
 
 
+def _open_attempt_symbol(text: str) -> "str | None":
+    """三件套命中时返回第一个 ticker，否则 None。
+
+    [8/10 DELL] parser 主动 skip 的分支需要一个节流 key（中英孪生 + 编辑重发
+    会把同一条消息送进来三四次）。判定逻辑与 _looks_like_open_attempt 完全同源，
+    只是多回传一个 symbol —— 不新开一套启发式。
+    """
+    if not _looks_like_open_attempt(text):
+        return None
+    m = _OPEN_TICKER_RE.search(_strip_bot_noise(text))
+    return m.group(0).lstrip("$") if m else None
+
+
 # ============================================================
 # 启发：enrich 风格"带仓位比例、无方向"的入场
 # ============================================================
@@ -204,6 +217,64 @@ def _close_is_open_twin(cid: "int | None", symbol: str, parsed: dict) -> "str | 
 
 
 # ============================================================
+# 双语孪生：EN 已判"不是平仓指令"时，别让 ZH 机翻版把仓位卖了
+# ============================================================
+# 背景 8/3（当晚唯一一笔误平）：
+#   16:06:25 EN "SPY puts near entry price at the close around 1.72, if you
+#            don't want to swing you can close until 4:15pm EST. I personally
+#            am swinging them" → close_parser 返 None，正确跳过；
+#   16:06:29 ZH 机翻 "…若不想持仓过夜，可在美东时间下午4:15前平仓…"
+#            → 解析成 CLOSE 100% @1.72，卖在 1.63（入场 1.93）。
+# 频道里的 ZH 永远是 EN 的机器翻译，不是独立信号源：**源文本读不出平仓指令时，
+# 译文里的平仓动词就是翻译噪音**。close_parser 已按语义修了这一条（若不想…/
+# 我个人选择持仓），这里是不依赖具体措辞的第二道防线——下一个机翻怪句同样接得住。
+#
+# 方向是刻意不对称的：只挡"EN 先跳过 → ZH 要执行"。
+# 反过来（ZH 先跳过 → EN 执行）不挡：EN 是源文本，它说平就是平。
+# 已知边界：本频道 63% 的对子是 ZH 先到，那种顺序本守卫不生效（EN 会正常执行，
+# 也正是我们想要的）；它专治 8/3 这种 EN 先到并被判 None 的顺序。
+_CJK_RE = _re.compile(r"[一-鿿]")
+# (channel_id, symbol) → 该 symbol 在 EN 文本里被 close_parser 判 None 的时刻
+_recent_close_skip: dict[tuple[int, str], datetime] = {}
+
+
+def _record_close_skip(cid: "int | None", text: str, open_symbols) -> None:
+    """close_parser 对一条 **EN** 消息返回 None 时登记，供 ZH 孪生守卫查。
+
+    只登记不含汉字的文本：ZH 版自己被跳过不构成"源文本说了不平"的证据。
+    """
+    if cid is None or not text or _CJK_RE.search(text):
+        return
+    now = datetime.now(timezone.utc)
+    for key in [k for k, ts in _recent_close_skip.items()
+                if now - ts > _TWIN_SUPPRESS_WINDOW]:
+        _recent_close_skip.pop(key, None)
+    for sym in open_symbols or ():
+        # ticker 在 EN 文本里用 \b 就够，但与 _twin_of_recent_exec 保持同一种
+        # lookaround 写法，免得两处边界规则日后各走各的
+        if _re.search(rf"(?<![A-Za-z0-9]){_re.escape(sym)}(?![A-Za-z0-9])", text):
+            _recent_close_skip[(cid, sym)] = now
+
+
+def _close_is_zh_twin_of_skipped_en(
+    cid: "int | None", symbol: str, parsed: dict,
+) -> "str | None":
+    """ZH 解析出的 CLOSE 是否是"刚被判定为非指令的 EN 消息"的机翻孪生。"""
+    if cid is None or parsed.get("lang") != "zh":
+        return None
+    ts = _recent_close_skip.get((cid, symbol))
+    if ts is None:
+        return None
+    age = (datetime.now(timezone.utc) - ts).total_seconds()
+    if age > _TWIN_SUPPRESS_WINDOW.total_seconds():
+        return None
+    return (
+        f"{symbol} 的英文原文 {age:.0f}s 前已判定为非平仓指令，"
+        f"中文孪生（pct={parsed.get('pct')}）不执行"
+    )
+
+
+# ============================================================
 # 启发：疑似加仓（add-on）信号检测
 # ============================================================
 # 背景 7/6：KC "small add SPY @ 1.86" ×4（EN×2 + ZH×2）全部 parse-fail 静默丢弃。
@@ -252,15 +323,36 @@ def _looks_like_addon_attempt(text: str) -> "str | None":
 _ZH_TICKER_HINTS = ("亚马逊", "微软", "特斯拉", "苹果", "英伟达", "谷歌", "脸书", "网飞")
 
 
-def _looks_like_close_attempt(text: str) -> bool:
-    """close_parser 返回 None 但文本里有 ticker + 价格-like → 值得 TG（可能漏接）
+def _looks_like_close_attempt(text: str, lone_day_trade: bool = False) -> bool:
+    """close_parser 返回 None 但看着像漏接的平仓指令 → 值得 TG。
 
-    "can trim some runners here at 3.45" 这种没 ticker 的 follow-up → silence
+    两条路径都要求**价格 hint**（$X / @X / d.dd）：
+
+    1. 文本里有 ticker —— 原有判据，捕获 ZH 公司名映射失败那类真漏检。
+    2. `lone_day_trade`：文本里没有 ticker，**但当前全库只有一个 day_trade 活仓**
+       —— 无歧义，喊单员省略 ticker 就是在说那一个。
+
+    第 2 条是 8/19～8/20 连吃三晚的缺口。原来只有第 1 条，"没 ticker 的
+    follow-up 一律 silence"，结果：
+
+      8/19 00:35  "small safety trim @ 2.60 to de-risk after the 2.20 add"
+      8/20 00:34  "small trim @ 2.60"
+      8/20 00:37  "BANG! Out half 2.80 💰"
+      8/20 00:39  "BANG! Out majority @ 3.05 🚀"
+
+    四条全是对当时唯一那个 day_trade 仓位（SPY）说的，全部静默丢弃、
+    一条 TG 都没发 —— 8/20 那晚 KC 从 2.60 一路减到 3.45，我们一动没动，
+    第二张一直拿到 EOD 的 1.71。
+
+    **只提醒不下单**：放宽的是告警面，不是自动下单面。误平的代价远大于漏平
+    （见 close_parser 顶部注释），要不要跟由人决定。
     """
     if not text:
         return False
     text = _strip_bot_noise(text)
-    has_ticker = bool(_OPEN_TICKER_RE.search(text)) or any(t in text for t in _ZH_TICKER_HINTS)
     # 价格-like：$X / @X / 任何 d.dd（不用 \b 边界，因为中文+数字无 word boundary）
     has_price_hint = bool(_re.search(r"\$\.?\d|@\s*\.?\d|\d+\.\d{1,2}", text))
-    return has_ticker and has_price_hint
+    if not has_price_hint:
+        return False
+    has_ticker = bool(_OPEN_TICKER_RE.search(text)) or any(t in text for t in _ZH_TICKER_HINTS)
+    return has_ticker or lone_day_trade

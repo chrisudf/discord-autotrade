@@ -599,6 +599,290 @@ sleep period. Root cause is environmental — `caffeinate -is make run`.
 
 ---
 
+## 19. A full disk erases the evidence of the outage it causes — log-only error handling is not error handling
+
+**Symptom**: 7/31 overnight (09:50:20–09:50:42 AEST = 19:50 ET) the sl/tp/eod
+watchers threw 33 consecutive `sqlite3.OperationalError: disk I/O error` as the
+volume hit zero free space. Telegram said nothing. Worse, `app_2026-08-01.log`
+jumps straight from `08:34:13` to `11:10:35` and `logs/errors/error_2026-08-01.log`
+is **0 bytes** — the 33 ERROR records are the only thing that happened in that
+window, and they are exactly what was lost. Without the terminal happening to be
+open there would have been no trace at all that all three risk watchers went down.
+
+**Why non-obvious**:
+- Every watcher's `except` was `logger.exception(...)`, which reads as
+  "loud and recorded". It is — right up until the failure mode *is* the log
+  sink. The one incident class that most needs an audit trail is the one that
+  cannot write one.
+- `loguru` degrades quietly here: a failing sink prints `--- Logging error ---`
+  to stderr and drops the record. The process stays healthy, other sinks keep
+  working, and nothing raises — so a "log and continue" loop genuinely continues,
+  just blind.
+- sqlite and the log sink shared a failure domain (same volume). Two independent-
+  looking defenses died to one cause.
+- The disk pressure came from outside the repo entirely (the checkout is ~4 MB).
+  Nothing in the app's own footprint hinted at it, and `preflight()` checks
+  broker, OPRA and risk budget but never free space.
+- The watcher loops *did* survive (`while True: try/except` held, and
+  `asyncio.CancelledError` is a `BaseException` so it isn't swallowed) — so
+  "process still up" was true and meaningless.
+
+**Defense**: [autotrade/notify/watchdog.py](../autotrade/notify/watchdog.py) —
+watcher `except` branches now call `notify_tick_error()`, which keeps the
+traceback in the log *and* pushes a Telegram alert down an independent path,
+first-failure-immediate then throttled per scope
+(`WATCHER_ERROR_ALERT_COOLDOWN_SEC`, default 300s; 33 alerts in 22s would be its
+own outage — see lesson 12 and the 7/23 runner-preserve noise). Recovery emits a
+matching ✅ with the suppressed count, so "it broke" and "it's fine now" are both
+observable. The alerting path is fully exception-guarded: a protection mechanism
+must never become a new failure source. Still open (see ROADMAP P1): a preflight
+free-space gate and a size-capped log rotation, so the condition is refused at
+startup rather than discovered at 3am.
+
+---
+
+## 20. Signal grammar drifts mid-flight: the same author inverts price and strike without warning
+
+**Symptom**: 7/31 13:41 ET, `$AAOI scalp 0DTE $.70 $98 calls` failed to parse and
+the trade was missed — both the EN message and its ZH twin. Every Pattern B
+variant (B0/B0.5/B1/B1b/B2/B3) hardcodes `$STRIKE calls … $PRICE`; this one put
+the fill price first.
+
+**Why non-obvious**:
+- The message is otherwise perfectly ordinary — right ticker, right tag, right
+  DTE. Nothing about it looks malformed to a human, which is why it doesn't
+  register as "a new format" when you skim the channel.
+- It failed *silently into the noise floor*: the same night produced legitimate
+  `Parse failed` warnings for level broadcasts, weekly recaps and buy lists. One
+  real miss inside a stream of correct rejections is invisible without
+  reconstructing intent per message.
+- The obvious fix (add an inverted copy of each B pattern) doubles a regex family
+  that already has six members and six expiry paths.
+
+**Defense**: normalize word order at the entrance instead —
+`_normalize_inverted_price()` in
+[autotrade/parsing/signal_parser.py](../autotrade/parsing/signal_parser.py)
+rewrites `$PRICE $STRIKE calls` into canonical order, so the existing B ladder
+supplies all the expiry/tag logic unchanged (same tactic as the ZH direction-word
+normalization above it). Two guards keep it from swapping the fields the wrong
+way — which would place a limit order at the *strike* — the price must carry a
+decimal point (this channel quotes premiums with cents and strikes as integers,
+so `$740 $745 calls` spread notation is rejected), and price must be < strike.
+
+---
+
+## 21. Bilingual redundancy is not redundancy when both channels degrade on the same message
+
+**Symptom**: 8/3 10:27 ET, KC posted `out AMZN -15%` and its ZH twin
+`减持亚马逊 -15%`. Neither closed the position. The EN copy never even reached
+the close parser — `detect_action` routed it to OPEN, because `STRONG_CLOSE_RE`
+only knew `out of` and `WEAK_CLOSE_RE` only knew `out half/full/majority` and
+`out N%`; bare `out <TICKER>` was in neither. The ZH copy *did* parse, but
+`减持` sits in `ZH_ACTION_VERBS` and not `ZH_FULL_CLOSE_VERBS`, so pct fell to
+the trim default of 33, which a 1-contract position turns into a
+runner-preserve skip. The author exited at −15%; we carried the put overnight.
+
+**Why non-obvious**: the whole design leans on "ZH arrives, EN backstops it
+1–3s later" (module docstring of `close_parser`, and the 63%/100% pairing stats
+behind it). That reads like two independent samples. It isn't — the ZH text is a
+*machine translation of the same sentence*, so an unusual phrasing perturbs both
+copies at once, in different ways. Here `out` → `减持` was a lossy translation
+(exit → reduce) and `out AMZN` was an unlisted EN form; each failure alone was
+survivable, and the pair was not. Any postmortem that reads "but the twin should
+have caught it" is describing a correlation the architecture never had.
+
+The same night produced a second instance of the identical shape, opposite
+direction: 16:06 ET `…if you don't want to swing you can close until 4:15pm EST.
+I personally am swinging them` was correctly skipped in EN and executed as
+`CLOSE 100%` from the ZH translation `若不想持仓过夜，可…平仓` — a conditional
+whose main clause carries the verb, attached to a message where the author says
+outright he is holding. Sold 1.63 against a 1.93 entry.
+
+**Defense**: two layers, deliberately independent.
+- *Semantic*, in [close_parser.py](../autotrade/parsing/close_parser.py):
+  `_OUT_BARE_SYM_PATTERN` (bare `out <TICKER>` = full close, uppercase-only via
+  `(?-i:)` plus a stopword list, still whitelist-gated downstream),
+  `ZH_OPTIONAL_CLAUSE_RE` / `EN_OPTIONAL_CLAUSE_RE` (negated conditionals mask to
+  *sentence* end, not comma — the action lives in the main clause), and
+  `AUTHOR_HOLD_MARKERS` / `ZH_AUTHOR_HOLD_MARKERS`.
+- *Structural*, in [heuristics.py](../autotrade/listener/heuristics.py):
+  `_close_is_zh_twin_of_skipped_en` — if the EN source text was judged "not an
+  instruction" within 60s, the ZH machine translation of it does not execute,
+  whatever it says. Asymmetric on purpose: EN is the source, so ZH-skipped never
+  blocks EN. This one costs nothing to maintain and catches the *next* weird
+  translation, which is the failure we cannot enumerate in advance.
+
+Note what was **not** changed: `减持` still means trim (pct=33). Promoting it to
+full-close to fix this one message would reprice every genuine trim signal. The
+fix belongs on the EN side, which arrives first and is the source of truth.
+
+---
+
+## 22. A tag that is parsed, stored and displayed is not a tag that does anything
+
+**Symptom**: 8/3, `AMZN 275p 4DTE @ 1.65 day trade` opened with
+`tags=['day_trade']` and `eod_force_close=False`, and was still open the next
+morning. `categorize()` derived `eod_force` from `dte == 0` alone; `day_trade`
+was consumed only by `policy/guards.py` as a DTE ceiling. The tag appeared in the
+parse log, in the positions table, and in the Telegram fill notice — every
+surface a human checks while convincing themselves the pipeline understood the
+signal.
+
+**Why non-obvious**: the failure has no error, no warning, and no silent branch
+you can grep for. The tag is *used*, just not for the thing its name implies, and
+the two consumers (`guards` and `categorize`) sit in different modules with no
+reason to reference each other. Reading either one alone looks complete.
+
+**Defense** — and this is where it gets instructive, because the obvious fix was
+also inert. Three layers had to change, and the first two alone did nothing:
+
+1. `eod_force = (dte == 0) or ("day_trade" in tags)` in
+   [policy/positions.py](../autotrade/policy/positions.py);
+2. …returned from **all** branches — the three non-0DTE returns hardcoded
+   `False`, which was equivalent while `dte == 0` was the only source and became
+   the bug the moment it wasn't;
+3. …and `eod_watcher` had to *read* the flag. It didn't. An earlier fix (long ITM
+   options auto-exercising, lesson #14) had **replaced** the flag with
+   `expiry == today` as the selection criterion, correctly — a Monday-opened
+   weekly still has `flag=False` on Friday. But replacing it left
+   `eod_force_close` with zero behavioral consumers repo-wide, a write-only
+   column. So steps 1–2 wrote a truer value into a field nobody read: the same
+   lesson recurring one layer down, inside the fix for it.
+
+The selection is now `expiry == today OR eod_force_close`, two independent
+sources: (a) covers positions expiring today whatever their flag, (b) covers
+"close today" declared at open regardless of expiry. Either alone leaks a real
+case.
+
+Note the contract flip this forces: `test_eod_skips_future_expiry` asserted that
+`flag=1` + future expiry does *not* close — correct while the flag was
+informational and that state could only be synthetic. `day_trade` makes it a
+common legitimate state, so the test now asserts the opposite and says why.
+
+General form: when adding a tag, name its consumer in the same commit — and when
+*replacing* a field's consumer, delete the field or note that it is now inert.
+A write-only column is a loaded gun for the next person who "wires it up" and
+sees green tests.
+
+---
+
+## 23. A rejection with no state is an infinite loop — and the alert channel drowns before the log does
+
+**Symptom**: 8/13, `US.MU260814C945000` was recorded OPEN with 2 contracts that
+the broker never actually held. Five seconds later TP T1 fired, the broker
+refused the sell as a naked short, and the watcher tried again 5 seconds later.
+**1918 times, 00:11 → 06:00.** 5754 log lines — 70% of an 8183-line, 1.09 MB
+overnight log, up from 363 lines the night before. It recurred on 8/14 (812
+times) because the running listener predated the fix.
+
+**Why non-obvious**: every individual layer looked correct in isolation.
+
+1. `tp_hits` (the "this tier already fired" bitmask) is persisted *after* the
+   order succeeds — correct, so a failed sell can be retried. But it means a
+   rejection leaves **no trace at all**.
+2. `_sell_rejected` additionally `discard`ed the per-tick dedup key — also
+   deliberate, so another path could still act within the tick.
+3. Neither knew about the other, and nothing distinguished *transient* failure
+   (worth retrying) from *deterministic* refusal. "Broker has 0 long of this
+   contract" answers the same way on attempt 1918 as on attempt 1.
+
+The deeper trap: the phantom position itself came from a **silent** branch.
+`confirm_buy_fill` logs and back-fills only when the dealt price *differs* from
+the limit; when moomoo reported the order filled at exactly the limit, it
+returned without a single line. Two sibling positions that night logged
+`FILL_ADJUST` within 15s; this one logged nothing, and "nothing" is
+indistinguishable from "never ran".
+
+**The part that actually hurt**: the reconciler *saw it* at 00:27 —
+`db_only: US.MU260814C945000 db=2 broker=0` — sent one Telegram, then went quiet
+by design (same-signature throttle). It reported every hour for six hours and
+never acted. Visibility was never the missing piece.
+
+**And the alerts were worse than useless**: each of the 1918 rejections called
+`send_telegram` directly rather than through the `notify()` wrapper. The wrapper
+is the only thing that logs `[notify] TG sent`, so the operator's phone very
+likely got ~1918 messages while the log showed none — inverting the evidence so
+completely that the 8/14 review concluded "zero alerts reached the operator".
+`transport.py`'s own docstring warns about exactly this bypass (8/5, the sleep
+alert). Knowing about a footgun in a comment does not disarm it.
+
+**Defense** (`position/retry_guard.py`, wired into tp / sl / eod / kc_close):
+
+- deterministic refusals (`broker/errors.is_deterministic_reject`) trip the
+  breaker on the **first** rejection; transient ones back off 30s→60s→120s→240s
+  and trip after 5;
+- tripping **does not** set `tp_hits` — marking the tier "done" would silently
+  erase an unrealized take-profit. Stop and shout, in-memory only, restart clears;
+- alerts fire at exactly two moments (first failure, trip) with suppressed counts
+  folded in — same shape as `notify/watchdog`;
+- polling paths (SL/TP) get backoff+trip; signal-driven paths (EOD, kc_close)
+  take `backoff=False` and only trip, because their retry cadence is already
+  deliberate (EOD's 60s `_skip_until`, kc_close's bilingual-twin retry).
+
+`reconciler` now closes deterministic `db_only` drift itself, behind three gates
+(env switch; never when the broker reports zero option positions, since that is
+indistinguishable from a failed query; max 3 per round).
+
+**General form**: a retry with no persisted failure state is not a retry, it is a
+loop. Before adding one, answer two questions in the same commit — *what marks
+that this attempt failed*, and *what class of failure is worth repeating at all*.
+And when an error path emits a notification, route it through the wrapper the
+rest of the system uses; the one that bypasses it is invisible exactly when
+volume makes visibility matter.
+
+---
+
+## 24. Fixing one language of a bilingual pipeline is not fixing the pipeline
+
+**Symptom**: 8/14, 16:13 ET. The same message arrived twice, 5 seconds apart:
+
+```
+EN  "nice drop on SPCX into end of day, still in the puts after the
+     profit trims this morning ✅"        → no signal ✅
+ZH  "临收盘SPCX跌得漂亮，早间利润减仓后仍持有看跌期权✅"
+                                          → CLOSE 33% ❌
+```
+
+A recap that says *in both languages* "I am still holding" was parsed as an
+instruction to sell. The only thing that prevented it was runner-preserve —
+SPCX happened to have 1 contract left, so 33% rounded to 0. With 2 contracts it
+would have sold one.
+
+**Why non-obvious**: no single rule was wrong. `减仓` is a legitimate close verb.
+`早间` was simply absent from a list that already had `今早`, `今天早些`,
+`早些时候` — three synonyms of the fourth. The sentence used commas throughout,
+so `_zh_action_sentences` (which splits on `。！？`) never separated the recap
+clause from the verb. And `SPCX` is a Latin ticker, so symbol extraction
+succeeded where two other Chinese recaps that night were saved only by
+`[zh_unrecognized]` failing to find a symbol — luck, not defense.
+
+This is the *third* recurrence of the same shape. 8/5: an EN `so far` recap
+guard was added and the ZH twin (`目前为止`) was not — the note in
+`ZH_RECAP_MARKERS` calls fixing one side "白修". 8/10: `chopping in half` and
+`削减一半` both missed. Each time the fix was correct and one-sided.
+
+The asymmetry has teeth because the two pipelines have **different structures**,
+not just different word lists: EN has a `HOLDING` guard on the close path, ZH has
+none; ZH splits sentences on CJK punctuation the EN side doesn't use. So "add the
+translated word" is necessary and not sufficient — the guard itself may not exist
+on the other side.
+
+**Defense**: `早间` added to `ZH_RECAP_MARKERS`; the `仍持有 / 仍在持有 / 还持有
+/ 还在持有` family added to **both** `close_parser.ZH_RECAP_MARKERS` and
+`signal_parser.SKIP_KEYWORDS`, since the open path had the same gap (`$ASTS
+仍在持有` reached `no signal` by luck the same night). Bare `持有` stays out —
+it would swallow "buy X, plan to hold through September". Regression:
+[tests/test_overnight_0814.py](../tests/test_overnight_0814.py), which pins both
+languages *and* the reverse direction (real close instructions must still parse).
+
+**General form**: when a parser change lands on one language of a bilingual feed,
+the commit is not done until you have looked for the corresponding guard on the
+other side and confirmed it exists. Whichever twin arrives first wins, and
+historically ZH arrives first 63% of the time — so the unfixed side is not a
+smaller risk, it is most of the risk.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -886,6 +1170,86 @@ python -m autotrade.ops.show_today
 python -m autotrade.diag.diag_handle_message_real
 ```
 
+## 25. Fixing a miss can arm a landmine that never had a chance to go off
+
+**Symptom**: 8/18. `out the rest of AMZN to secure small green trade ✅ Price has
+on just about everything outside memory stocks has been slow and boring.` had
+been failing to parse for weeks — the close was silently missed and the position
+rode to EOD. The fix was small and obviously right: teach the parser the phrase
+`out the rest`.
+
+With that one line, the same message stopped being a miss and became this:
+
+```
+{'kind': 'BULK_TRIM', 'symbols': [], 'pct': 100, ...}
+```
+
+**Sell every open position at 100%.** The word `everything` — sitting in a clause
+of market commentary at the end of the sentence — was in `BULK_MARKERS`, and
+`_has_bulk_marker` scanned the whole message. That branch had simply never been
+reachable for this message, because parsing failed two steps earlier.
+
+**Why non-obvious**: the dangerous code was not touched, not new, and not wrong
+in isolation — `everything` is a perfectly good bulk marker in
+`sell everything here`. What changed was *reachability*. A defect that lives
+downstream of a failing gate is invisible in production and invisible in tests,
+because nothing ever gets far enough to reach it. Fixing the gate is what ships it.
+
+The general shape: **when you fix a parse failure you are not adding one code
+path — you are enabling every path downstream of it at once, none of which has
+ever run on this input.** The 8/18 message had been exercising exactly one branch
+(`return None`) for its entire life.
+
+Practical consequence for this repo: a fix that turns "no signal" into "signal"
+on the money path needs its **downstream** asserted, not just its parse result.
+The regression for this one asserts `kind == "CLOSE"` and `symbols == ["AMZN"]`,
+not merely that the message parses.
+
+---
+
+## 26. A fill confirmation from the broker can be a number that never existed
+
+**Symptom**: 8/20, 02:57. `US.TSLA260828C470000` submitted at limit 2.97,
+`[Risk] cost=$594`. Fifteen seconds later:
+
+```
+[fill] buy US.TSLA260828C470000 dealt_avg=0.13 (limit 2.97) → avg_entry 已回填
+```
+
+The position's cost basis was overwritten with **0.13** — a 95.6% deviation from
+a limit order's limit price, which is arithmetically impossible for a real fill
+(a limit buy fills at or below the limit, not at 4% of it). The DB then held a
+position that cost $594 and claimed to cost $26, with no stop loss. Every P&L
+number derived from that row was wrong, and wrong in the flattering direction.
+
+The corroborating evidence arrived two hours later, on the same contract:
+
+```
+04:41  [CLOSE] no price ref for US.TSLA260828C470000, skipping sell (33%)
+```
+
+while `PLTR` in the same message got a quote fine (`quote_ref=0.95`). Both
+symptoms have one cause: **this contract had no working OPRA quote**, and the
+"filled average price" the broker returned for it was garbage rather than an
+error.
+
+**Why non-obvious**: the code did check the field — `if dealt > 0`. The trap is
+that the bad value was *positive, finite, and plausible-looking in isolation*.
+Nothing in the SDK signals "this number is not a price": no error code, no NaN,
+no exception. The only way to know 0.13 is wrong is to compare it against
+something you already knew — the limit price you submitted.
+
+The general rule: **a value that came back successfully is not a value that is
+true.** Any number from an external system that will be written to the money path
+needs a sanity band derived from a value you control, not just a null check.
+Here the band is `[limit × 0.50, limit × 1.05]` — the upper bound because a limit
+buy cannot fill above its limit, the lower bound wide enough to admit genuinely
+good fills (8/21: UBER limit 0.50, actual 0.37, −26%, real and correct).
+
+When it fails the band, the right move is **refuse and alert**, not clamp or
+accept. Keeping the limit price in the DB is knowingly a little high; accepting
+0.13 is knowingly wrong by 20×.
+
 ---
 
 # Lesson → 回归测试映射表
@@ -914,6 +1278,14 @@ python -m autotrade.diag.diag_handle_message_real
 | 16 | 全量 re-login 不回放漏掉的消息 | `test_backfill.py::test_backfill_replays_missed`、`::test_backfill_idempotent_against_already_seen`、`::test_backfill_noop_without_disconnect_wall`、`::test_backfill_consumes_wall_timestamp` |
 | 17 | history 的 limit 截断掉的是**最新**几条 | `test_overnight_0728.py::test_backfill_truncation_drops_oldest_not_newest`；`test_backfill.py::_FakeChannel` 现按真实语义模拟 `oldest_first`/`limit` |
 | 18 | monotonic 在系统睡眠中不走 | `test_overnight_0728.py::test_churn_counts_wall_clock_window`（挂钟记账）、`::test_alive_gap_pulls_backfill_anchor_and_alerts_once`（反向利用:挂钟心跳跳变=睡眠指纹） |
+| 19 | 磁盘写满会擦掉它自己造成的故障证据 | `test_overnight_0731.py::test_first_error_alerts_immediately`、`::test_burst_is_throttled_to_one_alert`、`::test_scopes_throttle_independently`、`::test_recovery_notifies_once_with_missed_count`、`::test_alerting_failure_never_escapes`、`::test_healthy_ticks_are_silent`。**磁盘闸门与日志尺寸上限尚未实现**（ROADMAP P1 #10），当前防御只覆盖"告警发得出去"，不覆盖"提前拒绝启动" |
+| 20 | 喊价/行权价语序会中途倒过来 | `test_overnight_0731.py::test_inverted_price_strike_now_parses`（EN+ZH 双播）、`::test_inverted_order_across_expiry_forms`、`::test_canonical_order_unaffected`、`::test_swap_guards_reject_non_premium`、`::test_price_levels_broadcast_still_skipped` |
+| 21 | 双语孪生同时降级 = 冗余归零 | 语义层：`test_overnight_0803.py::test_bare_out_ticker_routes_and_parses_as_full_close`、`::test_out_forms_keep_their_pct`、`::test_bare_out_does_not_fire_on_prose`（误报护栏）、`::test_conditional_close_is_not_an_instruction`（当晚双语原文）、`::test_negated_conditional_masks_the_main_clause`、`::test_author_holding_skips_whole_message`、`::test_real_close_instructions_still_execute`（反向：真 trim 不受影响）、`::test_out_fraction_routes_and_parses`、`::test_expiry_dates_are_not_fractions`。结构层（不依赖措辞）：`::test_zh_twin_blocked_after_en_twin_skipped`、`::test_en_close_after_zh_skip_still_executes`（方向不对称）、`::test_zh_close_without_prior_en_skip_executes`、`::test_zh_skip_does_not_register_en_marker`。**不变量**：`::test_zh_trim_verb_still_means_trim`（减持 仍是 33，修复不许外溢到 ZH 侧） |
+| 22 | tag 被解析/落库/展示 ≠ tag 有行为；write-only 字段是下一个人的陷阱 | 策略层：`test_overnight_0803.py::test_day_trade_forces_eod_close`、`::test_eod_force_matrix_otherwise_unchanged`（整张矩阵，防"新 flag 只改一个分支"复发）、`::test_zero_dte_unchanged`、`::test_open_signal_with_day_trade_still_routes_open`。**消费端**（缺了它前两层全是空转）：`test_watchers.py::test_eod_closes_day_trade_before_its_expiry`（契约翻转，前身断言相反行为）、`::test_eod_skips_future_expiry_without_force_flag`（反向安全属性：在途 swing 不许被碰）、`::test_eod_force_closes_weekly_expiring_today`（expiry 那条独立入选路径不受影响） |
+| 23 | 拒单不留状态 = 无限循环；告警通道比日志先被淹 | 熔断：`test_tp_retry_guard.py::test_naked_short_reject_trips_after_one_attempt`（100 轮只打 1 次 broker）、`::test_transient_reject_backs_off_then_trips`、`::test_trip_is_scoped_to_one_contract_and_tier`、`::test_success_clears_backoff_state`。**不变量**：`::test_naked_short_reject_trips_after_one_attempt` 断言 `tp_hits` 保持 0（熔断不许把没落袋的止盈标记成已完成）。告警节流：`::test_naked_short_alert_is_sent_once_with_reconcile_hint`。日志收敛：`::test_log_throttled_*`（4 个）。自动落账三道闸门：`test_0016_reconciler.py::test_auto_close_*`（6 个，含 `::test_auto_close_vetoed_when_broker_returns_empty` —— 空查询不许清空全部活仓）。**幻影仓入口（`confirm_buy_fill` 的静默分支 + 限价/市价偏离闸门）尚未修**，见 ROADMAP P1 #14 |
+| 24 | 只修双语管线的一侧 = 没修 | `test_overnight_0814.py::test_zh_still_holding_recap_is_not_a_close`（当晚原文）、`::test_en_twin_stays_correct`（另一侧不许被带坏）、`::test_recap_markers_block_close`（6 个词形）、`::test_holding_recap_is_not_an_open_signal`（开仓路径同批补）。**反向护栏**：`::test_real_close_signals_still_parse`（4 个真指令不许误伤）、`::test_buy_and_hold_phrasing_still_opens`（裸"持有"没进表）。同族前案见 #21 与 `test_overnight_0810.py` |
+| 25 | 修一个漏平会踩响一颗从没触发过的雷（变的是可达性） | `test_overnight_0818_0824.py::test_out_the_rest_does_not_become_bulk_trim`（下游断言：必须是 CLOSE `['AMZN']` 而不是 BULK_TRIM 100%）、`::test_bulk_marker_requires_close_verb_object`（4 个 case，真 bulk 不许被误伤）。**不变量**：修 parse 失败时断言的是**下游结果**，不是「能解析了」 |
+| 26 | broker 回来的成交价可以是个从未存在过的数字 | `test_fill_checker.py::test_buy_fill_rejects_absurd_dealt_price`（限价 2.97 / 回报 0.13 → 拒绝回填 + 告警）、`::test_buy_fill_accepts_a_genuinely_good_fill`（反向：UBER 限价 0.50 实成 0.37 必须放过）、`::test_buy_fill_reprices_only_its_own_leg_after_addon`（加仓按腿重算，前身断言的是保守跳过）|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |

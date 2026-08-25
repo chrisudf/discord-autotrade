@@ -28,6 +28,7 @@ TODO: 用 Polygon 回测后用真实 fill 数据校准这三档
     "price": float,
 }
 """
+import re
 import threading
 
 from autotrade.utils.logger import logger
@@ -284,6 +285,72 @@ def _get_long_qty(option_code: str) -> int:
     if side != "LONG" or qty <= 0:
         return 0
     return qty
+
+
+# US 期权代码判定：US.SYMBOL + YYMMDD + C|P + strike×1000。
+#
+# [7/29 修正] 原判据 `[CP]\d{6,}$` 要求 strike 字段 **至少 6 位**，但 moomoo
+# 的 strike×1000 **不补零** —— strike < $100 就只有 5 位甚至更少：
+#     US.SOFI270115C20000  ($20)  → 20000  5 位 → 判成正股 ❌
+#     US.NIO260731C5500    ($5.5) → 5500   4 位 → 判成正股 ❌
+#     US.AMD260731C100000  ($100) → 100000 6 位 → 正确     ✅
+# 即 **所有 strike < $100 的期权全部漏判**（实测你账户里的 SOFI 20C 就中招，
+# 被列进 sync_positions 的"孤儿正股"并建议手工清掉）。
+#
+# 危险链条：reconciler 拿不到这类仓 → 本地有而 broker "没有" → 误报
+# db_only「疑似已行权/场外平仓」→ 报告指引去跑 ops/sync_positions →
+# 那边同一个 bug → record_close(fill_price=0) 把**活仓**错标 CLOSED →
+# 掉出 SL/TP/EOD 选仓，裸放且无人知道。
+#
+# 改为按结构锚定（日期段恰好 6 位 + 行权价至少 1 位），而不是数 strike 位数。
+# 正股不会误命中：股票代码里没有数字（BRK.B 之类含点的也不匹配）。
+# ops/sync_positions._looks_like_option 是独立人工脚本、各自自包含，
+# 已同步修同一个 bug（两处都改，只改一处等于留着另一条路踩雷）。
+_OPTION_CODE_RE = re.compile(r"^[A-Z]+\d{6}[CP]\d+$")
+
+
+def _looks_like_option_code(code: str) -> bool:
+    return code.startswith("US.") and bool(_OPTION_CODE_RE.match(code[3:]))
+
+
+def list_open_option_positions() -> dict[str, int]:
+    """[0016] 查 broker 当前全部 US 期权持仓（qty>0）。对账 reconciler 用。
+
+    与 _get_long_qty 的区别：那是单 code 的 naked-short 防护；这里拉全量
+    （position_list_query 不带 code 过滤），并用同一条 stale-session 重试
+    路径（_call_with_session_retry），中途 session 失效不至于整轮对账挂掉
+    ——正是 SNOW"运行半夜忽然账户挂"那类故障的恢复通道。
+
+    正股不收：期权行权换来的"孤儿正股"由人工 ops/sync_positions 处理
+    （见其 strays_stock 告警），reconciler v1 只对齐期权。
+
+    Returns:
+        {option_code: qty}
+
+    Raises:
+        RuntimeError: 查询失败（重试一次后仍失败）。调用方决定重试节奏
+        （reconciler 主循环 catch 后下一轮再试），不在这里吞掉——
+        静默把失败当"空仓"会让对账误报所有 DB 仓位为漂移
+        （与 _get_long_qty docstring 里"查询失败不当 qty=0"同一教训）。
+    """
+    ctx = _get_ctx()
+    ret, df = _call_with_session_retry(
+        ctx, "position_list_query", "reconcile ",
+        trd_env=_get_trd_env(),
+        acc_id=_ensure_account(),
+    )
+    if ret != RET_OK:
+        raise RuntimeError(f"position_list_query failed: {df}")
+    out: dict[str, int] = {}
+    if df is None or len(df) == 0:
+        return out
+    for _, row in df.iterrows():
+        code = str(row["code"])
+        qty = int(row["qty"])
+        if qty <= 0 or not _looks_like_option_code(code):
+            continue
+        out[code] = qty
+    return out
 
 
 def place_sell_order(

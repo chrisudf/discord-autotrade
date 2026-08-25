@@ -8,14 +8,26 @@ Rules (2026-06):
 5. expiry 相对消息时间戳计算（回测正确性）
 6. expiry 落假日/周末 → 自动前移到最近交易日（如 6/19 Juneteenth → 6/18）
 7. expiry 显示字符串与 expiry_date 保持一致（避免 TG/DB 显示 6/19 但实际下 6/18）
+8. (2026-07) ZH 机翻开仓模板走 Pattern D（A/B/C 全落空后兜底，五要素严格匹配，
+   详见 _try_pattern_d）——规则 1 "English-only" 自 ZH 方向词归一化起已放宽
 """
 import re
 from datetime import date, timedelta
 from autotrade.parsing.holidays import adjust_to_trading_day, is_trading_day
-# out N% 的模式只有一份，定义在 close_parser（"out" 短语词表的所在地），
+# "out" 系模式只有一份，定义在 close_parser（"out" 短语词表的所在地），
 # 这里 import 复用：路由与解析必须同进同退。close_parser 只依赖 re/logger，
 # 不反向 import 本模块，无循环风险。
-from autotrade.parsing.close_parser import _OUT_PCT_PATTERN
+from autotrade.parsing.close_parser import (
+    _CHOP_HALF_PATTERN,
+    _OUT_BARE_SYM_PATTERN,
+    _OUT_FRACTION_PATTERN,
+    _OUT_PCT_PATTERN,
+    _OUT_REST_PATTERN,
+    _RUNNERS_ONLY_PATTERN,
+    _TOOK_OFF_PATTERN,
+    _ZH_OUT_FRACTION_PATTERN,
+    _ZH_RUNNERS_ONLY_PATTERN,
+)
 from autotrade.utils.logger import logger
 
 
@@ -46,6 +58,19 @@ def _next_friday(today: date) -> date:
     """本周或下周五（如果今天就是周五，返回今天）。"""
     days_to_friday = (4 - today.weekday()) % 7
     return today + timedelta(days=days_to_friday)
+
+
+def _third_friday(year: int, month: int) -> date:
+    """该月第三个周五 —— 美股月度期权（含 LEAPS）的标准到期日。
+
+    [7/29] KC "added SOFI 20c Jan 2027 leaps @ 1.22" 只给月+年不给日，
+    月度合约的到期日按规则就是第三个周五（2027-01 → 01-15）。
+    调用方仍要过 _adjust_expiry：第三个周五撞假日（如 Good Friday）时
+    整体前挪到周四，与 weekly 路径同一套回退。
+    """
+    d = date(year, month, 1)
+    d += timedelta(days=(4 - d.weekday()) % 7)  # 当月第一个周五
+    return d + timedelta(days=14)
 
 
 # === 假日调整封装 ===
@@ -114,6 +139,11 @@ SKIP_KEYWORDS = [
     # 触发 looks-like-signal 误报，EN 孪生 "Only holding my" 正确 skip）。
     # 只收带前缀的形态——裸"持有"太宽，会误伤"买入 X 打算持有到 9 月"这类真开仓
     "只持有", "仅持有", "继续持有", "暂时持有",
+    # [8/14] "$ASTS 仍在持有"（03:19:38）当时落到 no signal 是侥幸不是拦截；
+    # 同一晚的 close 路径上，同族的"仍持有"差点把 SPCX 误平（见
+    # close_parser.ZH_RECAP_MARKERS 的 8/14 注释）。两边一起补，别只修一侧 ——
+    # "拦住一边另一边照样平掉" 是 8/5 已经学过一次的形状。
+    "仍持有", "仍在持有", "还持有", "还在持有",
     # 第一人称主语 + holding
     "i'm holding", "im holding", "i am holding",
     # 状语 + holding
@@ -135,6 +165,71 @@ PRICE_RANGE_PATTERN = re.compile(
 )
 
 CHINESE_MARKERS = ["美股会员网rich", "美股会员网机器人"]
+
+# [7/31 实锤丢单] "$AAOI scalp 0DTE $.70 $98 calls"（13:41 ET 盘中）——喊价写在
+# 行权价**前面**。Pattern B 全系列（B0/B0.5/B1/B1b/B2/B3）都硬编码
+# "$STRIKE calls ... $PRICE" 语序，倒过来写一条都接不住，中英双播两条全丢。
+# 与其给 B 每个变体再写一份倒序副本（6 份正则 × 到期日逻辑），不如在入口做
+# 一次语序归一化，改写成规范序后复用既有 B 阶梯——到期日/tag 逻辑自动继承，
+# 与上面 ZH 方向词归一化是同一套路子。
+#
+# [8/10 实锤丢单] "$DELL - weekly - $3.50 - $530 calls / Scaling in 1% now"
+# （10:12 ET 盘中）——同样是倒序，但两个 $ 之间隔着**字段分隔符** " - "，
+# 而不是空白。后果是双重的：归一化不触发 → 文本原样进 _has_price_range →
+# "$3.50 - $530" 逐字命中 PRICE_RANGE_PATTERN 的 "$数字 - $数字" → 判成喊价
+# 区间跳过，中英双播两条全丢且**一条 TG 都没发**（见 open_flow 的 skip 分支）。
+# 放开分隔符后文本先被改写成 "$DELL - weekly - $530 calls $3.50"，区间正则
+# 自然不再命中（$530 前面是 "weekly - " 不是 $数字）——归一化跑在
+# _has_price_range **之前**，所以**不需要动 PRICE_RANGE_PATTERN 本身**，
+# 真区间（"$740 - $745 calls"）的拦截能力完整保留。
+#
+# 三道护栏防止把 strike 和 price 换反（换反 = 用 $98 的限价买 $0.70 的合约）：
+#   1. price 必须带小数点（".70" / "1.50"）——本频道喊价一律带分位，
+#      行权价一律整数；这条直接排掉 "$740 $745 calls" 这类价差写法
+#   2. price < strike——期权权利金没有高过行权价的
+#   3. strike >= price * 10——放开分隔符**新引入**的形状：真喊价区间
+#      "$3.50 - $4.00 calls" 两个数都带小数、且 3.50 < 4.00，前两道全过，
+#      会被错换成"用 $3.50 买 $4.00 行权价"。数量级差挡住它（4.00 < 35 → 不换，
+#      原样留给区间 pre-filter 正确拦下）；真信号绰绰有余（DELL 530 ≥ 35、
+#      AAOI 98 ≥ 7）。
+# 行权价与 calls/puts 之间的填充词段（"$252.50 SCALP calls"、"$80 weekly calls"）。
+# [8/21 实锤丢单] enrich "$MRVL $252.50 SCALP***** calls $1.69 weekly" 双语双漏——
+# 这一段原本是 `(?:[a-z0-9]+\s+){0,3}?`，只收字母数字，而 enrich 用尾随星号做强调
+# 是惯用写法（SCALP*****＝重点关注），**一个星号就足以让整条信号消失**。
+# 当晚 KC 自己报 two baggers(+100%)，按 2 张估算漏掉约 $338。
+#
+# 只放开"单词后面跟一串强调星号"这一种形状（`\*{0,8}`），不把 `*` 塞进字符类——
+# 后者会让裸 `***` 也算合法填充词，等于把任意分隔符都当成填充，召回面放得太宽。
+# 上限 8 个纯属够用即可；enrich 实测最多五个。
+_STRIKE_SIDE_GAP = r"(?:[a-z0-9]+\*{0,8}\s+){0,3}?"
+
+_INVERTED_PRICE_STRIKE_RE = re.compile(
+    r"\$(\.\d+|\d+\.\d+)"                             # $PRICE（必须带小数点）
+    r"[\s\-–—]+"                                      # 空白 / 字段分隔破折号（含中文全角）
+    r"\$(\d+(?:\.\d+)?)"                              # $STRIKE
+    r"(\s*" + _STRIKE_SIDE_GAP + r"(?:calls?|puts?))",   # [填充词] calls/puts
+    re.IGNORECASE,
+)
+
+# 护栏 3 的数量级下限（strike 至少是 price 的 10 倍）
+_INVERTED_STRIKE_PRICE_RATIO = 10
+
+
+def _normalize_inverted_price(text: str) -> str:
+    """把 "$PRICE $STRIKE calls" 改写成 "$STRIKE calls $PRICE"（规范序）。
+
+    不匹配 / 护栏不过 → 原样返回，对既有语序零影响。
+    """
+    def _swap(m):
+        price, strike, tail = m.group(1), m.group(2), m.group(3)
+        if float(price) >= float(strike):
+            return m.group(0)
+        if float(strike) < float(price) * _INVERTED_STRIKE_PRICE_RATIO:
+            # 两数量级太近 → 更可能是喊价区间而非 price/strike 对，不换
+            return m.group(0)
+        return f"${strike}{tail} ${price}"
+
+    return _INVERTED_PRICE_STRIKE_RE.sub(_swap, text)
 
 
 def _strip_chinese(text: str) -> str:
@@ -204,6 +299,11 @@ def parse_signal(text: str, msg_ts: date = None):
     # 在行情评论里太常见（"我看涨大盘"），不碰。
     text = text.replace("看涨期权", " calls ").replace("看跌期权", " puts ")
 
+    # 语序归一化：喊价前置 → 规范序（见 _INVERTED_PRICE_STRIKE_RE）。
+    # 必须在 ZH 方向词归一化之后——ZH 版 "$.70 $98 看涨期权" 要先变出 "calls"
+    # 才能被倒序正则认出来。
+    text = _normalize_inverted_price(text)
+
     if _has_skip_keyword(text) or _HOLDING_TICKER_RE.search(text):
         logger.info(f"[parser] skip (holding/remaining): {text[:60]}")
         return {"skip": "holding_or_remaining"}
@@ -213,7 +313,13 @@ def parse_signal(text: str, msg_ts: date = None):
         return {"skip": "price_range"}
 
     try:
-        sig = _try_pattern_a(text, today) or _try_pattern_b(text, today) or _try_pattern_c(text, today)
+        # Pattern D 在 A/B/C 全落空后才尝试（ZH 机翻模板兜底，不影响既有优先级）
+        sig = (
+            _try_pattern_a(text, today)
+            or _try_pattern_b(text, today)
+            or _try_pattern_c(text, today)
+            or _try_pattern_d(text, today)
+        )
     except ValueError as e:
         # smart_expiry 对 6/31 这类无效日期抛 ValueError → 按解析失败处理，
         # 走 None 路径（listener 会 TG 报警），不让异常传出去
@@ -234,11 +340,52 @@ def parse_signal(text: str, msg_ts: date = None):
 def _try_pattern_a(text: str, today: date):
     """Pattern A: SYMBOL STRIKEc/p {MM/DD | Month DD} @ PRICE"""
 
+    # === A2L: 月份 + 四位年份（LEAPS 形态，无 day）===
+    # [7/29 实锤丢单] "added SOFI 20c Jan 2027 leaps @ 1.22"：下面 A2 的
+    # (\d{1,2}) 没有右边界，把年份 "2027" 截成 day=20 → 2027-01-20 →
+    # US.SOFI270120C20000 被 OPRA 拒（Unknown stock），整单丢失。
+    # 月度/LEAPS 到期日 = 第三个周五 = 2027-01-15（账户里真实持有的正是它）。
+    # 必须排在 A2 前面，且 A2 的 day 已加 (?!\d) 右边界双保险。
+    pattern_a2_leaps = re.compile(
+        rf"\b([A-Z]{{1,5}})\s+"
+        rf"(\d+(?:\.\d+)?)([cp])\s+"
+        rf"({MONTH_NAMES_RE})\s+(20\d{{2}})\b"
+        rf"(?:[^@\n]*?@\s*\$?(\d+(?:\.\d+)?))?",
+        re.IGNORECASE,
+    )
+    for m in pattern_a2_leaps.finditer(text):
+        symbol, strike, cp, month_name, yyyy, price = m.groups()
+        if not symbol.isupper():
+            continue
+        if symbol.upper() in {"I", "A", "THE", "AT", "ON", "IS", "DTE", "IPO"}:
+            continue
+        if price is None:
+            filled = re.search(r"filled?\s*@\s*\$?(\d+(?:\.\d+)?)", text, re.I)
+            if filled:
+                price = filled.group(1)
+        if price is None:
+            continue
+        mm = MONTH_NAME_TO_NUM[month_name.lower()]
+        return {
+            "raw": text,
+            "matched": m.group(0).strip(),
+            "symbol": symbol.upper(),
+            "side": "CALL" if cp.lower() == "c" else "PUT",
+            "strike": float(strike),
+            "expiry": f"{mm}/{int(yyyy)}",
+            "expiry_date": _adjust_expiry(
+                _third_friday(int(yyyy), mm), context="A2L Month YYYY (LEAPS)"
+            ),
+            "price": float(price),
+            "tags": _extract_tags(text),
+        }
+
     # === A2: 英文月份在先（优先级更高，避免 A1 误吃）===
+    # day 的 (?!\d) 右边界：没有它，"Jan 2027" 会被截成 day=20（见上方 A2L）。
     pattern_a2 = re.compile(
         rf"\b([A-Z]{{1,5}})\s+"
         rf"(\d+(?:\.\d+)?)([cp])\s+"
-        rf"({MONTH_NAMES_RE})\s+(\d{{1,2}})(?:st|nd|rd|th)?"
+        rf"({MONTH_NAMES_RE})\s+(\d{{1,2}})(?!\d)(?:st|nd|rd|th)?"
         rf"(?:[^@\n]*?@\s*\$?(\d+(?:\.\d+)?))?",
         re.IGNORECASE,
     )
@@ -353,6 +500,45 @@ def _try_pattern_a(text: str, today: date):
     return None
 
 
+# B 系列尾段"从 calls/puts 走到喊价"的窗口。
+#
+# [8/5 实锤丢单] enrich 23:51 先发 "跟踪 $RKLB 每周 $80 看涨期权"（无价，正确
+# 拒单），14s 后**编辑**该消息补上 "\n\n$1.35 填充 2%"。喊价另起一段，而 B0 /
+# B0.5 / B1b / B2 / B3 的尾段一律是 `[^\$\n]*?` —— 字符类里的 \n 把喊价挡在
+# 换行外面，五个变体全落空（B1 用的是 .*?+DOTALL，本来就跨得过去）。
+# 实测：同一句写成一行 "…$80 calls $1.35 fill" 解析完全正常，唯一的差别就是
+# 那个换行。
+#
+# 放开 \n，仍然禁 $：`$` 是本频道 ticker 的固定前缀，禁掉它窗口就跨不到下一个
+# $TICKER 去（"$META 620 calls" 后面接 "$SPY 4.20" 拼不成混合单）。
+# 代价是窗口现在能吃到"目标价/止损价"那类**不是入场价**的数字——这条防线由
+# 下面 _b_match 里的 _price_qualified 接管（原是 Pattern D 的护栏，见
+# _PRICE_QUALIFIERS 注释里 7/29 那次对抗测试）。
+_B_PRICE_GAP = r"[^\$]*?"
+
+
+
+def _b_match(pattern, text: str, price_group: int):
+    """B 系列共用：finditer + 限定价护栏，返回第一个喊价可信的 match。
+
+    price_group 是该 pattern 里**喊价**的分组序号（各变体分组数不同，必须
+    逐个传对，传错等于护栏对着别的数字看）。
+
+    用 finditer + continue 而不是 search + return None：同一条消息里
+    "目标 $6.00" 后面若还跟着真喊价，后一个 match 仍有机会命中。
+    与 _try_pattern_d 的处理逐字同构。
+    """
+    for m in pattern.finditer(text):
+        if _price_qualified(text, m.start(price_group), m.start()):
+            logger.info(
+                f"[parser] Pattern B 跳过限定价（目标/止损/现价类，非入场价）: "
+                f"{m.group(0).strip()[:60]}"
+            )
+            continue
+        return m
+    return None
+
+
 def _try_pattern_b(text: str, today: date):
     """Pattern B: 多种 $SYMBOL 形态。
 
@@ -362,17 +548,20 @@ def _try_pattern_b(text: str, today: date):
     B1:    含 NDTE
     B2:    weekly 无日期 → 默认本周五
     B3:    $STRIKE 在 calls 前的倒序写法
+
+    全系列的喊价段用 _B_PRICE_GAP（可跨行）并经 _b_match 过限定价护栏，
+    见该常量注释里的 8/5 RKLB 实锤。
     """
 
     # ----- B0: 含 MM/DD -----
     p_mmdd = re.compile(
         r"\$([A-Z]{1,5})\b"
         r"[^\$\n]*?(\d{1,2})/(\d{1,2})"
-        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
-        r"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)",
+        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*" + _STRIKE_SIDE_GAP + r"(calls?|puts?)"
+        + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
     )
-    m = p_mmdd.search(text)
+    m = _b_match(p_mmdd, text, 6)
     if m:
         symbol, mm, dd, strike, side, price = m.groups()
         return {
@@ -390,14 +579,26 @@ def _try_pattern_b(text: str, today: date):
         }
 
     # ----- B0.5: $SYMBOL ... Month DD ... $STRIKE calls $PRICE -----
+    # [8/5 复盘发现] 下面那行的 {{0,3}} 之前写成 {0,3} —— 这是 rf 字符串，
+    # 单括号会被当成 f-string 替换字段：f"{0,3}" 渲染成字面量 "(0, 3)"。
+    # 编译出来的正则实际是 `(?:[a-z0-9]+\s+)(0, 3)?(calls?|puts?)`，后果有两层：
+    #   1. "0-3 个填充词"变成"**必须恰好一个**填充词"；
+    #   2. 凭空多出第 7 个捕获组，一旦命中，下面 6 元解包抛
+    #      ValueError: too many values to unpack —— 而 parse_signal 的
+    #      `except ValueError` 本是给 smart_expiry 的非法日期准备的，
+    #      把它一并吞掉，日志报成 "[parser] invalid date in signal"，
+    #      **信号静默丢失且归因错误**。
+    # 没填充词时则整条 B0.5 不匹配 → 落到 B2 → 英文月份日期被无视，
+    # expiry 悄悄退成 next Friday（买错到期日的合约）。
+    # B0.5 自写下起就没真正生效过；修正后它才第一次按 docstring 工作。
     p_month_name = re.compile(
         rf"\$([A-Z]{{1,5}})\b"
         rf"[^\$\n]*?({MONTH_NAMES_RE})\s+(\d{{1,2}})(?:st|nd|rd|th)?"
-        rf"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
-        rf"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)",
+        rf"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*" + _STRIKE_SIDE_GAP + r"(calls?|puts?)"
+        + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
     )
-    m = p_month_name.search(text)
+    m = _b_match(p_month_name, text, 6)
     if m:
         symbol, month_name, dd, strike, side, price = m.groups()
         mm = MONTH_NAME_TO_NUM[month_name.lower()]
@@ -420,11 +621,13 @@ def _try_pattern_b(text: str, today: date):
     p_dte_first = re.compile(
         r"\$([A-Z]{1,5})\b"
         r".*?(\d+)DTE"
-        r".*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
+        r".*?\$(\d+(?:\.\d+)?)\s*" + _STRIKE_SIDE_GAP + r"(calls?|puts?)"
         r".*?\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE | re.DOTALL,
     )
-    m = p_dte_first.search(text)
+    # B1 的 .*?+DOTALL 本来就跨行，不改窗口；补上与其它变体同一套限定价护栏
+    # （之前 B1 是全系列唯一既能跨行、又完全没有护栏的一支）。
+    m = _b_match(p_dte_first, text, 5)
     if m:
         symbol, dte, strike, side, price = m.groups()
         return {
@@ -444,12 +647,12 @@ def _try_pattern_b(text: str, today: date):
     # ----- B1b: $SYMBOL $STRIKE calls NDTE $PRICE -----
     p_dte_mid = re.compile(
         r"\$([A-Z]{1,5})\b"
-        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
+        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*" + _STRIKE_SIDE_GAP + r"(calls?|puts?)"
         r"[^\$\n]*?(\d+)DTE"
-        r"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)",
+        + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
     )
-    m = p_dte_mid.search(text)
+    m = _b_match(p_dte_mid, text, 5)
     if m:
         symbol, strike, side, dte, price = m.groups()
         return {
@@ -469,11 +672,11 @@ def _try_pattern_b(text: str, today: date):
     # ----- B2: $SYMBOL [weekly] $STRIKE calls/puts $PRICE （无日期） -----
     p_weekly = re.compile(
         r"\$([A-Z]{1,5})\b"
-        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
-        r"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)",
+        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*" + _STRIKE_SIDE_GAP + r"(calls?|puts?)"
+        + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
     )
-    m = p_weekly.search(text)
+    m = _b_match(p_weekly, text, 4)
     if m:
         symbol, strike, side, price = m.groups()
         return {
@@ -494,12 +697,12 @@ def _try_pattern_b(text: str, today: date):
     p_alt = re.compile(
         r"\$([A-Z]{1,5})\b"
         r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*"
-        r"\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
+        r"\s*" + _STRIKE_SIDE_GAP + r"(calls?|puts?)"
         r"[^\$\n]*?(\d{1,2})/(\d{1,2})"
-        r"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)",
+        + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
     )
-    m = p_alt.search(text)
+    m = _b_match(p_alt, text, 6)
     if m:
         symbol, strike, side, mm, dd, price = m.groups()
         return {
@@ -604,6 +807,129 @@ def _try_pattern_c(text: str, today: date):
     }
 
 
+# Pattern D: ZH 机翻开仓模板（编译一次，模块级；分组次序见 _try_pattern_d）
+# 形态：SYM + strike + calls/puts + (NDTE | N天到期) + (@价 | 价格N)
+#   - symbol 允许紧贴 CJK（"买入META"——ZH 原文动词和 ticker 之间没有空格，
+#     \b 在 \w(CJK 也是 \w) 之间不成立，只能用 lookbehind 排除英文字母/$）
+#   - side 是完整词 calls/puts：ZH 归一化("看涨期权"→" calls ")的产物，
+#     正是 A 系列(要求 strike 紧贴单字符 c/p)接不住的原因
+#   - 要素间窗口 _GAP：容纳全角逗号/空格等机翻标点，但**不允许跨越**句读
+#     （。！？；.!?）、换行、或**连续 2+ 个英文字母**（第二个 ticker，以及
+#     "target"/"stop loss" 这类英文限定词都会被它挡住）。
+#     [7/28 对抗评审] 旧版 [^\n]{0,30} 会把 "META 620看涨期权，SPY 4DTE @ 3.15"
+#     拼成 META+SPY 的 4DTE @3.15 混合单——30 字符轻松跨过一整个 ZH 子句
+#     和第二个标的。禁止字符类把窗口锁死在"同一子句、同一 ticker 内"。
+#     [7/29 复核] 原写法是 `[^A-Z...]` + re.IGNORECASE，实际语义 **不是**
+#     注释当时写的"≥2 连续大写字母"：Python 里否定字符类叠加 IGNORECASE 会
+#     把小写一并排除（re.match(r'[^A-Z]','a',re.I) is None），所以它挡的是
+#     任何 2+ 连续英文字母。这里改写成 [^A-Za-z...] 显式表达同一行为
+#     （**逐字等价，不改召回**），免得后人"照注释修正"成只挡大写——那会
+#     让 "META 620 calls 4DTE target @ 6.00" 当 entry 下单（实测验证过）。
+#     英文限定词的防线现在有两层：_GAP 的字母墙 + 下面的 _price_qualified。
+#   - 价格必须是**入场价**语义：见 _PRICE_QUALIFIERS / _price_qualified。
+#     "目标价格6.00"/"止损价格2.40"/"目前价格6.00" 是评论不是喊单。
+_GAP = r"(?:[^A-Za-z\n。！？；.!?]|[A-Za-z](?![A-Za-z]))*?"  # 连续 2+ 英文字母不允许
+_PATTERN_D = re.compile(
+    r"(?<![A-Za-z$])([A-Z]{1,5})\s+"                        # symbol（禁 $ 前缀：$ 形态归 B/C 管）
+    r"(\d+(?:\.\d+)?)\s+"                                   # strike
+    r"(calls?|puts?)\b"                                     # side（完整词）
+    r"" + _GAP + r"(?:(\d{1,3})\s*DTE\b|(\d{1,3})\s*天到期)"  # NDTE | N天到期
+    r"" + _GAP + r"(?:@\s*\$?\s*(\.?\d+(?:\.\d+)?)"         # @3.15 / @ $3.15
+    r"|(?<![标损前的现])价格\s*[:：]?\s*\$?\s*(\.?\d+(?:\.\d+)?))",  # 价格4.80（紧邻限定词末字 标/损/前/的/现 → 目标|止损|目前|当前|…的|现 价格，视为评论不下单）
+    re.IGNORECASE,
+)
+
+# 价格限定词：出现在价格 token **之前**就说明那个数字不是入场价，是评论。
+# [7/29 对抗测试] `价格` 分支原本只有负向 lookbehind (?<![标损前的现])，
+# **`@` 分支一个防护都没有** —— 实测 "AMD 210看涨期权 4天到期 目标 @ 4.50"
+# 会按 4.50 下单（真实 entry 3.00，溢价 50%），且 4.50 低于
+# MAX_PRICE_PER_CONTRACT 熔断线，风控接不住。EN 版 "target @ 6.00" 当时能
+# 被拒纯属 _GAP 字母墙的副作用（见 _GAP 注释），不是有意设计——ZH 侧因为
+# 限定词是 CJK 直接穿墙而过。而按 docstring，ZH 孪生常比 EN 早 ~2s 到，
+# ZH 误解析先执行、EN 版压根不匹配 → **没有孪生来纠正**，这是单边错单。
+#
+# 只收"这个数字明确不是入场价"的词，宁可漏挡也不误伤真喊单：
+# 特意**不含** "now"——"buying now @ 3.15" 是合法开仓。
+_PRICE_QUALIFIERS = (
+    "目标", "止损", "止盈", "目前", "当前", "现价", "预期",
+    "target", "stop", "current",
+)
+# 回看窗口：够装下 "stop loss @ "(12) 即可；再长会摸到 DTE 要素区徒增误伤。
+_QUALIFIER_LOOKBACK = 16
+
+
+def _price_qualified(text: str, price_start: int, match_start: int) -> bool:
+    """价格 token 前 _QUALIFIER_LOOKBACK 字符内是否有限定词（→ 评论，不下单）。
+
+    只往回看到本次匹配的起点，不跨出 m.group(0)——否则同一条消息里前面
+    某个仓位的"止损"会误伤后面真正的开仓喊价。
+    """
+    window = text[max(match_start, price_start - _QUALIFIER_LOOKBACK):price_start]
+    return any(q in window.lower() for q in _PRICE_QUALIFIERS)
+
+
+def _try_pattern_d(text: str, today: date):
+    """Pattern D: ZH 机翻开仓模板 `SYM STRIKE calls/puts (NDTE|N天到期) (@价|价格N)`
+
+    两夜实锤（逐字语料在 tests/test_0014_zh_open.py）：
+      1. 7/24 夜："买入META 620看涨期权，4天到期，价格4.80" —— 归一化后
+         "META 620 calls ，4天到期，价格4.80"：A 系列要求 strike 紧贴 c/p
+         （"620c"），B/C 系列要求 $ 前缀，三头全落空 → 当晚 ZH 孪生解析失败，
+         全靠 EN 版被路由修复接住。enrich 的 ZH 版实测常早 EN ~2s 到达（7/14），
+         ZH 不可解析 = 白等 EN；EN 同时失手（当晚 "into the close" 误路由）
+         就是整单丢失。
+      2. 7/28 夜："SPY 745看涨期权 4DTE @ 3.15 日内交易" 同型再现。
+
+    语义复用：
+      - "N天到期" 等价 NDTE —— expiry_date 与 A3 同一条路径
+        （today + N 天，再 _adjust_expiry 假日回退），保证 ZH/EN 孪生
+        指纹 (symbol,side,strike,expiry_date) 完全一致，dedup 才拦得住双发。
+      - "日内交易" 的 day_trade tag 由 _extract_tags 的 zh_tag_map（"日内"）
+        既有词表覆盖，无需另补。
+
+    保守边界（契约铁律 2：宁错过不错杀）：
+      - 模板五要素缺一不命中，不做宽松匹配——缺价/缺期的残句宁可落到
+        looks-like-signal 大声告警，也不半猜下单。
+      - "7月15日" 这类 ZH 日期形态不在本模板内（无实测语料，不扩）。
+    """
+    for m in _PATTERN_D.finditer(text):
+        symbol, strike, side_word, dte_en, dte_zh, price_at, price_zh = m.groups()
+        # 同 A 系列：IGNORECASE 下 [A-Z] 也吃小写，要求原文全大写才算 ticker
+        # （"buy 620 calls 4DTE @ 3.15" 里的 "buy" 不是 ticker）
+        if not symbol.isupper():
+            continue
+        if symbol.upper() in {"I", "A", "THE", "AT", "ON", "IS", "DTE", "IPO"}:
+            continue
+        # 限定价防护：目标/止损/现价 等前缀说明这个数字不是入场价。
+        # finditer + continue（而非 return None）：同一条消息里"目标 @ 6.00"
+        # 之后若还跟着真正的喊价，仍有机会被后一个 match 接住。
+        price_group = 6 if price_at is not None else 7
+        if _price_qualified(text, m.start(price_group), m.start()):
+            logger.info(
+                f"[parser] Pattern D 跳过限定价（目标/止损/现价类，非入场价）: "
+                f"{m.group(0).strip()[:60]}"
+            )
+            continue
+        n = int(dte_en if dte_en is not None else dte_zh)
+        price = price_at if price_at is not None else price_zh
+        return {
+            "raw": text,
+            "matched": m.group(0).strip(),
+            "symbol": symbol.upper(),
+            "side": "CALL" if side_word.lower().startswith("call") else "PUT",
+            "strike": float(strike),
+            # 显示字符串统一记 NDTE（_finalize_signal 会覆盖成实际 M/D，
+            # 与 A3 行为一致）
+            "expiry": f"{n}DTE",
+            "expiry_date": _adjust_expiry(
+                today + timedelta(days=n), context="D NDTE/天到期"
+            ),
+            "price": float(price),
+            "tags": _extract_tags(text),
+        }
+    return None
+
+
 def _extract_tags(text: str) -> list:
     """从 KC 信号文本抽 tag，给后续 category/分析用。
 
@@ -677,25 +1003,63 @@ STRONG_CLOSE_RE = re.compile(
     # 双双漏掉，两个都是我们的持仓）。只认现在时/祈使——过去式 "locked in 200%"
     # 是 recap，不匹配。
     r"|\block(?:ing)?\s+(?:them\s+|these\s+|it\s+|profits?\s+)?(?:all\s+)?(?:in|on)\b"
-    r"|减仓|平仓|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空|减持|缩减至|缩减到|出清"
+    # 8/19 SPY："平掉剩余SPY仓位" 整句无动词命中 → 连 CLOSE 都没路由到
+    # （EN 孪生 "out the rest of SPY" 同时漏）。与 close_parser.ZH_ACTION_VERBS 同步。
+    r"|减仓|平仓|平掉|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空|减持|缩减至|缩减到|出清"
     # 7/23 实测：enrich ZH 孪生 "$NBIS - 出半"（EN "Out half"）没进 CLOSE 路由，
     # 落到 OPEN 解析失败。EN 侧 WEAK_CLOSE_RE 一直认 "out half"，双语不对称。
     # 两侧边界与 close_parser.ZH_OUT_HALF_RE 保持一致（对抗评审两轮实锤）：
     # 右边界拦"冲出半年新高"，左边界拦"走出半V型反转"（ASCII 跟随右边界拦不住），
     # "出半仓" 变体后面允许任意接续（"出半仓于2.45"）。
     r"|(?<![一-鿿])出半(?:仓|(?![一-鿿]))"
-    r"|锁定",
+    # 8/3 同型漏检：enrich "$TSLA 出 1/2"（EN "$TSLA out 1/2"）双语双漏。
+    # 边界与 close_parser.ZH_OUT_FRACTION_RE 共用同一份 pattern 串。
+    r"|" + _ZH_OUT_FRACTION_PATTERN
+    # 8/10 DELL：EN "chopping in half" 的 ZH 机翻"削减一半"。EN 侧进 WEAK
+    # （见下），ZH 侧进 STRONG——理由同 "出半"：机翻句里几乎不会夹开仓意图词，
+    # 而 ZH 独有的 OPEN_INTENT 误否决过一次（7/15 "all out" 案例）。
+    # 只认带"半"的组合，与 close_parser.ZH_ACTION_VERBS 的收词口径一致。
+    + r"|削减一半|削减半"
+    + r"|锁定"
+    # 8/20 SPY/MSFT："仅持仓X @ 3.28" 是 KC "runners only" 的机翻，语义是
+    # **已经减到只剩 runner**，而 `持仓` 在 SKIP_KEYWORDS 里 → OPEN 路径直接
+    # 判成 holding 跳过（当晚出现 3 次全漏）。进 STRONG 的理由同"出半"/"削减一半"：
+    # ZH 机翻句里几乎不会夹开仓意图词，而 OPEN_INTENT 一票否决误伤过一次。
+    # pattern 与 close_parser 共用同一份常量（要求跟 @价格，见那里的注释）。
+    + r"|" + _ZH_RUNNERS_ONLY_PATTERN,
     re.I,
 )
 WEAK_CLOSE_RE = re.compile(
     r"\bclosing\b(?!\s+bell)"          # 'closing bell' 是时间状语不是动作
     r"|\bout\s+(?:half|full|majority)\b"
     # 7/25 实测:enrich "$LLY - Out 25% more. Down to runners." 双语双发全漏
-    # (裸 out 不在词表)。只认 out 紧跟 N% 的形态;行情解说("knocked out 25%
-    # of the premium")由 _OUT_PCT_PATTERN 自带的 lookbehind 排除。
-    # 路由(这里)与解析(close_parser._OUT_PHRASE_RE)共用同一个常量——
-    # 两边写法漂移就是漏单裂缝。
+    # (裸 out 不在词表)。out N% 的模式只有一份、定义在 close_parser
+    # (_OUT_PCT_PATTERN,含 knocked-out 解说的 lookbehind),这里 import 复用——
+    # 路由与解析同进同退,两边写法漂移就是漏单裂缝。
     r"|" + _OUT_PCT_PATTERN
+    # 8/3 实测：KC "out AMZN -15%" 与 enrich "$TSLA out 1/2" 双双落到 OPEN 解析
+    # 失败——裸 "out <TICKER>" 和 "out <分数>" 两个形状 EN 侧一直没进路由词表。
+    # 两份 pattern 同样 import 自 close_parser，与解析同进同退。
+    # 放 WEAK 而非 STRONG：OPEN_INTENT 一票否决保留（"out AMZN, adding SPY"
+    # 这种混合句宁可判 OPEN——误平的代价大于漏平，见 close_parser 顶部注释）。
+    # 裸 ticker 分支大小写敏感（(?-i:) 局部关掉本 RE 的 re.I），否则
+    # "out of the money" 会被当平仓，理由详见 _OUT_BARE_SYM_PATTERN。
+    + r"|" + _OUT_FRACTION_PATTERN
+    + r"|(?-i:" + _OUT_BARE_SYM_PATTERN + r")"
+    # 8/10 实测：enrich 收盘前 "$DELL - … - chopping in half" 双语双漏，
+    # detect_action 根本没路由成 CLOSE（两条都落到 OPEN 侧 Parse failed）。
+    # pattern 同样 import 自 close_parser，路由与解析同进同退。
+    # 放 WEAK：原文里 "I will hold a 1% lotto position" 这类措辞常与开仓意图
+    # 混排，保留 OPEN_INTENT 一票否决（宁漏平不误平）。
+    + r"|" + _CHOP_HALF_PATTERN
+    # 8/18 AMZN + 8/19 SPY："out the rest of X" 撞上 _OUT_BARE_SYM_STOPWORDS
+    # 里的 THE；"took another off at 1.98" 没有任何动词命中；
+    # 8/20 SPY/MSFT："runners only X @ 3.28" 同样不在词表。
+    # 三份 pattern 都 import 自 close_parser，路由与解析同进同退。
+    # 放 WEAK 而非 STRONG：保留 OPEN_INTENT 一票否决（宁漏平不误平）。
+    + r"|" + _OUT_REST_PATTERN
+    + r"|" + _TOOK_OFF_PATTERN
+    + r"|" + _RUNNERS_ONLY_PATTERN
     + r"|\bselling\b"
     r"|\bscaling\s+down\b",
     re.I,
