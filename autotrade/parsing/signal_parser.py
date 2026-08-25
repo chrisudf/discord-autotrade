@@ -22,7 +22,11 @@ from autotrade.parsing.close_parser import (
     _OUT_BARE_SYM_PATTERN,
     _OUT_FRACTION_PATTERN,
     _OUT_PCT_PATTERN,
+    _OUT_REST_PATTERN,
+    _RUNNERS_ONLY_PATTERN,
+    _TOOK_OFF_PATTERN,
     _ZH_OUT_FRACTION_PATTERN,
+    _ZH_RUNNERS_ONLY_PATTERN,
 )
 from autotrade.utils.logger import logger
 
@@ -188,11 +192,22 @@ CHINESE_MARKERS = ["美股会员网rich", "美股会员网机器人"]
 #      会被错换成"用 $3.50 买 $4.00 行权价"。数量级差挡住它（4.00 < 35 → 不换，
 #      原样留给区间 pre-filter 正确拦下）；真信号绰绰有余（DELL 530 ≥ 35、
 #      AAOI 98 ≥ 7）。
+# 行权价与 calls/puts 之间的填充词段（"$252.50 SCALP calls"、"$80 weekly calls"）。
+# [8/21 实锤丢单] enrich "$MRVL $252.50 SCALP***** calls $1.69 weekly" 双语双漏——
+# 这一段原本是 `(?:[a-z0-9]+\s+){0,3}?`，只收字母数字，而 enrich 用尾随星号做强调
+# 是惯用写法（SCALP*****＝重点关注），**一个星号就足以让整条信号消失**。
+# 当晚 KC 自己报 two baggers(+100%)，按 2 张估算漏掉约 $338。
+#
+# 只放开"单词后面跟一串强调星号"这一种形状（`\*{0,8}`），不把 `*` 塞进字符类——
+# 后者会让裸 `***` 也算合法填充词，等于把任意分隔符都当成填充，召回面放得太宽。
+# 上限 8 个纯属够用即可；enrich 实测最多五个。
+_STRIKE_SIDE_GAP = r"(?:[a-z0-9]+\*{0,8}\s+){0,3}?"
+
 _INVERTED_PRICE_STRIKE_RE = re.compile(
     r"\$(\.\d+|\d+\.\d+)"                             # $PRICE（必须带小数点）
     r"[\s\-–—]+"                                      # 空白 / 字段分隔破折号（含中文全角）
     r"\$(\d+(?:\.\d+)?)"                              # $STRIKE
-    r"(\s*(?:[a-z0-9]+\s+){0,3}?(?:calls?|puts?))",   # [填充词] calls/puts
+    r"(\s*" + _STRIKE_SIDE_GAP + r"(?:calls?|puts?))",   # [填充词] calls/puts
     re.IGNORECASE,
 )
 
@@ -502,6 +517,7 @@ def _try_pattern_a(text: str, today: date):
 _B_PRICE_GAP = r"[^\$]*?"
 
 
+
 def _b_match(pattern, text: str, price_group: int):
     """B 系列共用：finditer + 限定价护栏，返回第一个喊价可信的 match。
 
@@ -541,7 +557,7 @@ def _try_pattern_b(text: str, today: date):
     p_mmdd = re.compile(
         r"\$([A-Z]{1,5})\b"
         r"[^\$\n]*?(\d{1,2})/(\d{1,2})"
-        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
+        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*" + _STRIKE_SIDE_GAP + r"(calls?|puts?)"
         + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
     )
@@ -578,7 +594,7 @@ def _try_pattern_b(text: str, today: date):
     p_month_name = re.compile(
         rf"\$([A-Z]{{1,5}})\b"
         rf"[^\$\n]*?({MONTH_NAMES_RE})\s+(\d{{1,2}})(?:st|nd|rd|th)?"
-        rf"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){{0,3}}?(calls?|puts?)"
+        rf"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*" + _STRIKE_SIDE_GAP + r"(calls?|puts?)"
         + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
     )
@@ -605,7 +621,7 @@ def _try_pattern_b(text: str, today: date):
     p_dte_first = re.compile(
         r"\$([A-Z]{1,5})\b"
         r".*?(\d+)DTE"
-        r".*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
+        r".*?\$(\d+(?:\.\d+)?)\s*" + _STRIKE_SIDE_GAP + r"(calls?|puts?)"
         r".*?\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE | re.DOTALL,
     )
@@ -631,7 +647,7 @@ def _try_pattern_b(text: str, today: date):
     # ----- B1b: $SYMBOL $STRIKE calls NDTE $PRICE -----
     p_dte_mid = re.compile(
         r"\$([A-Z]{1,5})\b"
-        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
+        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*" + _STRIKE_SIDE_GAP + r"(calls?|puts?)"
         r"[^\$\n]*?(\d+)DTE"
         + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
@@ -656,7 +672,7 @@ def _try_pattern_b(text: str, today: date):
     # ----- B2: $SYMBOL [weekly] $STRIKE calls/puts $PRICE （无日期） -----
     p_weekly = re.compile(
         r"\$([A-Z]{1,5})\b"
-        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
+        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*" + _STRIKE_SIDE_GAP + r"(calls?|puts?)"
         + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
     )
@@ -681,7 +697,7 @@ def _try_pattern_b(text: str, today: date):
     p_alt = re.compile(
         r"\$([A-Z]{1,5})\b"
         r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*"
-        r"\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
+        r"\s*" + _STRIKE_SIDE_GAP + r"(calls?|puts?)"
         r"[^\$\n]*?(\d{1,2})/(\d{1,2})"
         + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
@@ -987,7 +1003,9 @@ STRONG_CLOSE_RE = re.compile(
     # 双双漏掉，两个都是我们的持仓）。只认现在时/祈使——过去式 "locked in 200%"
     # 是 recap，不匹配。
     r"|\block(?:ing)?\s+(?:them\s+|these\s+|it\s+|profits?\s+)?(?:all\s+)?(?:in|on)\b"
-    r"|减仓|平仓|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空|减持|缩减至|缩减到|出清"
+    # 8/19 SPY："平掉剩余SPY仓位" 整句无动词命中 → 连 CLOSE 都没路由到
+    # （EN 孪生 "out the rest of SPY" 同时漏）。与 close_parser.ZH_ACTION_VERBS 同步。
+    r"|减仓|平仓|平掉|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空|减持|缩减至|缩减到|出清"
     # 7/23 实测：enrich ZH 孪生 "$NBIS - 出半"（EN "Out half"）没进 CLOSE 路由，
     # 落到 OPEN 解析失败。EN 侧 WEAK_CLOSE_RE 一直认 "out half"，双语不对称。
     # 两侧边界与 close_parser.ZH_OUT_HALF_RE 保持一致（对抗评审两轮实锤）：
@@ -1002,7 +1020,13 @@ STRONG_CLOSE_RE = re.compile(
     # 而 ZH 独有的 OPEN_INTENT 误否决过一次（7/15 "all out" 案例）。
     # 只认带"半"的组合，与 close_parser.ZH_ACTION_VERBS 的收词口径一致。
     + r"|削减一半|削减半"
-    + r"|锁定",
+    + r"|锁定"
+    # 8/20 SPY/MSFT："仅持仓X @ 3.28" 是 KC "runners only" 的机翻，语义是
+    # **已经减到只剩 runner**，而 `持仓` 在 SKIP_KEYWORDS 里 → OPEN 路径直接
+    # 判成 holding 跳过（当晚出现 3 次全漏）。进 STRONG 的理由同"出半"/"削减一半"：
+    # ZH 机翻句里几乎不会夹开仓意图词，而 OPEN_INTENT 一票否决误伤过一次。
+    # pattern 与 close_parser 共用同一份常量（要求跟 @价格，见那里的注释）。
+    + r"|" + _ZH_RUNNERS_ONLY_PATTERN,
     re.I,
 )
 WEAK_CLOSE_RE = re.compile(
@@ -1028,6 +1052,14 @@ WEAK_CLOSE_RE = re.compile(
     # 放 WEAK：原文里 "I will hold a 1% lotto position" 这类措辞常与开仓意图
     # 混排，保留 OPEN_INTENT 一票否决（宁漏平不误平）。
     + r"|" + _CHOP_HALF_PATTERN
+    # 8/18 AMZN + 8/19 SPY："out the rest of X" 撞上 _OUT_BARE_SYM_STOPWORDS
+    # 里的 THE；"took another off at 1.98" 没有任何动词命中；
+    # 8/20 SPY/MSFT："runners only X @ 3.28" 同样不在词表。
+    # 三份 pattern 都 import 自 close_parser，路由与解析同进同退。
+    # 放 WEAK 而非 STRONG：保留 OPEN_INTENT 一票否决（宁漏平不误平）。
+    + r"|" + _OUT_REST_PATTERN
+    + r"|" + _TOOK_OFF_PATTERN
+    + r"|" + _RUNNERS_ONLY_PATTERN
     + r"|\bselling\b"
     r"|\bscaling\s+down\b",
     re.I,

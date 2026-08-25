@@ -41,6 +41,23 @@ from autotrade.position.sell_executor import (
 from autotrade.utils.logger import logger
 
 
+def _has_lone_day_trade() -> bool:
+    """当前活仓里恰好只有一个 day_trade —— 无 ticker 的 trim 指向它没有歧义。
+
+    只用于决定"要不要发提醒 TG"，不参与选仓下单。异常一律当 False
+    （告警是锦上添花，不能因为它把 close 主链路带崩）。
+    """
+    try:
+        day_trades = [
+            p for p in position_mgr.get_open_positions()
+            if "day_trade" in (p.get("tags") or []) or p.get("eod_force_close")
+        ]
+        return len(day_trades) == 1
+    except Exception:
+        logger.exception("[CLOSE] _has_lone_day_trade failed, 按 False 处理")
+        return False
+
+
 # ============================================================
 # CLOSE 信号处理
 # ============================================================
@@ -73,9 +90,11 @@ async def handle_close_signal(
         # EN 原文判定"不是平仓指令"要留痕，供 60s 内的 ZH 机翻孪生查
         # （8/3 SPY 误平，见 heuristics._close_is_zh_twin_of_skipped_en）
         _record_close_skip(channel_id, raw, open_symbols)
-        # 只对"含 ticker + 价格 hint"的发 TG：捕获真漏检（如 ZH 公司名映射失败）
-        # 过滤无 ticker 的 follow-up close（如 "trim runners here at 3.45"）
-        if _looks_like_close_attempt(raw):
+        # 只对"含 ticker + 价格 hint"的发 TG：捕获真漏检（如 ZH 公司名映射失败）。
+        # 无 ticker 的 follow-up（"trim runners here at 3.45"）原本一律 silence ——
+        # 但**全库只有一个 day_trade 活仓**时它毫无歧义，也发（8/19-8/20 连吃三晚，
+        # 见 _looks_like_close_attempt 的注释）。只提醒不下单。
+        if _looks_like_close_attempt(raw, lone_day_trade=_has_lone_day_trade()):
             await _safe_notify(format_close_skipped("parser skipped (recap/no-symbol)", raw))
         return
 

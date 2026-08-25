@@ -33,6 +33,20 @@ from autotrade.notify.messages import format_error
 from autotrade.storage import positions_db
 from autotrade.utils.logger import logger
 
+# 成交价合理性闸门。
+# [8/20 TSLA 实锤] US.TSLA260828C470000 限价 2.97 提交成功，broker 回报
+# filled_avg_price=**0.13**（偏离 95.6%），本函数此前只判 `dealt > 0` 就照单回填
+# → DB 里躺着一个"成本 $26、实际花了 $594、无止损、无有效报价"的仓位，
+# 任何基于 DB 的盈亏统计都会把它算成暴赚。同一晚 04:41 该合约还出现
+# `[CLOSE] no price ref, skipping sell` —— 两条现象同指一个根因：这个合约
+# 拿不到 OPRA 报价，回来的成交价是垃圾值。
+#
+# 上界 1.05：限价单不该成交在限价之上，留 5% 给手续费/报价口径差异。
+# 下界 0.50：真实的好成交（8/21 UBER 限价 0.50 实际吃到 0.37，-26%）必须放过，
+# 但 -95% 这种数量级的必须拦下。越界 = **拒绝回填 + 告警**，不是照收。
+_DEALT_MAX_RATIO = 1.05
+_DEALT_MIN_RATIO = 0.50
+
 # moomoo order_status 终态
 _FILLED_STATUSES = {"FILLED_ALL"}
 # 不会再变成 FILLED 的失败终态 → 立即告警不用等超时
@@ -79,11 +93,53 @@ async def confirm_buy_fill(order_id: str, option_code: str, qty: int, limit_pric
         res = await _poll_until_terminal(order_id)
         if res["outcome"] == "filled":
             dealt = res.get("filled_avg_price") or 0.0
+            # [ROADMAP P1 #14 (a)] filled 分支无论走哪条都留一行。
+            # 原来只在 dealt != limit 时才打日志，成交价正好等于限价就静默 return
+            # —— "什么都没有" 和 "压根没跑" 在日志上无法区分（8/13 MU 那单全日志
+            # 零 [fill] 行，同晚 ASTS/SPCX 都在 15s 内出了 FILL_ADJUST）。
+            # 8/20 CRWV 88P 也踩过同一处：复盘要靠"四笔有 FILL_ADJUST、一笔没有"
+            # 才能反推它是正常成交而不是任务没跑。
+            logger.info(
+                f"[fill] buy {option_code} filled dealt_avg={dealt:.2f} "
+                f"(limit {limit_price:.2f}) order={order_id}"
+            )
             if dealt > 0 and abs(dealt - limit_price) > 1e-9:
-                if positions_db.adjust_entry_price(option_code, qty, dealt):
+                lo = limit_price * _DEALT_MIN_RATIO
+                hi = limit_price * _DEALT_MAX_RATIO
+                if limit_price > 0 and not (lo <= dealt <= hi):
+                    # 拒绝回填：DB 里留着限价（偏高但量级正确），
+                    # 好过写进一个把成本基准打穿的垃圾值。
+                    logger.error(
+                        f"[fill] buy {option_code} dealt_avg={dealt:.2f} 偏离限价 "
+                        f"{limit_price:.2f} 超出闸门 [{lo:.2f}, {hi:.2f}] —— "
+                        f"拒绝回填 avg_entry，order={order_id}"
+                    )
+                    await send_telegram(format_error(
+                        "成交价异常，拒绝回填成本",
+                        f"{option_code} order={order_id}\n"
+                        f"限价 ${limit_price:.2f} → broker 回报成交 ${dealt:.2f}"
+                        f"（偏离 {abs(dealt - limit_price) / limit_price * 100:.0f}%）\n"
+                        f"avg_entry 保持 ${limit_price:.2f} 未动。"
+                        f"该合约很可能取不到报价 —— 请核对 moomoo 成交明细，"
+                        f"并确认 SL/TP/EOD 还能不能给它取到价"
+                    ))
+                    return
+                if positions_db.adjust_entry_price(
+                    option_code, qty, dealt, assumed_price=limit_price
+                ):
                     logger.info(
                         f"[fill] buy {option_code} dealt_avg={dealt:.2f} "
                         f"(limit {limit_price:.2f}) → avg_entry 已回填"
+                    )
+                else:
+                    # [8/18 SPCX] 此前这里是静默 return —— 加仓必然走到这条分支，
+                    # 日志里一个字都没有，只能靠"四笔有 FILL_ADJUST、一笔没有"
+                    # 反推。成本基准没修对是要进 TP 阶梯的，不许再无声。
+                    logger.warning(
+                        f"[fill] buy {option_code} dealt_avg={dealt:.2f} "
+                        f"(limit {limit_price:.2f}) **未回填** —— 仓位不在 "
+                        f"OPEN/PARTIAL，或 qty_total < 本单张数（qty={qty}）。"
+                        f"avg_entry 仍是限价，order={order_id}"
                     )
             return
         if res["outcome"] == "dead":

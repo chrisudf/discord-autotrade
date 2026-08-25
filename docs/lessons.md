@@ -1170,6 +1170,86 @@ python -m autotrade.ops.show_today
 python -m autotrade.diag.diag_handle_message_real
 ```
 
+## 25. Fixing a miss can arm a landmine that never had a chance to go off
+
+**Symptom**: 8/18. `out the rest of AMZN to secure small green trade ✅ Price has
+on just about everything outside memory stocks has been slow and boring.` had
+been failing to parse for weeks — the close was silently missed and the position
+rode to EOD. The fix was small and obviously right: teach the parser the phrase
+`out the rest`.
+
+With that one line, the same message stopped being a miss and became this:
+
+```
+{'kind': 'BULK_TRIM', 'symbols': [], 'pct': 100, ...}
+```
+
+**Sell every open position at 100%.** The word `everything` — sitting in a clause
+of market commentary at the end of the sentence — was in `BULK_MARKERS`, and
+`_has_bulk_marker` scanned the whole message. That branch had simply never been
+reachable for this message, because parsing failed two steps earlier.
+
+**Why non-obvious**: the dangerous code was not touched, not new, and not wrong
+in isolation — `everything` is a perfectly good bulk marker in
+`sell everything here`. What changed was *reachability*. A defect that lives
+downstream of a failing gate is invisible in production and invisible in tests,
+because nothing ever gets far enough to reach it. Fixing the gate is what ships it.
+
+The general shape: **when you fix a parse failure you are not adding one code
+path — you are enabling every path downstream of it at once, none of which has
+ever run on this input.** The 8/18 message had been exercising exactly one branch
+(`return None`) for its entire life.
+
+Practical consequence for this repo: a fix that turns "no signal" into "signal"
+on the money path needs its **downstream** asserted, not just its parse result.
+The regression for this one asserts `kind == "CLOSE"` and `symbols == ["AMZN"]`,
+not merely that the message parses.
+
+---
+
+## 26. A fill confirmation from the broker can be a number that never existed
+
+**Symptom**: 8/20, 02:57. `US.TSLA260828C470000` submitted at limit 2.97,
+`[Risk] cost=$594`. Fifteen seconds later:
+
+```
+[fill] buy US.TSLA260828C470000 dealt_avg=0.13 (limit 2.97) → avg_entry 已回填
+```
+
+The position's cost basis was overwritten with **0.13** — a 95.6% deviation from
+a limit order's limit price, which is arithmetically impossible for a real fill
+(a limit buy fills at or below the limit, not at 4% of it). The DB then held a
+position that cost $594 and claimed to cost $26, with no stop loss. Every P&L
+number derived from that row was wrong, and wrong in the flattering direction.
+
+The corroborating evidence arrived two hours later, on the same contract:
+
+```
+04:41  [CLOSE] no price ref for US.TSLA260828C470000, skipping sell (33%)
+```
+
+while `PLTR` in the same message got a quote fine (`quote_ref=0.95`). Both
+symptoms have one cause: **this contract had no working OPRA quote**, and the
+"filled average price" the broker returned for it was garbage rather than an
+error.
+
+**Why non-obvious**: the code did check the field — `if dealt > 0`. The trap is
+that the bad value was *positive, finite, and plausible-looking in isolation*.
+Nothing in the SDK signals "this number is not a price": no error code, no NaN,
+no exception. The only way to know 0.13 is wrong is to compare it against
+something you already knew — the limit price you submitted.
+
+The general rule: **a value that came back successfully is not a value that is
+true.** Any number from an external system that will be written to the money path
+needs a sanity band derived from a value you control, not just a null check.
+Here the band is `[limit × 0.50, limit × 1.05]` — the upper bound because a limit
+buy cannot fill above its limit, the lower bound wide enough to admit genuinely
+good fills (8/21: UBER limit 0.50, actual 0.37, −26%, real and correct).
+
+When it fails the band, the right move is **refuse and alert**, not clamp or
+accept. Keeping the limit price in the DB is knowingly a little high; accepting
+0.13 is knowingly wrong by 20×.
+
 ---
 
 # Lesson → 回归测试映射表
@@ -1204,6 +1284,8 @@ python -m autotrade.diag.diag_handle_message_real
 | 22 | tag 被解析/落库/展示 ≠ tag 有行为；write-only 字段是下一个人的陷阱 | 策略层：`test_overnight_0803.py::test_day_trade_forces_eod_close`、`::test_eod_force_matrix_otherwise_unchanged`（整张矩阵，防"新 flag 只改一个分支"复发）、`::test_zero_dte_unchanged`、`::test_open_signal_with_day_trade_still_routes_open`。**消费端**（缺了它前两层全是空转）：`test_watchers.py::test_eod_closes_day_trade_before_its_expiry`（契约翻转，前身断言相反行为）、`::test_eod_skips_future_expiry_without_force_flag`（反向安全属性：在途 swing 不许被碰）、`::test_eod_force_closes_weekly_expiring_today`（expiry 那条独立入选路径不受影响） |
 | 23 | 拒单不留状态 = 无限循环；告警通道比日志先被淹 | 熔断：`test_tp_retry_guard.py::test_naked_short_reject_trips_after_one_attempt`（100 轮只打 1 次 broker）、`::test_transient_reject_backs_off_then_trips`、`::test_trip_is_scoped_to_one_contract_and_tier`、`::test_success_clears_backoff_state`。**不变量**：`::test_naked_short_reject_trips_after_one_attempt` 断言 `tp_hits` 保持 0（熔断不许把没落袋的止盈标记成已完成）。告警节流：`::test_naked_short_alert_is_sent_once_with_reconcile_hint`。日志收敛：`::test_log_throttled_*`（4 个）。自动落账三道闸门：`test_0016_reconciler.py::test_auto_close_*`（6 个，含 `::test_auto_close_vetoed_when_broker_returns_empty` —— 空查询不许清空全部活仓）。**幻影仓入口（`confirm_buy_fill` 的静默分支 + 限价/市价偏离闸门）尚未修**，见 ROADMAP P1 #14 |
 | 24 | 只修双语管线的一侧 = 没修 | `test_overnight_0814.py::test_zh_still_holding_recap_is_not_a_close`（当晚原文）、`::test_en_twin_stays_correct`（另一侧不许被带坏）、`::test_recap_markers_block_close`（6 个词形）、`::test_holding_recap_is_not_an_open_signal`（开仓路径同批补）。**反向护栏**：`::test_real_close_signals_still_parse`（4 个真指令不许误伤）、`::test_buy_and_hold_phrasing_still_opens`（裸"持有"没进表）。同族前案见 #21 与 `test_overnight_0810.py` |
+| 25 | 修一个漏平会踩响一颗从没触发过的雷（变的是可达性） | `test_overnight_0818_0824.py::test_out_the_rest_does_not_become_bulk_trim`（下游断言：必须是 CLOSE `['AMZN']` 而不是 BULK_TRIM 100%）、`::test_bulk_marker_requires_close_verb_object`（4 个 case，真 bulk 不许被误伤）。**不变量**：修 parse 失败时断言的是**下游结果**，不是「能解析了」 |
+| 26 | broker 回来的成交价可以是个从未存在过的数字 | `test_fill_checker.py::test_buy_fill_rejects_absurd_dealt_price`（限价 2.97 / 回报 0.13 → 拒绝回填 + 告警）、`::test_buy_fill_accepts_a_genuinely_good_fill`（反向：UBER 限价 0.50 实成 0.37 必须放过）、`::test_buy_fill_reprices_only_its_own_leg_after_addon`（加仓按腿重算，前身断言的是保守跳过）|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |

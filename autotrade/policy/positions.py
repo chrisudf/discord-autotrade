@@ -9,10 +9,44 @@
 import math
 from datetime import date
 
+from autotrade.utils.envcfg import env_int
 from autotrade.utils.logger import logger
 
 
 # ============ 类目判定 ============
+
+# weekly 的 DTE 上界。**这是本仓库唯一决定"这笔仓位有没有止损"的数字。**
+#
+# [8/22 实锤 -$976] ASTS 80C 和 AMD 520C 都是 8/13 开仓、8/21 到期，
+# **DTE = 8** —— 比原来的上界 7 多一天，于是归到 swing、apply_sl=False，
+# 接下来八天里没有止损、没有 TP 触发、没有喊单员的离场信号，一路走到归零
+# （ASTS -$436 卖在 0.01，AMD -$540 连报价都取不到直接过期）。
+# 这两笔加起来超过那一周其余所有盈亏之和，而亏的原因不是看错方向，
+# 是**没有任何规则去管它们**。
+#
+# 一个 8 天后到期的合约不是 swing，是"提前一天买的 weekly"。上界抬到 10 天，
+# 让"下周五到期"这一整类回到 50% 止损的保护范围内
+# （周一开、下周五到期 = DTE 11 仍算 swing；周三开、下周五到期 = DTE 9 算 weekly）。
+#
+# ---------------------------------------------------------------------------
+# **10 是拍板值，不是回测值**（2026-08-25 确认保持）。它解决的是 8/22 那两笔
+# 「差一天掉出保护范围」的具体事故，**没有**任何数据说明 10 比 9 或 12 更优。
+# 换句话说：这个数字现在的依据是一个样本，n=2。
+#
+# 什么时候该回来改它 —— 见 ROADMAP P2「WEEKLY_MAX_DTE 的取值要回测」：
+#   1. 攒够两三个月的 `position_events`，按开仓时 DTE 分桶统计
+#      「触发过 SL 的比例 / SL 触发后到期时的价格」，看 8-14 天这一段
+#      到底是"被止损救了"还是"被止损割在地板上"；
+#   2. 如果 8-14 天这段的 SL 大多是割在低点（喊单员的 weekly 常常先跌后拉），
+#      那正确的修法不是调这个数字，而是给这一段**单独一条更宽的止损线**
+#      （现在 weekly 与它共用 50%）；
+#   3. 真正的 swing（DTE 30+，如 TSLA 380C / AVGO 450C）**依旧完全裸奔**，
+#      那是 max_loss_pct 硬底的事，与本常量无关，别混在一起改。
+#
+# 在上面第 1 步的数据出来之前，**不要凭手感调这个值**。改它等于改风控口径。
+# 需要临时试验用 env `WEEKLY_MAX_DTE=` 覆盖，别改默认值。
+# ---------------------------------------------------------------------------
+WEEKLY_MAX_DTE = env_int("WEEKLY_MAX_DTE", 10, minimum=0)
 
 def categorize(
     expiry_d: date, today_et: date, tags: list[str]
@@ -28,16 +62,20 @@ def categorize(
         (category, apply_sl, eod_force_close)
 
     决策矩阵（eod_force 另见下方 day_trade 覆盖）：
-        DTE  | lotto | category    | apply_sl | eod_force
-        -----+-------+-------------+----------+----------
-        0    | no    | 0dte        | False    | True
-        0    | yes   | 0dte_lotto  | False    | True   ← 必过期，强平
-        1-7  | no    | weekly      | True     | False
-        1-7  | yes   | lotto       | False    | False  ← 彩票放飞
-        8+   | any   | swing       | False    | False
+        DTE            | lotto | category    | apply_sl | eod_force
+        ---------------+-------+-------------+----------+----------
+        0              | no    | 0dte        | False    | True
+        0              | yes   | 0dte_lotto  | False    | True   ← 必过期，强平
+        1..WEEKLY_MAX  | no    | weekly      | True     | False
+        1..WEEKLY_MAX  | yes   | lotto       | False    | False  ← 彩票放飞
+        WEEKLY_MAX+1.. | any   | swing       | False    | False
+
+        WEEKLY_MAX_DTE 默认 10（8/22 之前是硬写的 7，见该常量注释里的 $976）。
 
     TODO: lotto 实测后看要不要加 max_loss_pct（比如 -80% 硬底）
-    TODO: swing 8-20 是否细分，独立测一段时间数据
+    TODO: swing 仍然完全没有下行保护。抬 WEEKLY_MAX_DTE 只覆盖了"临近到期"
+          那一段；真正的 swing（DTE 30+，如 TSLA 380C / AVGO 450C）依旧裸奔。
+          max_loss_pct 硬底需要单独回测。
     """
     dte = (expiry_d - today_et).days
     if dte < 0:
@@ -61,7 +99,7 @@ def categorize(
         return ("0dte_lotto" if is_lotto else "0dte"), False, eod_force
     if is_lotto:
         return "lotto", False, eod_force
-    if dte <= 7:
+    if dte <= WEEKLY_MAX_DTE:
         return "weekly", True, eod_force
     return "swing", False, eod_force
 

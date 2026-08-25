@@ -323,15 +323,36 @@ def _looks_like_addon_attempt(text: str) -> "str | None":
 _ZH_TICKER_HINTS = ("亚马逊", "微软", "特斯拉", "苹果", "英伟达", "谷歌", "脸书", "网飞")
 
 
-def _looks_like_close_attempt(text: str) -> bool:
-    """close_parser 返回 None 但文本里有 ticker + 价格-like → 值得 TG（可能漏接）
+def _looks_like_close_attempt(text: str, lone_day_trade: bool = False) -> bool:
+    """close_parser 返回 None 但看着像漏接的平仓指令 → 值得 TG。
 
-    "can trim some runners here at 3.45" 这种没 ticker 的 follow-up → silence
+    两条路径都要求**价格 hint**（$X / @X / d.dd）：
+
+    1. 文本里有 ticker —— 原有判据，捕获 ZH 公司名映射失败那类真漏检。
+    2. `lone_day_trade`：文本里没有 ticker，**但当前全库只有一个 day_trade 活仓**
+       —— 无歧义，喊单员省略 ticker 就是在说那一个。
+
+    第 2 条是 8/19～8/20 连吃三晚的缺口。原来只有第 1 条，"没 ticker 的
+    follow-up 一律 silence"，结果：
+
+      8/19 00:35  "small safety trim @ 2.60 to de-risk after the 2.20 add"
+      8/20 00:34  "small trim @ 2.60"
+      8/20 00:37  "BANG! Out half 2.80 💰"
+      8/20 00:39  "BANG! Out majority @ 3.05 🚀"
+
+    四条全是对当时唯一那个 day_trade 仓位（SPY）说的，全部静默丢弃、
+    一条 TG 都没发 —— 8/20 那晚 KC 从 2.60 一路减到 3.45，我们一动没动，
+    第二张一直拿到 EOD 的 1.71。
+
+    **只提醒不下单**：放宽的是告警面，不是自动下单面。误平的代价远大于漏平
+    （见 close_parser 顶部注释），要不要跟由人决定。
     """
     if not text:
         return False
     text = _strip_bot_noise(text)
-    has_ticker = bool(_OPEN_TICKER_RE.search(text)) or any(t in text for t in _ZH_TICKER_HINTS)
     # 价格-like：$X / @X / 任何 d.dd（不用 \b 边界，因为中文+数字无 word boundary）
     has_price_hint = bool(_re.search(r"\$\.?\d|@\s*\.?\d|\d+\.\d{1,2}", text))
-    return has_ticker and has_price_hint
+    if not has_price_hint:
+        return False
+    has_ticker = bool(_OPEN_TICKER_RE.search(text)) or any(t in text for t in _ZH_TICKER_HINTS)
+    return has_ticker or lone_day_trade

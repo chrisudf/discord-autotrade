@@ -79,9 +79,12 @@ async def test_eod_no_quote_retries_every_tick_but_tg_throttled():
 
     assert q.call_count == 3          # 每 tick 都重试(老代码 tick2/3 直接被 backoff 跳过)
     sell.assert_called_once()         # 报价恢复当刻立即强平
-    # no-quote TG 只发一次(节流);之后是成交通知
+    # 本仓位 expiry == today(0dte) → **到期日不节流**,两个 no-quote tick 各喊一次。
+    # [8/22 AMD 520C -$540] 到期日的强平窗口一天只有一次机会,30min 节流意味着
+    # 整个窗口只喊一声,而那声发在本地凌晨。非到期日的节流见下一条用例。
     noquote_calls = [c for c in tg.await_args_list if "无报价" in str(c)]
-    assert len(noquote_calls) == 1
+    assert len(noquote_calls) == 2
+    assert all("到期日" in str(c) for c in noquote_calls)
 
     assert positions_db.get(code)["status"] == "CLOSED"
     eod_watcher._skip_until.pop(code, None)
@@ -178,3 +181,38 @@ def test_out_pct_variants():
     assert parsed is not None and parsed["pct"] == 50
     # 无持仓白名单外的裸 ticker 不受影响(依赖 $ 前缀或白名单,原语义)
     assert parse_close("Out 30% more", set()) is None
+
+
+@pytest.mark.asyncio
+async def test_eod_no_quote_tg_still_throttled_when_not_expiry_day():
+    """非到期日(day_trade 的 eod_force_close)→ TG 仍按 30min/code 节流。
+
+    7/25 定的节流是为了防刷屏,那条约束对"明天还有机会"的仓位依然成立;
+    只有到期日才升级成每 tick 都喊(见上一条用例)。
+    """
+    now_et = _trading_now_et()
+    code = "US.EODNT260930C100000"
+    positions_db.open_or_add(
+        option_code=code, symbol="EODNT", strike=100.0, side="CALL",
+        expiry=now_et.date() + timedelta(days=37), qty=1, fill_price=1.00,
+        category="swing", apply_sl=False, eod_force_close=True,
+        tags=["day_trade"], channel_name="ut", msg_id="ut-eodnt",
+    )
+    eod_watcher._skip_until.pop(code, None)
+    eod_watcher._alerted_until.pop(code, None)
+
+    with patch("autotrade.position.eod_watcher.get_last_price", return_value=None), \
+         patch("autotrade.position.eod_watcher.place_sell_order") as sell, \
+         patch("autotrade.position.eod_watcher.send_telegram", new_callable=AsyncMock) as tg, \
+         patch("autotrade.position.eod_watcher._is_eod_window", return_value=True), \
+         patch("autotrade.position.eod_watcher.sweep_expired_and_notify",
+               new_callable=AsyncMock):
+        await eod_watcher._eod_tick(now_et)
+        await eod_watcher._eod_tick(now_et + timedelta(seconds=30))
+
+    sell.assert_not_called()
+    noquote_calls = [c for c in tg.await_args_list if "无报价" in str(c)]
+    assert len(noquote_calls) == 1
+    assert "到期日" not in str(noquote_calls[0])
+
+    positions_db.record_close(code, 1, 0.5, "manual", note="ut cleanup")
