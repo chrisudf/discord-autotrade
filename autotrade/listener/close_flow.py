@@ -6,6 +6,7 @@
 """
 import asyncio
 import os
+from datetime import date, datetime, timezone
 
 from autotrade.broker.quote import get_sell_ref_price
 from autotrade.broker.trade import place_sell_order
@@ -28,6 +29,7 @@ from autotrade.notify.transport import _safe_notify
 from autotrade.parsing.close_parser import parse_close
 from autotrade.policy.positions import strategy_b_decision
 from autotrade.utils.envcfg import env_float
+from autotrade.utils.timeutil import ET_TZ, today_et
 from autotrade.policy.pricing import calc_sell_limit
 from autotrade.position import fill_checker
 from autotrade.position import manager as position_mgr
@@ -41,22 +43,57 @@ from autotrade.position.sell_executor import (
 from autotrade.utils.logger import logger
 
 
-def _has_lone_day_trade() -> bool:
-    """当前活仓里恰好只有一个 day_trade —— 无 ticker 的 trim 指向它没有歧义。
+def _has_lone_fresh_position() -> bool:
+    """当前活仓里**今天（ET）新开的**恰好只有一个 —— 无 ticker 的 trim 指向它没有歧义。
 
     只用于决定"要不要发提醒 TG"，不参与选仓下单。异常一律当 False
     （告警是锦上添花，不能因为它把 close 主链路带崩）。
+
+    [8/26 实测：判据从 day_trade 改成"当日新开"]
+    前身 `_has_lone_day_trade` 只认 `day_trade` tag 或 `eod_force_close`。
+    8/25 那晚 KC 对 NVDA 连喊三次减仓，前两条没写 ticker：
+
+        23:48  "trimmed a few @ 2.72, will trim out half at 214.50-215 stock price"
+        23:49  "trimmed more 2.82"
+
+    而 NVDA 那单是 `FAFO LOTTO`（tags=['lotto','fafo']、eod_force_close=False）
+    → 旧判据命中不了 → 和补丁上线前一模一样地静默，一条 TG 都没发，
+    我们只执行了第三条（23:52 "out half NVDA 3.05"）。
+
+    当时全库 4 个活仓，其中 3 个是 8/14-8/22 的陈年仓位，**只有 NVDA 是刚开
+    5 分钟、喊单员正在连续谈论的那个**。"唯一的 day_trade" 抓不住这种情形，
+    "唯一的当日新开仓"才抓得住 —— 喊单员省略 ticker 时说的必然是刚开的那个，
+    不会是三周前的陈仓。
+
+    口径按 **ET 日期**（与 EOD / risk 的 date 口径一致），不是本机日期：
+    本地 8/26 00:32 开的仓，ET 还是 8/25，喊单员当时说的就是它。
     """
     try:
-        day_trades = [
+        today = today_et()
+        fresh = [
             p for p in position_mgr.get_open_positions()
-            if "day_trade" in (p.get("tags") or []) or p.get("eod_force_close")
+            if _opened_on_et(p.get("opened_at"), today)
         ]
-        return len(day_trades) == 1
+        return len(fresh) == 1
     except Exception:
-        logger.exception("[CLOSE] _has_lone_day_trade failed, 按 False 处理")
+        logger.exception("[CLOSE] _has_lone_fresh_position failed, 按 False 处理")
         return False
 
+
+def _opened_on_et(opened_at: "str | None", today: date) -> bool:
+    """opened_at 是 UTC ISO8601（positions_db._utc_iso），转 ET 后比日期。
+
+    解析不了就当 False —— 宁可不发提醒，也不要让一行坏数据把主链路带崩。
+    """
+    if not opened_at:
+        return False
+    try:
+        ts = datetime.fromisoformat(opened_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(ET_TZ).date() == today
 
 # ============================================================
 # CLOSE 信号处理
@@ -92,9 +129,9 @@ async def handle_close_signal(
         _record_close_skip(channel_id, raw, open_symbols)
         # 只对"含 ticker + 价格 hint"的发 TG：捕获真漏检（如 ZH 公司名映射失败）。
         # 无 ticker 的 follow-up（"trim runners here at 3.45"）原本一律 silence ——
-        # 但**全库只有一个 day_trade 活仓**时它毫无歧义，也发（8/19-8/20 连吃三晚，
+        # 但**全库只有一个当日新开仓**时它毫无歧义，也发（8/19-8/20 连吃三晚，
         # 见 _looks_like_close_attempt 的注释）。只提醒不下单。
-        if _looks_like_close_attempt(raw, lone_day_trade=_has_lone_day_trade()):
+        if _looks_like_close_attempt(raw, lone_day_trade=_has_lone_fresh_position()):
             await _safe_notify(format_close_skipped("parser skipped (recap/no-symbol)", raw))
         return
 

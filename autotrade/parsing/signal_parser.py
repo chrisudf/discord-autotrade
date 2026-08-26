@@ -1005,7 +1005,16 @@ STRONG_CLOSE_RE = re.compile(
     r"|\block(?:ing)?\s+(?:them\s+|these\s+|it\s+|profits?\s+)?(?:all\s+)?(?:in|on)\b"
     # 8/19 SPY："平掉剩余SPY仓位" 整句无动词命中 → 连 CLOSE 都没路由到
     # （EN 孪生 "out the rest of SPY" 同时漏）。与 close_parser.ZH_ACTION_VERBS 同步。
-    r"|减仓|平仓|平掉|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空|减持|缩减至|缩减到|出清"
+    #
+    # [8/26 补 减半 / 抛了] 这两个词 7/9 起就在 ZH_ACTION_VERBS 里，但从来没同步
+    # 到这张路由表 —— 于是 parse_close 认得、detect_action 不认得，**永远走不到
+    # 解析那一步**。8/25 实测 "减半NVDA 3.05" → detect_action=OPEN，而单独喂
+    # parse_close 能正确给出 pct=50。当晚零损失纯粹因为 EN 孪生 "out half NVDA
+    # 3.05" 早 4 秒执行了；ZH 先到（常常早 2-4 秒）的那一晚就是一次漏平。
+    # 这张表与 ZH_ACTION_VERBS 的同步现在由
+    # test_close_routing_sync.py::test_zh_parse_close_implies_close_routing 兜着。
+    r"|减仓|平仓|平掉|清仓|卖出|卖了|砍仓|砍掉|抛出|抛了|止盈|全平|清空"
+    r"|减持|减半|缩减至|缩减到|出清"
     # 7/23 实测：enrich ZH 孪生 "$NBIS - 出半"（EN "Out half"）没进 CLOSE 路由，
     # 落到 OPEN 解析失败。EN 侧 WEAK_CLOSE_RE 一直认 "out half"，双语不对称。
     # 两侧边界与 close_parser.ZH_OUT_HALF_RE 保持一致（对抗评审两轮实锤）：
@@ -1061,7 +1070,18 @@ WEAK_CLOSE_RE = re.compile(
     + r"|" + _TOOK_OFF_PATTERN
     + r"|" + _RUNNERS_ONLY_PATTERN
     + r"|\bselling\b"
-    r"|\bscaling\s+down\b",
+    r"|\bscaling\s+down\b"
+    # [8/26 扫描补漏] cut/cutting/dumped/dumping 在 close_parser.FULL_CLOSE_VERBS
+    # 里（命中即 pct=100 全平），但这两张路由表从来没有它们 —— "dumping NVDA here"
+    # 这类明确的清仓喊话**整条走 OPEN 分支**，落到 [parser] no signal 静默消失。
+    # 与 减半/抛了 是同一个病（见 STRONG_CLOSE_RE 里那段注释），只是在 EN 侧。
+    #
+    # 放 WEAK 不放 STRONG：保留 OPEN_INTENT 一票否决 ——
+    # "cutting NVDA, adding SPY" 这类混排句宁可判 OPEN（误平代价 > 漏平，
+    # 见 close_parser 顶部）。cut 用 \b 边界，"scout/circuit/haircut" 不受影响；
+    # "the Fed cut rates" 这类宏观评论还有 symbol 白名单第二道保险。
+    r"|\bcut(?:ting)?\b"
+    r"|\bdump(?:ed|ing)\b",
     re.I,
 )
 OPEN_INTENT_RE = re.compile(
