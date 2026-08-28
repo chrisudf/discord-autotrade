@@ -407,7 +407,12 @@ async def test_multi_symbol_close_hint_only_scopes_first_symbol():
     async def noop_notify(msg):
         pass
 
+    # [8/28] 多标的 + 单一喊价：@7.00 归不到具体合约（"7.00" 是 TSLA 420c 的价，
+    # 拿去给 MSFT 定限价就是 8/28 那笔 UNG→AAPL 串台的同一形状），parser 丢弃
+    # 喊价并置 price_unattributable，close_flow 落到 quote fallback。
+    # **平仓意图仍然执行** —— 不可归属的是价格不是意图，本用例的契约不变。
     with patch.object(close_flow, "_safe_notify", side_effect=noop_notify), \
+         patch.object(close_flow, "get_sell_ref_price", return_value=7.0), \
          patch.object(close_flow, "place_sell_order", side_effect=fake_sell):
         await close_flow.handle_close_signal(
             "Trimmed $TSLAM 420c and $MSFTM here @ 7.00", msg_id=55555,

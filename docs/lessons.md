@@ -1205,6 +1205,37 @@ on the money path needs its **downstream** asserted, not just its parse result.
 The regression for this one asserts `kind == "CLOSE"` and `symbols == ["AMZN"]`,
 not merely that the message parses.
 
+**Recurrence, 8/28 — and this one is worse, because the landmine was a *missing
+guard*, not a missing branch.** `$ALAB - Scale out.` had been going to the OPEN
+parser for weeks: `ACTION_VERBS` and `STRONG_CLOSE_RE` both carried only the
+`-ing` form. Adding the imperative was, again, small and obviously right.
+
+The regression that went red was `test_zh_after_clause_is_not_an_instruction`
+(8/20 PLTR):
+
+```
+I'll be swinging $PLTR $TSLA & a few $LLY runners after I scale out most.
+```
+
+On 8/20 the ZH twin of that message sold a real PLTR contract, and the fix was
+`ZH_AFTER_CLAUSE_RE`. The EN side was left alone — the postmortem note in this
+very file says *"EN 正确判 no signal"*. It was not correct. It was **empty**:
+EN reached `return None` because `scale out` was not in the verb table, not
+because any guard rejected it. The word-table hole was standing in for a guard
+that had never existed, and the note recorded the symptom as the mechanism.
+
+Adding the word removed the hole, and the same sentence became a live sell —
+caught only because 8/20's regression test existed. `EN_AFTER_CLAUSE_RE` now
+mirrors the ZH guard.
+
+So the shape has a second edge: **a passing test can be passing for a reason
+that has nothing to do with the guard you think it is testing.** When you write
+"the other language handled this correctly", check *which line* rejected it.
+"Nothing matched" and "a guard matched" look identical from the outside and
+behave completely differently the day the word table changes. (Compare #24:
+there the missing half was a word list; here it was the guard itself, hidden
+behind a word list.)
+
 ---
 
 ## 26. A fill confirmation from the broker can be a number that never existed
@@ -1252,6 +1283,75 @@ accept. Keeping the limit price in the DB is knowingly a little high; accepting
 
 ---
 
+## 27. A quoted price belongs to one contract; a sentence can mention three
+
+**Symptom**: 8/28, 02:17. KC posts a war story:
+
+```
+got so wrapped up in SPY and AAPL I didn't see that UNG order filled for 1.90
+trim as it approached the 10.75 level 😂💰 I have 6 contracts left by the way
+```
+
+The parser returned `symbols=['AAPL','UNG'] pct=33 price=1.9`, and one second
+later sold a contract:
+
+```
+[CLOSE] sell US.AAPL261016C330000 qty=1 limit=1.8 (33%, ref=signal)
+```
+
+`1.90` is **UNG's** fill. AAPL 330c was quoted by the same author at **5.80–6.00**
+in the surrounding messages. We placed a sell on AAPL at a limit derived from a
+different underlying's price, three times below market.
+
+**Why non-obvious**: three independent things all had to be reasonable.
+
+1. `AAPL` really is in the text, and it really is in our open positions — the
+   symbol whitelist did its job. It appears in `got so wrapped up in SPY and
+   AAPL`, an adverbial aside, not as the object of any verb.
+2. `trim` really is an action verb, and the message really is about a trim —
+   just one that **already happened, to someone else's order, on a different
+   ticker**.
+3. `_extract_signal_price` scopes to action sentences (`scope_en`), which is
+   more careful than most of the pipeline. It still returns a single float,
+   and the caller applies that one float to every symbol in the list.
+
+The third is the structural error and it is easy to miss when reading the code:
+`signal_price` is computed once, per message. But a price is a property of **one
+option contract**. The data model quietly assumes one message = one contract,
+which holds for the overwhelming majority of signals and fails silently and
+expensively when it doesn't. The existing test
+`test_multi_symbol_close_hint_only_scopes_first_symbol` had encoded the same
+hazard since July — `Trimmed $TSLA 420c and $MSFT here @ 7.00` applies TSLA's
+$7.00 to MSFT — and asserted it as correct behaviour.
+
+Note also what *did* work: the strike hint was already treated as
+non-transferable. `_extract_strike_hint` is deliberately scoped to `symbols[0]`
+with a comment explaining that using TSLA's 420c to filter MSFT would silently
+skip MSFT. The same reasoning applies verbatim to price, and was not applied.
+**A guard written for one attribute is evidence that its siblings need it too.**
+
+**Defense**:
+
+- `_drop_unattributable_price`: more than one symbol + a single quoted price →
+  discard the price, fall through to the per-contract quote fallback, set
+  `price_unattributable` so `close_flow` sends a TG. The close still executes —
+  what is unattributable is the *price*, not the *intent*, and refusing outright
+  would silently drop legitimate multi-symbol trims.
+- `didn't see / didn't notice / never caught` joins `RECAP_PATTERNS`. A
+  first-person statement that the author **was not watching** cannot also be an
+  instruction to follow. (First version of this regex matched only the ASCII
+  apostrophe and let the verbatim `didn’t` straight through — it passed a
+  hand-typed test and failed the real corpus line. The `will|'ll|’ll` pattern
+  three lines above had both forms already.)
+
+**General form**: when a parser extracts a scalar from a message and a list of
+targets from the same message, ask what happens when the list has length two.
+If the scalar is a property of an individual target, the answer is usually that
+you have to drop it — guessing which target it belongs to is a coin flip whose
+downside is priced in dollars.
+
+---
+
 # Lesson → 回归测试映射表
 
 每条 lesson 对应的自动回归（`tests/`，默认 `make test` 全跑）或活体检查
@@ -1284,8 +1384,9 @@ accept. Keeping the limit price in the DB is knowingly a little high; accepting
 | 22 | tag 被解析/落库/展示 ≠ tag 有行为；write-only 字段是下一个人的陷阱 | 策略层：`test_overnight_0803.py::test_day_trade_forces_eod_close`、`::test_eod_force_matrix_otherwise_unchanged`（整张矩阵，防"新 flag 只改一个分支"复发）、`::test_zero_dte_unchanged`、`::test_open_signal_with_day_trade_still_routes_open`。**消费端**（缺了它前两层全是空转）：`test_watchers.py::test_eod_closes_day_trade_before_its_expiry`（契约翻转，前身断言相反行为）、`::test_eod_skips_future_expiry_without_force_flag`（反向安全属性：在途 swing 不许被碰）、`::test_eod_force_closes_weekly_expiring_today`（expiry 那条独立入选路径不受影响） |
 | 23 | 拒单不留状态 = 无限循环；告警通道比日志先被淹 | 熔断：`test_tp_retry_guard.py::test_naked_short_reject_trips_after_one_attempt`（100 轮只打 1 次 broker）、`::test_transient_reject_backs_off_then_trips`、`::test_trip_is_scoped_to_one_contract_and_tier`、`::test_success_clears_backoff_state`。**不变量**：`::test_naked_short_reject_trips_after_one_attempt` 断言 `tp_hits` 保持 0（熔断不许把没落袋的止盈标记成已完成）。告警节流：`::test_naked_short_alert_is_sent_once_with_reconcile_hint`。日志收敛：`::test_log_throttled_*`（4 个）。自动落账三道闸门：`test_0016_reconciler.py::test_auto_close_*`（6 个，含 `::test_auto_close_vetoed_when_broker_returns_empty` —— 空查询不许清空全部活仓）。**幻影仓入口（`confirm_buy_fill` 的静默分支 + 限价/市价偏离闸门）尚未修**，见 ROADMAP P1 #14 |
 | 24 | 只修双语管线的一侧 = 没修 | `test_overnight_0814.py::test_zh_still_holding_recap_is_not_a_close`（当晚原文）、`::test_en_twin_stays_correct`（另一侧不许被带坏）、`::test_recap_markers_block_close`（6 个词形）、`::test_holding_recap_is_not_an_open_signal`（开仓路径同批补）。**反向护栏**：`::test_real_close_signals_still_parse`（4 个真指令不许误伤）、`::test_buy_and_hold_phrasing_still_opens`（裸"持有"没进表）。同族前案见 #21 与 `test_overnight_0810.py` |
-| 25 | 修一个漏平会踩响一颗从没触发过的雷（变的是可达性） | `test_overnight_0818_0824.py::test_out_the_rest_does_not_become_bulk_trim`（下游断言：必须是 CLOSE `['AMZN']` 而不是 BULK_TRIM 100%）、`::test_bulk_marker_requires_close_verb_object`（4 个 case，真 bulk 不许被误伤）。**不变量**：修 parse 失败时断言的是**下游结果**，不是「能解析了」 |
+| 25 | 修一个漏平会踩响一颗从没触发过的雷（变的是可达性） | `test_overnight_0818_0824.py::test_out_the_rest_does_not_become_bulk_trim`（下游断言：必须是 CLOSE `['AMZN']` 而不是 BULK_TRIM 100%）、`::test_bulk_marker_requires_close_verb_object`（4 个 case，真 bulk 不许被误伤）。**不变量**：修 parse 失败时断言的是**下游结果**，不是「能解析了」。**8/28 复发**（补 `scale out` 踩响 8/20 的 EN 侧防护缺口）：`test_overnight_0828.py::test_scale_out_parses_as_close` + `test_overnight_0818_0824.py::test_zh_after_clause_is_not_an_instruction`（EN_AFTER_CLAUSE_RE 就是被它逼出来的）|
 | 26 | broker 回来的成交价可以是个从未存在过的数字 | `test_fill_checker.py::test_buy_fill_rejects_absurd_dealt_price`（限价 2.97 / 回报 0.13 → 拒绝回填 + 告警）、`::test_buy_fill_accepts_a_genuinely_good_fill`（反向：UBER 限价 0.50 实成 0.37 必须放过）、`::test_buy_fill_reprices_only_its_own_leg_after_addon`（加仓按腿重算，前身断言的是保守跳过）|
+| 27 | 喊价属于**一张合约**，而一句话可以提到三个标的 | `test_overnight_0828.py::test_ung_fill_recap_does_not_close_anything`（当晚原文，两层防护任一生效即不成交）、`::test_multi_symbol_single_price_drops_the_price`（丢价不丢意图 + `price_unattributable` 标志）、`::test_first_person_negated_perception_is_recap`（3 个词形，含 Unicode 撇号）。**反向护栏**：`::test_real_instructions_survive_the_recap_rule`（条件式 see/notice 是真指令）、`::test_single_symbol_price_is_untouched`（单标的不受影响）。契约翻转：`test_listener_close.py::test_multi_symbol_close_hint_only_scopes_first_symbol` 与 `test_0015_executor.py` 的两个混合结局用例现在显式注入报价 —— 前身把「TSLA 的 $7.00 用在 MSFT 上」断言为正确行为 |
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |

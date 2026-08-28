@@ -91,6 +91,19 @@ RECAP_PATTERNS = [
     # 既有当下动作又有未来计划时整条被跳过，例如 "Out half here, will trim
     # the rest at $19" —— 宁可漏平也不误平，见模块顶部。
     re.compile(r"\b(?:will|'ll|’ll)\s+(?:be\s+)?(?:trim|cut|sell|close|dump|scale|lock)\w*"),
+
+    # [8/28 实锤，当晚唯一动了钱的一条] KC 的战报
+    # "got so wrapped up in SPY and AAPL I **didn't see** that UNG order filled
+    # for 1.90 trim ..." 被判成 CLOSE，把 AAPL 330c 卖了一张。
+    # "我没看见 / 没注意到" 是**明确的事后叙述**：作者在说自己当时不在场，
+    # 不可能同时是一条要人跟单的指令。这是本表里语义最硬的一条 recap 信号。
+    # 只收第一人称否定式，不收裸 see/notice —— "see if it holds 3.50 then trim"
+    # 这类真指令不受影响。
+    # 撇号必须同时收 ASCII ' 和 Unicode ’ —— Discord/iOS 键盘发出来的是后者。
+    # 本条第一版只写了 ASCII，手敲测试通过、当晚原文（didn’t）照样漏过去。
+    # 同一个坑：RECAP_PATTERNS 上面那条 will/'ll/’ll 早就把两种都列了。
+    re.compile(r"\b(?:i\s+)?(?:did\s*n[o']?t|didn[’']t|did\s+not|never)\s+"
+               r"(?:see|notice|catch|realize)\b", re.I),
 ]
 
 # bulk action —— 不指定 symbol，对所有持仓批量 trim
@@ -128,6 +141,13 @@ ACTION_VERBS = [
     "closing", "closed",
     "dumping", "dumped",
     "scaling out",
+    # [8/28 实锤漏平] "$ALAB - Scale out. Congrats to all!!!" —— 祈使式，
+    # 词表只有 -ing 形，整条落到 OPEN 分支的 [parser] no signal。
+    # 代价比一般漏平重：ALAB 是 category=lotto，按设计**不挂 TP、不挂 SL**
+    # （tp_watcher 的 LADDER 里没有 lotto），喊单员的平仓信号是它唯一的
+    # 主动出场路径。那条信号发出时 +300%，14 分钟后 +400%，当天到期。
+    # 中文孪生是"扩展"（scale out 的机翻误译），词表接不住，只能靠 EN 这条。
+    "scale out", "scaled out",
     "scaling down",           # 7/6 "Scaling down to 1/2 position sizing"
     "bang!", "bang -",        # KC 的情绪触发词，通常配 trim
     # enrich 止盈口头禅（7/17 "$XOM LOCK THEM ALL ON" / "lock them in!"）。
@@ -612,6 +632,26 @@ EN_OPTIONAL_CLAUSE_RE = re.compile(
 #   3. 以 `后` 收尾，且整段不跨 ，。！？换行。
 # 反例（**不该抹**）："在2.20加仓后，于2.60进行小幅安全减仓" —— 从句动词是
 # 加仓不在表里，真正的 减仓 在从句之外，照常执行。
+# EN 侧的同款时间状语从句守卫 —— "after I scale out most" 是时间参照不是当前动作。
+#
+# [8/28] 这条是补 `scale out` 到动词表**逼出来**的：8/20 那次 EN 判 no signal
+# 靠的不是任何防护，而是 `scale out`（祈使/原形）压根不在词表里 —— 注释里
+# 写着 "EN 正确判 no signal"，实际是**巧合正确**。把祈使式补进词表的同一秒，
+# 那条 8/20 的原文就变成了真卖单（回归测试当场变红，见
+# test_overnight_0818_0824::test_zh_after_clause_is_not_an_instruction）。
+#
+# 这正是 lesson #24 的形状：ZH 侧 8/20 补了 ZH_AFTER_CLAUSE_RE，EN 侧没补，
+# 因为当时"EN 没问题"。防护的缺失被一个偶然的词表空缺掩盖了 8 天。
+#
+# 边界与 ZH 版对齐：after/once 引导 + 从句里出现平仓动词 + 不跨句子标点。
+EN_AFTER_CLAUSE_RE = re.compile(
+    r"\b(?:after|once)\s+(?:i|we|he|she|they)\s+"
+    r"(?:[a-z]+\s+){0,2}?"
+    r"(?:scal(?:e|ing|ed)\s+out|trim\w*|cut\w*|sell\w*|sold|clos\w*|dump\w*)"
+    r"[^.!?\n]*",
+    re.IGNORECASE,
+)
+
 ZH_AFTER_CLAUSE_RE = re.compile(
     r"在[^，,。！？\n]{0,12}?(?:减仓|减持|平仓|清仓|卖出|止盈|出清|平掉)[^，,。！？\n]{0,6}?后"
 )
@@ -960,6 +1000,33 @@ def _extract_pct(text: str, text_lower: str) -> int:
     return 100 if _has_full_close_verb(text_lower, text) else 33
 
 
+def _drop_unattributable_price(symbols: list, signal_price, lang: str, text: str):
+    """多标的 + 单一喊价 → 丢弃喊价，返回 (price, unattributable?)。
+
+    [8/28 实锤，唯一真正动了钱的一条] KC 的战报
+    "got so wrapped up in SPY and AAPL I didn't see that UNG order filled for
+    1.90 trim as it approached the 10.75 level" 抽出 symbols=['AAPL','UNG']、
+    price=1.9 —— 1.90 是 **UNG** 的成交价，却被拿去给 **AAPL 330c** 定限价：
+    1.9 × 0.95 = 1.80 挂单卖出，而同一时段喊单员报的 AAPL 330c 是 5.80-6.00。
+
+    喊价天然是**单个合约**的属性。一句话里出现两个标的时，没有任何可靠依据
+    把它归给其中之一 —— 归错的代价是限价差出数倍。所以这里不猜：丢掉喊价，
+    让 close_flow 落到既有的 quote fallback（逐合约取实时报价定限价，7/25
+    AVGO 那条路径），并让调用方发一条 TG 说明。
+
+    **不拦执行**是刻意的：`Trimmed $TSLA 420c and $MSFT here @ 7.00` 这类
+    多标的平仓是既有契约（test_multi_symbol_close_hint_only_scopes_first_symbol），
+    不可归属的是**价格**不是**意图**。降级到实时报价既止住串台，又不丢平仓动作。
+    """
+    if signal_price is None or len(symbols) <= 1:
+        return signal_price, False
+    logger.warning(
+        f"[close_parser] {lang.upper()} 多标的 {symbols} + 单一喊价 "
+        f"{signal_price} —— 价格无法归属到具体合约，丢弃喊价改用实时报价: {text[:80]}"
+    )
+    return None, True
+
+
 def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
     """英文路径（原 parse_close 逻辑）。"""
     text_lower = text.lower()
@@ -974,6 +1041,8 @@ def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
     text = EN_SUGGESTION_CLAUSE_RE.sub(" ", text)
     # 否定条件句抹到句末（见 EN_OPTIONAL_CLAUSE_RE 注释，8/3 SPY）
     text = EN_OPTIONAL_CLAUSE_RE.sub(" ", text)
+    # 时间状语从句抹掉（见 EN_AFTER_CLAUSE_RE 注释，8/20 PLTR 的 EN 侧）
+    text = EN_AFTER_CLAUSE_RE.sub(" ", text)
     text_lower = text.lower()
     if not _has_action_verb(text_lower, text):
         return None
@@ -1000,6 +1069,8 @@ def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
         return None
     pct = _extract_pct(text, text_lower)
     hint_strike, hint_side = _extract_strike_hint(scope_en, symbols, full_text=text)
+    signal_price, price_unattributable = _drop_unattributable_price(
+        symbols, signal_price, "en", text)
     logger.info(
         f"[close_parser] EN CLOSE symbols={symbols} pct={pct} "
         f"strike={hint_strike} side={hint_side} "
@@ -1008,6 +1079,7 @@ def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
     return {"kind": "CLOSE", "symbols": symbols, "pct": pct,
             "hint_strike": hint_strike, "hint_side": hint_side,
             "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
+            "price_unattributable": price_unattributable,
             "matched": text[:120], "lang": "en"}
 
 
@@ -1206,6 +1278,8 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
         return None
     pct = _extract_zh_pct(text)
     hint_strike, hint_side = _extract_strike_hint(scope_zh, symbols, full_text=text)
+    signal_price, price_unattributable = _drop_unattributable_price(
+        symbols, signal_price, "zh", text)
     logger.info(
         f"[close_parser] ZH CLOSE symbols={symbols} pct={pct} "
         f"strike={hint_strike} side={hint_side} "
@@ -1214,6 +1288,7 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
     return {"kind": "CLOSE", "symbols": symbols, "pct": pct,
             "hint_strike": hint_strike, "hint_side": hint_side,
             "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
+            "price_unattributable": price_unattributable,
             "matched": text[:120], "lang": "zh"}
 
 
