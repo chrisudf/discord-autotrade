@@ -10,11 +10,10 @@ launchd 用本机时区。作者机器是 Australia/Brisbane（UTC+10，无夏�
 |---|---|---|
 | 23:15 | launchd → `night_run.sh` | 开新 Terminal 窗口跑 `caffeinate -i make run`，输出 tee 到 `logs/session_YYYY-MM-DD.log` |
 | 07:00 | launchd → `morning_collect.sh` | SIGTERM 停 listener → 整晚日志存到桌面 → 从 `trades.db` 抽摘要 |
-| 07:00 起约 1-1.5 小时 | 同上 → `opus_review.sh` | **Opus 5 + xhigh** 出复盘 markdown，写完自动弹开 |
 
-**为什么取证和复盘分开**：停机和存日志不该依赖 Claude app 开着，也不该依赖模型跑得完。
-1-3 步是纯 shell，几秒钟结束；第 4 步失败也不影响前面的产物 —— 复盘晚点补没关系，
-日志丢了就没了。
+**早上只取证，不自动复盘**（2026-08-17 起）：`morning_collect.sh` 全是纯 shell，
+几秒钟结束，只产出 txt。复盘按需手动跑 `zsh ops/opus_review.sh $(date +%F)`。
+停机和存日志不该依赖 Claude 跑得完 —— 复盘晚点补没关系，日志丢了就没了。
 
 **只有一份复盘**。曾经并行跑过 Claude app 的定时任务 `autotrade-nightly-review`
 （07:10，读同样两份产物，在对话里给一份可追问的版本），理由是那时 app 把定时任务
@@ -22,7 +21,7 @@ launchd 用本机时区。作者机器是 Australia/Brisbane（UTC+10，无夏�
 （当天那次定时任务 29 次 API 调用全是 `claude-opus-5`），两条路于是变成同一件事
 跑两遍 Opus，一个早上吃掉 5 小时额度的一半多。留命令行这条是因为它不依赖 app 开着、
 `--model` / `--settings` 能硬控模型和 effort、产物直接落盘。
-不想要复盘就 `zsh ops/morning_collect.sh --no-review`。
+现在它已不由早上的任务自动触发，要复盘就手动跑 `zsh ops/opus_review.sh $(date +%F)`。
 
 先停机再存日志，不是反过来：`app/main.py` 的 SIGTERM handler 会走 `shutdown()`，
 收尾日志也该进文件。

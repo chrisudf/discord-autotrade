@@ -3,14 +3,12 @@
 #   1. 优雅停掉夜里的 listener
 #   2. 把整晚 terminal log 存成桌面 txt
 #   3. 从 trades.db 抽一份当晚信号/成交摘要
-#   4. 调 opus_review.sh 出一份 Opus 5 + xhigh 的复盘（markdown，自动弹开）
 #
-# 1-3 步是纯 shell、不依赖任何 app，保证取证一定发生。第 4 步就算失败也不影响
-# 前三步的产物。
+# 全是纯 shell、不依赖任何 app，保证取证一定发生。
 #
-# 第 4 步是唯一的复盘路径。曾经并行跑过 Claude 定时任务 autotrade-nightly-review
-# （7:10，同一份素材、同一份 review_prompt.md），2026-08-06 停用 —— 它也跑 Opus 5，
-# 等于同一件事花两份钱。原因和取舍见 opus_review.sh 顶部注释。
+# 曾经还有第 4 步：调 opus_review.sh 出一份 Opus 5 + xhigh 的自动复盘。
+# 2026-08-17 去掉 —— 早上只留 txt 取证，复盘按需手动跑：
+#   zsh ops/opus_review.sh $(date +%F)
 #
 # 本脚本在 Terminal.app 窗口里执行，不是由 launchd 直接执行 ——
 # launchd 读不了 ~/Desktop（TCC），中间隔着 launch_in_terminal.sh 这层垫片，
@@ -172,7 +170,5 @@ echo "取证完成："
 echo "  整晚日志: $DEST"
 echo "  数据摘要: $DIGEST"
 echo "  日志摘要: $LOGDIGEST"
-
-# ---------- 4. Opus 5 复盘 ----------
-# 唯一一条复盘路径。曾经并行的 Claude 定时任务已停用，原因见 opus_review.sh 顶部注释。
-[[ "${1:-}" == "--no-review" ]] || zsh "$PROJ/ops/opus_review.sh" "$STAMP"
+echo
+echo "要复盘的话手动跑: zsh $PROJ/ops/opus_review.sh $STAMP"
