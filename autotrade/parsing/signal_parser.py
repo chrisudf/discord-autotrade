@@ -994,7 +994,10 @@ STRONG_CLOSE_RE = re.compile(
     # "close TSLA here" / "want to close half" 不受影响；closed/closing 语义不变。
     r"\b(closed"
     r"|(?<!the\s)(?<!at\s)(?<!into\s)(?<!before\s)(?<!near\s)(?<!after\s)close(?!\s+to\b)"
-    r"|sold|exit|stopped|trim(?:med|ming)?|out of|scaling\s+out)\b"
+    # [8/28 $ALAB] scaling out 只有 -ing 形，祈使式 "Scale out." 整条走 OPEN
+    # 分支 → [parser] no signal。路由与解析同进同退：close_parser.ACTION_VERBS
+    # 同批加了 "scale out" / "scaled out"，两处必须一起改。
+    r"|sold|exit|stopped|trim(?:med|ming)?|out of|scal(?:e|ing|ed)\s+out)\b"
     # "all out" 从 WEAK 提级（7/15："all out SPY -11% not adding" 里的
     # "adding" 命中 OPEN_INTENT 把 WEAK close 一票否决 → 误判 OPEN，
     # 靠 ZH 孪生"全部平仓"才兜住检测）。"going all out" 是开仓情绪，排除。

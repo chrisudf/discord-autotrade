@@ -178,7 +178,12 @@ async def test_partial_success_with_broker_failure_keeps_fp(monkeypatch):
         return {"success": True, "order_id": "MX1", "code": kwargs["option_code"],
                 "qty": kwargs["qty"], "price": kwargs["limit_price"]}
 
+    # [8/28] 多标的 + 单一喊价 → parser 丢弃喊价（价格无法归属，见
+    # close_parser._drop_unattributable_price），落到 quote fallback。
+    # 本用例要测的是"混合结局下的指纹去留"，不是定价 —— 给一个报价让它
+    # 照常走完卖出流程，测试意图不变。
     with patch.object(close_flow, "_safe_notify", side_effect=capture), \
+         patch.object(close_flow, "get_sell_ref_price", return_value=7.0), \
          patch.object(close_flow, "place_sell_order", side_effect=fake_sell):
         await close_flow.handle_close_signal(
             "Trimmed $MXOK and $MXRJ here @ 7.00", msg_id=150002,
@@ -209,7 +214,12 @@ async def test_runner_plus_broker_failure_rolls_back_fp(monkeypatch):
                 "order_id": None, "code": code_rej,
                 "qty": kwargs["qty"], "price": kwargs["limit_price"]}
 
+    # [8/28] 多标的 + 单一喊价 → parser 丢弃喊价（价格无法归属，见
+    # close_parser._drop_unattributable_price），落到 quote fallback。
+    # 本用例要测的是"混合结局下的指纹去留"，不是定价 —— 给一个报价让它
+    # 照常走完卖出流程，测试意图不变。
     with patch.object(close_flow, "_safe_notify", side_effect=capture), \
+         patch.object(close_flow, "get_sell_ref_price", return_value=7.0), \
          patch.object(close_flow, "place_sell_order", side_effect=fake_sell):
         await close_flow.handle_close_signal(
             "Trimmed $MXRN and $MXRB here @ 7.00", msg_id=150003,

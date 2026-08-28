@@ -4,6 +4,8 @@
 - weekly: +50% trim 50% → +100% trim 剩余 50% → 剩 ~25% 跑（靠 EOD/expiry/手动）
 - swing:  +100% trim 50% → +200% trim 剩余 50% → 剩 ~25% 跑
 - 0dte / lotto: 不挂 TP（前者靠 EOD，后者放飞）
+  —— 但"放飞"不等于"没人看"：8/28 起这两类在大幅盈利时会发 TG 提醒
+  （_alert_no_ladder_winners，不自动卖）。起因见该函数注释里的 $ALAB。
 
 档位 = 阈值是 avg_entry_price * (1 + threshold_pct)，
 按 ladder 顺序触发，每档卖固定比例。
@@ -27,6 +29,7 @@ T2 则落到 runner-preserve（见 _plan）。**实盘前 qty 改回 1 时，这
 - TP_SELL_SLIP       : 默认 0.05（卖出限价 = last * 0.95，TP 不需要 SL 那么激进）
 - SELL_REJECT_MAX_FAILS / SELL_REJECT_BACKOFF_{BASE,CAP}_SEC : 熔断阈值与退避
 - LOG_DEDUP_WINDOW_SEC : 重复日志收敛窗口（默认 60s，见 utils/logdedup）
+- NO_LADDER_ALERT_PCT : 无阶梯仓位（lotto/0dte）高盈利提醒起步档，默认 200（%），0=关
 
 TODO（实测调整）：
 - 阈值经验值，跑实盘后 PnL 复盘哪档过早 / 过晚
@@ -51,6 +54,7 @@ from autotrade.notify.transport import send_telegram
 from autotrade.notify.messages import format_error
 from autotrade.notify.watchdog import notify_tick_error, notify_tick_ok
 from autotrade.utils import logdedup
+from autotrade.utils.envcfg import env_float
 from autotrade.utils.logger import logger
 
 
@@ -69,6 +73,64 @@ def _cfg() -> dict:
 
 # 单 tick 内已触发的 (code, tier_bit) 避免在 broker 返回前重复触发
 _triggered_this_tick: set[tuple[str, int]] = set()
+
+
+# 无 TP 阶梯仓位（lotto / 0dte）的高盈利提醒：code → 已提醒过的最高档（百分比）。
+# 进程级，重启清零 —— 重启后重新提醒一次是可接受的（信息重复 << 信息缺失）。
+_no_ladder_alerted: dict[str, float] = {}
+
+
+def _no_ladder_alert_pct() -> float:
+    """无阶梯仓位提醒的起步档，默认 +200%。0 = 关闭。"""
+    return env_float("NO_LADDER_ALERT_PCT", 200.0, minimum=0.0)
+
+
+async def _alert_no_ladder_winners(positions: list[dict], prices: dict) -> None:
+    """给**没有 TP 阶梯**的仓位（lotto / 0dte）在大幅盈利时发一条 TG。
+
+    [8/28 $ALAB] ALAB 300C 是 category=lotto —— 按设计不挂 TP（LADDER 里没有
+    lotto）、apply_sl=False。当晚喊单员 23:33 发 "$ALAB - Scale out."，
+    parser 接不住（祈使式不在动词表，同批已修），11 分钟后他报 +300%、
+    再过 3 分钟 +400%，而我们**一张没卖**，仓位一路带到到期日。
+
+    问题不在那条漏掉的信号本身，在于 lotto 的"放飞"策略实际等于：
+    **唯一的主动出场路径是一条可能解析不出来的消息**。一旦它没解析出来，
+    就再没有任何机制会看它一眼，直到到期日 EOD。
+
+    这里补的是最小的一层：不自动卖（放飞是有意的策略选择，改成自动止盈是
+    另一个需要单独拍板的决定），但**必须让人知道**。翻倍一次提醒一次
+    （200% → 400% → 800%），避免同一个仓位每 5 秒刷一条。
+    """
+    threshold = _no_ladder_alert_pct()
+    if threshold <= 0:
+        return
+    for pos in positions:
+        code = pos["option_code"]
+        last = prices.get(code)
+        entry = pos.get("avg_entry_price") or 0
+        if last is None or entry <= 0:
+            continue
+        pnl_pct = (last / entry - 1) * 100
+        if pnl_pct < threshold:
+            continue
+        prev = _no_ladder_alerted.get(code, 0.0)
+        # 首次达标发一条；之后要再翻一倍才值得再发
+        if prev and pnl_pct < prev * 2:
+            continue
+        _no_ladder_alerted[code] = pnl_pct
+        logger.warning(
+            f"[tp] 🎈 无阶梯仓位大幅盈利: {code} {pnl_pct:+.0f}% "
+            f"(entry={entry:.2f} last={last:.2f} category={pos.get('category')}) "
+            f"—— 本仓无 TP 阶梯，不会自动止盈"
+        )
+        await send_telegram(format_error(
+            f"🎈 {pos.get('category')} 仓位 {pnl_pct:+.0f}%，但它不会自动止盈",
+            f"{code} 剩 {pos['qty_remaining']} 张\n"
+            f"成本 ${entry:.2f} → 现价 ${last:.2f}（{pnl_pct:+.0f}%）\n\n"
+            f"category={pos.get('category')} 没有 TP 阶梯，apply_sl="
+            f"{bool(pos.get('apply_sl'))} —— **只有喊单员的平仓信号或到期日 EOD "
+            f"会让它出场**。要不要手动落袋，请自行判断。"
+        ))
 
 
 def _guard_key(code: str, tier_bit: int) -> str:
@@ -261,15 +323,20 @@ async def _tp_tick():
     global _triggered_this_tick
     _triggered_this_tick = set()  # tick 边界重置（每轮独立判断）
 
-    positions = [
-        p for p in position_mgr.get_open_positions()
-        if p["category"] in LADDER and p["qty_remaining"] > 0
-    ]
-    if not positions:
+    active = [p for p in position_mgr.get_open_positions() if p["qty_remaining"] > 0]
+    positions = [p for p in active if p["category"] in LADDER]
+    # 无阶梯仓位（lotto / 0dte）只提醒不卖，见 _alert_no_ladder_winners
+    no_ladder = [p for p in active if p["category"] not in LADDER]
+    if not positions and not no_ladder:
         return
 
-    codes = [p["option_code"] for p in positions]
+    # 取价仍然只发一次 —— 无阶梯仓位并进同一批，不额外吃 snapshot 配额
+    # （7/8 批量取价改造的前提条件，见本函数 docstring）
+    codes = [p["option_code"] for p in positions + no_ladder]
     prices = await asyncio.to_thread(get_last_prices, codes)
+
+    if no_ladder:
+        await _alert_no_ladder_winners(no_ladder, prices)
 
     for pos in positions:
         cat = pos["category"]
@@ -305,3 +372,8 @@ async def run_tp_watcher():
         except Exception as e:
             notify_tick_error("tp", e)
         await asyncio.sleep(_cfg()["interval"])
+
+
+def reset_no_ladder_alerts() -> None:
+    """测试用：清空跨用例残留的无阶梯提醒状态。"""
+    _no_ladder_alerted.clear()

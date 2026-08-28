@@ -448,6 +448,18 @@ async def _kc_sell(
                     f"[CLOSE] quote fallback: {code} "
                     f"quote_ref={quote_ref} → limit={limit}"
                 )
+        # [8/28] 喊价被判为"无法归属"而丢弃时，落到 quote fallback 是**降级
+        # 不是常态**，必须让人知道 —— 否则同一条多标的消息以后每次都静默
+        # 按实时报价平仓，而喊单员其实报了价。
+        # 放在 limit 定完之后发：文案里要带最终限价，人才好判断合不合理。
+        if parsed.get("price_unattributable"):
+            await _safe_notify(format_error(
+                "CLOSE 喊价无法归属，已改用实时报价",
+                f"{code} qty={qty_to_sell} ({pos_pct}%)\n"
+                f"原文里出现多个标的、却只有一个喊价 —— 无法判断这个价属于哪张合约，"
+                f"已丢弃喊价改用实时报价定限价（ref={price_ref}, limit={limit}）。\n"
+                f"原文: {raw[:200]}"
+            ))
         if limit is None:
             # 信号没喊价 + 实时参照也拿不到 → 拒绝执行，TG 警报让
             # 人工接管（拒卖语义与 0010 之前一字不差；env 关闭时
