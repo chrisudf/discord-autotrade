@@ -1000,6 +1000,59 @@ def _extract_pct(text: str, text_lower: str) -> int:
     return 100 if _has_full_close_verb(text_lower, text) else 33
 
 
+# 中继机器人的发言人标签 —— 解析前整段剥掉。
+#
+# [8/28 起] KC 频道的消息多了一层中继前缀，格式从
+#     "@everyone\nKC Trades Bot:trimmed AAPL 330c ..."
+# 变成
+#     "核心期权交易综合BOT: KC Trades Bot:trimmed AAPL 330c ..."
+#     "核心期权交易综合BOT: :red_circle:KC交易机器人：减仓340c @ 4.30 🚀"
+#
+# 后果（8/29 实测）：ZH 侧的 symbol 抽取是**自由文本 + 持仓白名单**，
+# `综合BOT` 里的 BOT、`KC交易机器人` 里的 KC 都被当成 ticker 抽了出来：
+#
+#     [close_parser] ZH close intent, symbols=['BOT', 'KC'] 不在当前持仓 —— 跳过
+#
+# 那一晚零损失（BOT / KC 都不在持仓白名单，被正确挡掉），但两处代价是真的：
+#   1. 它污染 `[zh_unrecognized]` 的计数口径 —— 那个 warning 的**唯一用途**
+#      就是攒样本判断要不要做中文公司名映射（ROADMAP P1 #13），
+#      混进"发言人标签"这种噪音，样本就没法用了；
+#   2. 哪天持仓里出现同名票（BOT 是真实存在的 ticker），就是一次误平。
+#
+# **为什么只在 close 路径剥、不在 open 路径剥**：两条路径对前缀的暴露面不同。
+# open 侧走的是结构化模板（锚在 `$TICKER` + 行权价 + calls/puts 上），
+# 实测同一条消息加不加前缀都解析成同一个信号（回归见
+# test_overnight_0829::test_relay_prefix_does_not_affect_open_path）。
+# 只有 close 侧的自由文本抽取会被标签污染。lesson #24 要求的是"检查另一侧"，
+# 不是"无条件两边都改" —— 这里检查过了，结论是 open 侧不需要。
+#
+# 边界收得紧，避免把正文吃掉：
+#   - 只从**开头**剥，且最多剥 3 段（观察到最多两层：中继 + 喊单机器人）；
+#   - 每段必须短（≤ 24 字符）且含 BOT / bot / 机器人 —— 正文里的
+#     "trimmed AAPL 330c" 不含这些词，剥不到；
+#   - 顺带吃掉两段之间的 :emoji_shortcode:（`:red_circle:`）。
+#   - 允许标签前面先有一行 `@everyone`（Discord 提及，纯噪音）：**老格式**
+#     `@everyone\nKC Trades Bot:...` 同样会漏 `KC` 进 symbols（8/28 日志实测
+#     `symbols=['KC'] 不在当前持仓`），只是没人注意 —— 一起洗掉。
+_RELAY_LABEL_RE = re.compile(
+    r"^\s*(?:@everyone\s*)?"               # 可选的 @everyone 提及
+    r"(?::[a-z_]{2,20}:\s*)?"              # 可选的 :emoji_shortcode:
+    r"[^\n:：]{0,24}?(?:BOT|Bot|bot|机器人)\s*[:：]\s*",
+)
+
+
+def strip_relay_prefix(text: str) -> str:
+    """剥掉开头的中继/喊单机器人标签。剥不动就原样返回。"""
+    if not text:
+        return text
+    for _ in range(3):
+        new = _RELAY_LABEL_RE.sub("", text, count=1)
+        if new == text:
+            break
+        text = new
+    return text
+
+
 def _drop_unattributable_price(symbols: list, signal_price, lang: str, text: str):
     """多标的 + 单一喊价 → 丢弃喊价，返回 (price, unattributable?)。
 
@@ -1304,5 +1357,10 @@ def parse_close(text: str, open_symbols: set[str]) -> Optional[dict]:
     """
     if not text or len(text.strip()) < 3:
         return None
+
+    # 先剥中继机器人标签（见 _RELAY_LABEL_RE 注释，8/28 起 KC 频道的新格式）。
+    # 放在 dispatcher 而不是各语言分支：两条分支都吃同一份干净文本，
+    # 将来加第三条路径也自动继承。
+    text = strip_relay_prefix(text)
 
     return _parse_close_en(text, open_symbols) or _parse_close_zh(text, open_symbols)

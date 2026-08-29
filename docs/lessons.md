@@ -883,6 +883,163 @@ smaller risk, it is most of the risk.
 
 ---
 
+## 28. A scheduled wake that succeeds is not a machine that is awake
+
+**Symptom**: 8/29. The listener was supposed to start at 23:15 (15 minutes before
+the US open). It started at **23:45:16** — 15 minutes *after* the open. The
+`$UBER $78 calls $.31` lotto had gone out at ~23:32; startup backfill replayed it,
+the age guard correctly refused to open a 803-second-old signal, and the weekly
+recap later reported UBER at **+270%**.
+
+Everything in the chain looked configured. `launchd` was loaded. `pmset repeat
+wakepoweron` was set for 23:10. `launchd.night.err.log` was empty. And the wake
+itself worked:
+
+```
+23:10:00  Wake                      ← the scheduled wake fired, correctly
+23:10:30  Display is turned off
+23:11:26  Entering Sleep 'Idle Sleep'   ← awake for 86 seconds, then back down
+23:15:00  ← launchd should fire here. Machine is asleep. Nothing happens.
+23:26:51  DarkWake → back to sleep
+23:44:10  DarkWake → back to sleep
+23:45:15  Display on → launchd finally runs the missed job, 30 minutes late
+```
+
+**Why non-obvious**: the wake and the job were configured as if they were one
+mechanism, and every diagnostic said "fine". `pmset -g sched` shows the repeat
+wake. `launchctl list` shows the agent loaded, last exit 0. The job *did* run,
+so there is no failure anywhere to grep for — only a timestamp 30 minutes off,
+in a log nobody reads when nothing broke.
+
+The gap is that macOS treats them as unrelated: a scheduled wake buys you
+**one idle-sleep timeout** of uptime, nothing more. On battery that was 86
+seconds. The job was scheduled 5 minutes after the wake — four minutes past the
+end of the window it was supposed to land in. `caffeinate -i` in `night_run.sh`
+cannot help: it only starts running once the job has already started.
+
+**Defense**: the plist now carries several `StartCalendarInterval` entries —
+23:11, 23:15, 23:20, 23:25. The one that matters is **23:11**, 60 seconds after
+the wake and inside the observed 86-second window; the rest are cheap insurance
+for a wake that does not happen at all. Repeats are safe because `night_run.sh`
+opens with a `pgrep` guard and exits if a listener is already running — the
+retries are idempotent by construction, which is what makes "just fire it four
+times" an acceptable fix rather than a hack.
+
+**General form**: when a job depends on the machine being awake, the wake and the
+job are one system with a **margin**, and that margin is an idle-sleep timeout
+you do not control and did not measure. Schedule the job inside the window, not
+merely after the wake. And note what made this expensive to find: the failure
+produced no error anywhere — it is only visible as the distance between two
+timestamps in two different logs.
+
+---
+
+## 29. The speaker's name is not a ticker, and a whitelist is not why you survived
+
+**Symptom**: 8/28 23:45, the relay format in the KC channel changed. What had
+been
+
+```
+@everyone
+KC Trades Bot:trimmed AAPL 330c ...
+```
+
+became
+
+```
+核心期权交易综合BOT: KC Trades Bot:trimmed AAPL 330c ...
+核心期权交易综合BOT: :red_circle:KC交易机器人：减仓340c @ 4.30 🚀
+```
+
+The ZH close path extracts symbols from free text, so it read the speaker labels
+as instruments:
+
+```
+[close_parser] ZH close intent, symbols=['BOT', 'KC'] 不在当前持仓 —— 跳过
+```
+
+`BOT` came from `综合BOT`, `KC` from `KC交易机器人`. Nothing was traded, and the
+log line even looks reassuring — the position whitelist caught it.
+
+**Why non-obvious**: the whitelist made it invisible. `BOT` and `KC` were not in
+holdings, so the guard fired and the message was skipped, exactly as designed.
+That is a **second-line** defense doing a first line's job, and it hides two
+costs that the skip line does not mention:
+
+1. `[zh_unrecognized]` and its siblings exist to accumulate evidence about
+   whether Chinese company-name → ticker mapping is worth building
+   (ROADMAP P1 #13). Feeding speaker labels into that counter poisons the only
+   sample the decision would ever be made from.
+2. `BOT` is a real listed ticker. The whitelist is a coincidence, not a rule.
+
+Checking the old format afterwards showed it had been leaking `KC` the whole
+time in exactly the same way — the format change did not introduce the bug, it
+made a pre-existing one produce a second symbol.
+
+**Defense**: `strip_relay_prefix` removes leading speaker labels before parsing,
+applied at the `parse_close` dispatcher so every language branch gets the same
+clean text. Boundaries kept tight (start of string only, ≤24 chars per segment,
+must contain BOT/机器人, at most 3 segments, optional leading `@everyone` and
+`:emoji_shortcode:`) with reverse tests asserting real content is untouched.
+
+Applied to the **close path only**, deliberately: the open path anchors on
+`$TICKER` + strike + calls/puts and parses the prefixed and unprefixed message
+identically (pinned by `test_relay_prefix_does_not_affect_open_path`). Lesson
+#24 says to check the other side, not to change it unconditionally — the check
+was done and the answer was no.
+
+**General form**: when a parser reads instruments out of free text, everything
+that is not the message body is a source of false instruments — speaker labels,
+channel names, mentions, emoji shortcodes. Strip the envelope before parsing it.
+And when a guard fires on data that should never have reached it, the guard
+working is not the end of the investigation; ask what put that data there.
+
+---
+
+## 30. A position that becomes a runner by accident inherits a policy written for one that was chosen
+
+**Symptom**: 8/28-8/29. AAPL 330c 10/16, opened with 2 contracts at 5.05. Over
+the following night KC called the trim four times:
+
+| time | message | result |
+|---|---|---|
+| 23:45 | `trimmed AAPL 330c +30% and also the 340c +30%` | runner-preserve, skipped |
+| 23:45 | `trimmed AAPL 330 @ 6.85 ...` | dup of the above |
+| 00:45 | `BOOM!!! Trimmed AAPL 330 @ 7.50` | runner-preserve, skipped |
+| 00:46 | `trimmed the 340c @ 4.30` | no ticker, correctly skipped |
+
+The parser was right every time — `strike-filter: AAPL 330.0C → 1/1 positions
+selected` is a precise hit. Nothing sold, because one contract remained and
+33% of one contract rounds to zero. Entry 5.05, called at 7.50, still open.
+
+**Why non-obvious**: runner-preserve is a *good* rule with a documented price
+(lesson #13, ~$330/contract) and it behaved exactly as specified. The failure is
+in a premise the rule never states: it assumes a single remaining contract is a
+**runner you decided to keep**. Here it was the residue of a bug — the 8/28
+misrouted UNG war story (lesson #27) had sold one of the two contracts. The
+position did not become a runner; it was made one by an error, and then
+inherited "hold it forever" from a policy written for deliberate runners.
+
+That is the second-order cost of #27, and it is larger than the first: the bad
+sale was one contract at a bad limit; the consequence was that **four correct
+sell signals over the next twelve hours all became no-ops**.
+
+**Defense**: `STRATEGY_B` — already written, tested, and shipped dark since
+0011 — takes exactly this case: when a trim is blocked by runner-preserve, take
+a fresh quote, and if our own unrealized gain clears `STRATEGY_B_MIN_PNL_PCT`
+(25%), sell the remainder instead of holding. Last night's two quotes score
++35.6% and +48.5%. It is now `true` in the template. The floor is unchanged:
+no fresh quote → still preserve.
+
+**General form**: a rule conditioned on *state* ("one contract left") silently
+assumes something about *how the state arose* ("because we chose to keep it").
+When another bug can produce the same state, the rule keeps applying and there
+is no error to see — the second bug wears the first one's policy. Worth asking
+of any preserve/skip rule: what else, other than the intended path, can put the
+system into the state that triggers it?
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -1387,6 +1544,9 @@ downside is priced in dollars.
 | 25 | 修一个漏平会踩响一颗从没触发过的雷（变的是可达性） | `test_overnight_0818_0824.py::test_out_the_rest_does_not_become_bulk_trim`（下游断言：必须是 CLOSE `['AMZN']` 而不是 BULK_TRIM 100%）、`::test_bulk_marker_requires_close_verb_object`（4 个 case，真 bulk 不许被误伤）。**不变量**：修 parse 失败时断言的是**下游结果**，不是「能解析了」。**8/28 复发**（补 `scale out` 踩响 8/20 的 EN 侧防护缺口）：`test_overnight_0828.py::test_scale_out_parses_as_close` + `test_overnight_0818_0824.py::test_zh_after_clause_is_not_an_instruction`（EN_AFTER_CLAUSE_RE 就是被它逼出来的）|
 | 26 | broker 回来的成交价可以是个从未存在过的数字 | `test_fill_checker.py::test_buy_fill_rejects_absurd_dealt_price`（限价 2.97 / 回报 0.13 → 拒绝回填 + 告警）、`::test_buy_fill_accepts_a_genuinely_good_fill`（反向：UBER 限价 0.50 实成 0.37 必须放过）、`::test_buy_fill_reprices_only_its_own_leg_after_addon`（加仓按腿重算，前身断言的是保守跳过）|
 | 27 | 喊价属于**一张合约**，而一句话可以提到三个标的 | `test_overnight_0828.py::test_ung_fill_recap_does_not_close_anything`（当晚原文，两层防护任一生效即不成交）、`::test_multi_symbol_single_price_drops_the_price`（丢价不丢意图 + `price_unattributable` 标志）、`::test_first_person_negated_perception_is_recap`（3 个词形，含 Unicode 撇号）。**反向护栏**：`::test_real_instructions_survive_the_recap_rule`（条件式 see/notice 是真指令）、`::test_single_symbol_price_is_untouched`（单标的不受影响）。契约翻转：`test_listener_close.py::test_multi_symbol_close_hint_only_scopes_first_symbol` 与 `test_0015_executor.py` 的两个混合结局用例现在显式注入报价 —— 前身把「TSLA 的 $7.00 用在 MSFT 上」断言为正确行为 |
+| 28 | 唤醒成功 ≠ 机器醒着（定时唤醒只买到一个 idle-sleep 窗口） | 无自动回归（launchd / pmset 是宿主行为，测不了）。防御在 `~/Library/LaunchAgents/com.chengqiu.autotrade.night.plist` 的多个 `StartCalendarInterval`（23:11 落在唤醒窗口内 + 23:15/20/25 兜底），幂等性由 `ops/night_run.sh` 的 `pgrep` 守卫保证。**验证方法**：早上比对 `logs/ops.log` 的 `night_run: starting` 与 23:15，差值 > 1 分钟即复发 |
+| 29 | 发言人标签不是 ticker；白名单挡住不代表你有防护 | `test_overnight_0829.py::test_new_relay_prefix_no_longer_leaks_bot_as_ticker`（当晚原文）、`::test_old_format_also_stopped_leaking_kc`（老格式一直在漏）、`::test_relay_prefix_shapes`（4 种形状）。**反向护栏**：`::test_relay_prefix_leaves_real_content_alone`（4 条正文一个字不许动）、`::test_prefixed_close_still_executes`（剥完真指令仍要执行）、`::test_relay_prefix_does_not_affect_open_path`（钉住"只在 close 侧剥"这个决定的前提） |
+| 30 | 被动变成 runner 的仓位，继承了为"主动选择的 runner"写的策略 | `test_overnight_0829.py::test_strategy_b_would_have_sold_last_nights_aapl`（当晚两次报价都该全出）、`::test_strategy_b_threshold_boundaries`（无报价/低于阈值/刚过阈值三档）。上游成因见 #27；runner-preserve 本身的契约见 #13 |
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |
