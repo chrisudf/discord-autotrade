@@ -253,6 +253,39 @@ _TOOK_OFF_PATTERN = (
 _RUNNERS_ONLY_PATTERN = r"\brunners?\s+only\b[^.\n]{0,24}?@\s*\.?\d"
 _ZH_RUNNERS_ONLY_PATTERN = r"仅持仓[^。！？\n]{0,24}?[@＠]\s*\.?\d"
 
+# "Down to 1/2." —— 9/1 enrich 对 COIN 连喊两次减仓，双语双漏（"$COIN - Down to 1/2."
+# / "$COIN - 降至 1/2。"）。成因与 8/3 的 "out 1/2" 一模一样、只是换了个介词：
+# FRACTION_DOWN_TO_PATTERN（"剩 X/Y → 卖 1-X/Y"）7/6 起就在 pct 抽取阶段等着，
+# 而**动词判定与路由都不认这个形状** → 走不到那一步，整条落 [parser] no signal。
+#
+# 分子分母的枚举与 _OUT_FRACTION_PATTERN 逐字同源（num<den 且 den∈[2,5]，
+# 对齐 _fraction_pct 的定义域）：拦住 "down to 7/13" 这类到期日被当分数。
+# **必须跟分数**：裸 "down to" 是行情叙述（"down to 2.50 support"、
+# "down to runners" 是 KC 黑话且无比例），单独入表就是每条回调评论都变平仓。
+_DOWN_TO_FRACTION_PATTERN = (
+    r"\bdown\s+to\s+(?:1\s*/\s*[2-5]|2\s*/\s*[3-5]|3\s*/\s*[45]|4\s*/\s*5)\b"
+)
+_ZH_DOWN_TO_FRACTION_PATTERN = (
+    r"(?:降至|降到|减至|减到)\s*(?:1\s*/\s*[2-5]|2\s*/\s*[3-5]|3\s*/\s*[45]|4\s*/\s*5)"
+)
+
+# "Start securing some." —— 9/1 同一晚同一个标的的另一条（ZH "开始确保一些。"）。
+# 无数字 → pct 落默认 33。
+#
+# **绝不收裸 secure/securing**，这是本条最要紧的边界，而且同一晚就有现成反例：
+#   00:59 "If you are green in this trade - make sure it stays that way."
+#         ZH "确保它保持这样" —— 纯鼓励，收裸词当场误平；
+#   8/18  "out the rest of AMZN to secure small green trade" —— 目的状语；
+#   7/23  "stop at entry now to secure green trade" —— 移动止损子句，
+#         lessons #? 里明写着"EN 孪生本来就无 EN 动词，安全"，收裸词就把
+#         那条既有的安全结论推翻了。
+# 只认**减仓动作的宾语**（some / a few / half / part / profits），
+# 而上面三条反例的宾语都是 "green trade" / "it"。
+_SECURE_SOME_PATTERN = (
+    r"\bsecur(?:e|ing)\s+(?:some|a\s+few|half|part|profits?)\b"
+)
+_ZH_SECURE_SOME_PATTERN = r"确保(?:一些|一部分|部分|一点|少量)"
+
 # "out" 短语统一走词边界 regex（勿放回 ACTION_VERBS/FULL_CLOSE_VERBS 的
 # substring 匹配——见上方 "overall outlook" 案例）
 _OUT_PHRASE_RE = re.compile(
@@ -787,7 +820,10 @@ def _has_bulk_marker(text_lower: str) -> bool:
 # took-off / runners-only 不属于 "out" 家族，单开一个 RE（两条都自带边界条件：
 # took 必须跟 another 或百分比，runners only 必须跟 @价格，见各自常量注释）
 _EXTRA_ACTION_RE = re.compile(
-    _TOOK_OFF_PATTERN + r"|" + _RUNNERS_ONLY_PATTERN,
+    _TOOK_OFF_PATTERN + r"|" + _RUNNERS_ONLY_PATTERN
+    # [9/1 COIN] down-to 分数 / securing 宾语，两条都自带边界（见各自常量注释）
+    + r"|" + _DOWN_TO_FRACTION_PATTERN
+    + r"|" + _SECURE_SOME_PATTERN,
     re.IGNORECASE,
 )
 
@@ -826,7 +862,9 @@ _ACTION_RE = re.compile(
     + r"|" + _CHOP_HALF_PATTERN
     + r"|" + _OUT_REST_PATTERN
     + r"|" + _TOOK_OFF_PATTERN
-    + r"|" + _RUNNERS_ONLY_PATTERN,
+    + r"|" + _RUNNERS_ONLY_PATTERN
+    + r"|" + _DOWN_TO_FRACTION_PATTERN
+    + r"|" + _SECURE_SOME_PATTERN,
     re.IGNORECASE,
 )
 
@@ -1146,11 +1184,19 @@ def _has_zh_recap(text: str) -> bool:
 # 必须跟 @价格才算动作（不带价格的 "剩余1个持仓" 是持仓陈述，见常量注释）。
 _ZH_RUNNERS_ONLY_RE = re.compile(_ZH_RUNNERS_ONLY_PATTERN)
 
+# [9/1 COIN] ZH 侧的 down-to 分数 / securing 宾语。**不进 ZH_ACTION_VERBS**：
+# 那张表是裸子串匹配，"降至"/"确保" 裸词是行情叙述与鼓励语（同一晚就有
+# "确保它保持这样"），必须带边界条件，与 _ZH_RUNNERS_ONLY_RE 同款处理。
+_ZH_EXTRA_ACTION_RE = re.compile(
+    _ZH_DOWN_TO_FRACTION_PATTERN + r"|" + _ZH_SECURE_SOME_PATTERN
+)
+
 
 def _has_zh_action(text: str) -> bool:
     return (
         any(v in text for v in ZH_ACTION_VERBS)
         or bool(_ZH_RUNNERS_ONLY_RE.search(text))
+        or bool(_ZH_EXTRA_ACTION_RE.search(text))
     )
 
 
@@ -1168,7 +1214,8 @@ def _zh_action_sentences(text: str) -> str:
     `.` 在数字之间不切（如 '@ 2.45'）。中文 `。！？` 总是切。
     """
     sents = re.split(r"[。！？]|(?<!\d)[.!?](?!\d)", text)
-    hit = [s for s in sents if any(v in s for v in ZH_ACTION_VERBS)]
+    hit = [s for s in sents
+           if any(v in s for v in ZH_ACTION_VERBS) or _ZH_EXTRA_ACTION_RE.search(s)]
     return " ".join(hit) if hit else text
 
 

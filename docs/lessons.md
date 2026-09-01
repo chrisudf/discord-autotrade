@@ -1040,6 +1040,156 @@ system into the state that triggers it?
 
 ---
 
+## 31. The fallbacks a rule names in its own log line are not fallbacks unless you check them
+
+**Symptom**: 9/1. COIN 190c 9/4, two contracts at 2.08. 02:42 T1 hit and sold
+one at 2.99. 03:12 T2 hit (last ≥ 4.16), one contract left, 50% of one rounds
+to zero, so runner-preserve kept it and logged — verbatim —
+
+```
+[tp] 🏃 T2 HIT ... 保留 runner 不卖；本档标记为已触发，
+     后续交给 SL / EOD / 喊单员平仓信号
+```
+
+That line names three fallbacks. That night all three were empty:
+
+| named fallback | actual state |
+|---|---|
+| SL | anchored on entry: 2.08 × (1 − 0.50) = **1.04** |
+| EOD | `eod_force_close = 0` (not a day trade) |
+| 喊单员平仓信号 | two real trims that night, both unparsed (lesson #32) |
+
+A contract that had touched 4.16 would not be sold until it fell back to 1.04.
+The whole +100% was giving-back range, and no log line anywhere says so.
+
+**Why non-obvious**: nothing was broken. runner-preserve worked (lesson #13),
+the ladder worked, `tp_hits` was set correctly, the SL watcher was running and
+polling that contract every 5 seconds. Each component was inside its own
+contract; the gap is that **the stop's anchor is a fact about entry, while the
+thing being protected had become a fact about the highest tier already banked**.
+The log line even enumerates the fallbacks, which makes it read like a handoff
+to something — that phrasing is what stops you from checking whether the
+recipient exists. #30 is the same shape one level down: a rule inherited a
+premise nobody restated. Here the premise is "the stop still means something".
+
+**Defense**: `policy/positions.sl_ratchet_floor` — once tier k is set in
+`tp_hits`, the SL floor moves up to the rung below it (T1 → breakeven, T2 →
+lock the T1 threshold), divided by `(1 − sell_slip)` because the threshold is a
+**trigger** price and the fill is `last × (1 − slip)`; an unadjusted "breakeven
+stop" loses exactly one slippage. `sl_watcher._sl_tick` takes `max(old, floor)`
+— the ratchet may only tighten. `SL_RATCHET_AFTER_TP=0` restores the old
+behavior verbatim.
+
+**Known and deliberately out of scope**: this only reaches positions already in
+the SL watch list (`apply_sl=True`, plus the lotto floor). `swing` is
+`apply_sl=False` and never enters the watcher at all, so a swing runner that
+banks T1 is still naked — that is the AAPL of #30, still true. Giving an entire
+category a stop is a money-path decision that needs its own call, not a
+side effect of this patch. Filed as ROADMAP P1 §16.
+
+**General form**: when a component declines to act and logs "X / Y / Z will
+handle it", that sentence is a claim about three other components, and nothing
+verifies it. Write the check, or write the handoff as what it is — "nothing
+else is watching this".
+
+---
+
+## 32. Same shape, new preposition: the fraction pipeline was there, the door wasn't
+
+**Symptom**: 9/1, enrich called the COIN trim twice, both bilingual, four
+messages, all four `[parser] no signal`, zero alerts:
+
+| time | message | ZH twin |
+|---|---|---|
+| 01:45 | `Start securing some.` | `开始确保一些。` |
+| 02:49 | `$COIN - Down to 1/2.` | `$COIN - 降至 1/2。` |
+
+`FRACTION_DOWN_TO_PATTERN` ("down to X/Y" → sell 1−X/Y) has been in
+`_extract_pct` since 7/6, and `ZH_FRACTION_TO_PATTERN` alongside it. Fed
+directly, `parse_close` still returned `None` — the pct stage is never reached,
+because `detect_action` said OPEN and `_has_action_verb` said no verb.
+
+**Why non-obvious**: this is the *third* time the same defect has been filed
+(8/3 "out 1/2" → `_OUT_FRACTION_PATTERN`; 8/25 `减半` → routing table;
+lesson #25's general form). Each fix added the one missing shape. What keeps
+recurring is the assumption underneath: **an extraction pattern existing feels
+like the feature existing.** The pct stage is the visible, testable, satisfying
+half; the verb/routing gate is a precondition two files away, and it is where
+the message actually dies. `test_close_routing_sync.py` catches exactly one
+direction of this (parse ⇒ route) and it did **not** fire here, because
+`parse_close` didn't parse either — both gates were shut, so the invariant
+was vacuously true.
+
+**Defense**: `_DOWN_TO_FRACTION_PATTERN` / `_SECURE_SOME_PATTERN` and their ZH
+twins, defined once in `close_parser` and imported by `signal_parser` (routing
+and parsing move together, per the file's own rule). Both carry their boundary
+conditions in the pattern rather than in a caller:
+
+- down-to **must** be followed by a fraction with num<den, den∈[2,5], the same
+  enumeration as `_OUT_FRACTION_PATTERN` — bare "down to" is narration
+  ("down to 2.50 support") and KC slang ("down to runners");
+- securing **must** take a trim object (`some|a few|half|part|profits`).
+  Bare `secure/securing/确保` is the dangerous one, and the counterexample is
+  in the *same night's* log: 00:59 `make sure it stays that way` / `确保它保持
+  这样`. Two more sit in history: 8/18 `to secure small green trade`, and 7/23
+  `stop at entry now to secure green trade` — whose safety this file already
+  records as "the EN twin has no EN verb, so it's safe". Adding the bare word
+  would have quietly falsified that recorded conclusion.
+
+**Deliberately not fixed**: 04:31 `holding 1/4 into tomorrow` (and its 05:43
+recap) went from our 1/2 to his 1/4, so semantically it *is* another trim. It
+is caught by the holding/recap guard from lesson #24, on purpose. Turning a
+"what I still hold" statement into a sell order is the opposite policy from
+the one #24 was written to enforce; it needs its own decision, not a regex.
+Filed as ROADMAP P1 §17.
+
+**General form**: ask of any parser fix "which gate did the message actually
+die at?" — not "does a pattern for this exist?". And when an invariant test
+exists for the failure class, check whether it can fire on the new case;
+"A ⇒ B" proves nothing when A is also false.
+
+---
+
+## 33. An alert that has no possible action trains you to ignore the alert that does
+
+**Symptom**: 9/1, the reconciler logged the same three drift lines every round
+for 49 rounds — 147 identical WARNINGs:
+
+```
+[reconcile] drift broker_only: US.NVDA260918C250000 db=0 broker=1
+[reconcile] drift broker_only: US.SOFI270115C20000  db=0 broker=1
+[reconcile] drift broker_only: US.UPS270115C130000  db=0 broker=1
+```
+
+All three are LEAPS (Sept '26 / Jan '27) in the paper account. This bot only
+buys weeklies and swings. Checked against `trades.db`: none of the three has
+**ever** had a row, in any status. They were not opened by us and never will be.
+
+**Why non-obvious**: every layer behaved as designed. `broker_only` is a real
+diff category; the module's docstring explicitly refuses to auto-handle it
+("凭空造记录要猜入场价"), which is right; the TG throttle correctly sent one
+message and then went quiet on an unchanged signature; and the per-round
+WARNING is a *deliberate* 0016 decision so that a throttled night still leaves
+forensics. Each of those is defensible, and together they produced 147 lines of
+which **not one was actionable** — while the next real ghost (the 8/13 MU 945c
+shape: we opened it, DB says closed, broker says it's still there) prints in
+exactly the same format, at the same level, in the same place.
+
+**Defense**: `KIND_FOREIGN`. `diff_positions` takes an optional `known_codes`
+(codes that appear in `positions` in *any* status, via
+`positions_db.known_option_codes`) and splits broker-side extras by **cause**,
+not severity: seen before → `broker_only`, a real accounting split, still one
+WARNING per round, unchanged; never seen → `foreign`, INFO through a 6-hour
+`logdedup` window, and a TG section that says in words that nothing will ever
+auto-handle it. Omitting `known_codes` reproduces 0016 verbatim.
+
+**General form**: log volume is not the cost — the cost is that a recurring
+unactionable line and a rare actionable one become indistinguishable, and the
+human learns the wrong one. Before adding a periodic warning, ask what the
+reader is supposed to *do*, and what happens on the thousandth time they can't.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -1547,6 +1697,9 @@ downside is priced in dollars.
 | 28 | 唤醒成功 ≠ 机器醒着（定时唤醒只买到一个 idle-sleep 窗口） | 无自动回归（launchd / pmset 是宿主行为，测不了）。防御在 `~/Library/LaunchAgents/com.chengqiu.autotrade.night.plist` 的多个 `StartCalendarInterval`（23:11 落在唤醒窗口内 + 23:15/20/25 兜底），幂等性由 `ops/night_run.sh` 的 `pgrep` 守卫保证。**验证方法**：早上比对 `logs/ops.log` 的 `night_run: starting` 与 23:15，差值 > 1 分钟即复发 |
 | 29 | 发言人标签不是 ticker；白名单挡住不代表你有防护 | `test_overnight_0829.py::test_new_relay_prefix_no_longer_leaks_bot_as_ticker`（当晚原文）、`::test_old_format_also_stopped_leaking_kc`（老格式一直在漏）、`::test_relay_prefix_shapes`（4 种形状）。**反向护栏**：`::test_relay_prefix_leaves_real_content_alone`（4 条正文一个字不许动）、`::test_prefixed_close_still_executes`（剥完真指令仍要执行）、`::test_relay_prefix_does_not_affect_open_path`（钉住"只在 close 侧剥"这个决定的前提） |
 | 30 | 被动变成 runner 的仓位，继承了为"主动选择的 runner"写的策略 | `test_overnight_0829.py::test_strategy_b_would_have_sold_last_nights_aapl`（当晚两次报价都该全出）、`::test_strategy_b_threshold_boundaries`（无报价/低于阈值/刚过阈值三档）。上游成因见 #27；runner-preserve 本身的契约见 #13 |
+| 31 | 规则日志里点名的兜底，不查就不是兜底 | 策略层：`test_overnight_0901.py::test_last_nights_runner_was_naked_below_entry`（契约翻转：前身阈值就是 1.04）、`::test_t1_floor_is_true_breakeven_not_bare_entry`（滑点折算——不折算的"保本止损"会亏掉一个 slip）、`::test_ratchet_locks_one_rung_below_the_highest_hit_tier`（weekly/swing × 档位矩阵，含 T1 熔断跳档）、`::test_ratchet_stays_out_of_the_way`（一档未中/无阶梯类目/坏 entry 一律沉默）。**不变量**：`::test_ratchet_never_loosens_the_stop`（棘轮只抬不放，钉死 `max(旧阈值, 棘轮底)` 这个决定）。**消费端**（缺了它策略层就是空转，见 #22）：`::test_watcher_sells_the_runner_at_the_ratchet_floor`、`::test_ratchet_off_reproduces_last_nights_silence`（开关关掉逐字复现 9/1 那晚）、`::test_ratchet_does_not_touch_a_position_that_never_hit_a_tier`。**swing 仍裸奔**（apply_sl=False 压根不进 watcher）未修，见 ROADMAP P1 §16 |
+| 32 | 同一个形状换个介词；抽取管道在、门没开 | 语料：`tests/corpus/2026-09-01.jsonl`（4 条当晚漏平原文 + 2 条反向护栏 + 2 条 holding recap + 当晚唯一开仓）。断言：`test_overnight_0901.py::test_last_nights_missed_trims_now_route_and_parse`（断的是下游 kind/symbols/pct，不是"能解析了"）。**反向护栏**：`::test_commentary_still_routes_to_open`（8 条，含同夜 `确保它保持这样` 与 7/23 的移动止损子句）、`::test_secure_purpose_clause_still_means_full_close_not_a_new_trim`（8/18 AMZN 的 100% 不许退化成 33）。**不变量**：`::test_holding_recap_is_still_not_a_close`（#24 的结论不许被本次外溢）。同族前案：#21 #24 #25 |
+| 33 | 无动作可做的告警会把有动作的那条训练成背景色 | `test_overnight_0901.py::test_never_seen_broker_positions_are_foreign_not_drift`（当晚三条 LEAPS 的真 code）、`::test_a_code_we_once_held_is_still_a_real_ghost`（8/13 MU 形状必须继续每轮 WARNING）、`::test_foreign_report_says_it_will_never_be_handled`（文案要说清"不会自动处理"）。**不变量**：`::test_known_codes_omitted_keeps_0016_behaviour_verbatim`（不传参数 = 0016 行为逐字）。契约扩充：`test_0016_reconciler.py::test_auto_close_never_touches_qty_mismatch_or_ghost` 现在两类各放一条 —— 分了类不许让"自动落账一条都不碰"只剩一类在被测 |
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |

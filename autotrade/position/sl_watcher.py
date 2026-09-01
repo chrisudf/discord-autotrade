@@ -24,6 +24,9 @@
                         只作用于 category in ("lotto", "0dte_lotto") 的仓位。
 - SL_POLL_INTERVAL    : 默认 5 秒
 - SL_SELL_SLIP        : 默认 0.08（卖出限价相对当前价的下偏移，确保成交）
+- SL_RATCHET_AFTER_TP : 默认 1（开）。TP 档位命中后把止损底抬到上一级
+                        （见 policy.positions.sl_ratchet_floor 的 9/1 案例）。
+                        0 = 关，阈值逐字退回 entry × (1 - pct)
 
 TODO（实测调整）：
 - 50% 阈值经验值，看真实 fill 数据后可能要按 category 分档（weekly 紧一点；
@@ -42,6 +45,7 @@ from autotrade.position import manager as position_mgr
 from autotrade.position import fill_checker
 from autotrade.position import retry_guard
 from autotrade.position.sell_executor import Outcome, SellPlan, execute_sell
+from autotrade.policy.positions import sl_ratchet_enabled, sl_ratchet_floor
 from autotrade.notify.transport import send_telegram
 # format_close_filled 已随成交 TG 收进 sell_executor（0015），此处只剩错误文案
 from autotrade.notify.messages import format_error
@@ -71,6 +75,8 @@ def _cfg() -> dict:
         "lotto_pct": env_int("LOTTO_STOP_LOSS_PCT", 0, minimum=0) / 100.0,
         "interval": int(os.getenv("SL_POLL_INTERVAL", "5")),
         "sell_slip": float(os.getenv("SL_SELL_SLIP", "0.08")),
+        # [9/1] TP 档位棘轮，缺省开；0 = 关，SL 逐字退回"锚在 entry"
+        "ratchet": sl_ratchet_enabled(),
     }
 
 
@@ -95,7 +101,8 @@ LOTTO_CATEGORIES = ("lotto", "0dte_lotto")
 _triggered: set[str] = set()
 
 
-async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip: float):
+async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip: float,
+                      reason: str = ""):
     """对单个仓位触发止损全平。
 
     [0015] 执行骨架（锁→重读→防护→下单→记账→fill_confirm→TG）合并进
@@ -129,15 +136,16 @@ async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip:
         if limit <= 0:
             # 极低价兜底——0.01 起挂
             limit = 0.01
+        why = f" [{reason}]" if reason else ""
         logger.warning(
             f"[sl] 🛑 TRIGGER {code}: last={last_price:.2f} <= threshold={threshold:.2f} "
-            f"(entry={fresh['avg_entry_price']:.2f}), selling {qty} @ {limit}"
+            f"(entry={fresh['avg_entry_price']:.2f}){why}, selling {qty} @ {limit}"
         )
         return SellPlan(
             qty=qty, limit=limit, remark="sl_polling", notify_pct=100,
             note=(
                 f"SL: last={last_price:.2f} threshold={threshold:.2f} "
-                f"entry={fresh['avg_entry_price']:.2f}"
+                f"entry={fresh['avg_entry_price']:.2f}{why}"
             ),
         )
 
@@ -271,8 +279,18 @@ async def _sl_tick():
         # 阈值判断/冻结语义/卖出路径与全局 SL 完全同一条代码（_trigger_sl），
         # 分档只体现在 pct 来源——这是 0013 的硬要求，避免第二条卖出路径。
         threshold = pos["avg_entry_price"] * (1 - pct)
+        reason = ""
+        # [9/1] 棘轮：已触发的 TP 档位把底抬到上一级（见 policy.sl_ratchet_floor）。
+        # 只取更高者——棘轮永远不许把止损**放松**，哪怕将来 LADDER 改出个
+        # 低于 entry×(1-pct) 的档位。开关关掉即逐字退回旧行为。
+        if cfg["ratchet"]:
+            floor, why = sl_ratchet_floor(
+                pos.get("category"), pos.get("tp_hits", 0),
+                pos["avg_entry_price"], cfg["sell_slip"])
+            if floor is not None and floor > threshold:
+                threshold, reason = floor, why
         if last <= threshold:
-            await _trigger_sl(pos, last, threshold, cfg["sell_slip"])
+            await _trigger_sl(pos, last, threshold, cfg["sell_slip"], reason)
 
 
 async def run_sl_watcher():
@@ -282,6 +300,7 @@ async def run_sl_watcher():
     logger.info(
         f"[sl] watcher started: pct={cfg['sl_pct']*100:.0f}% "
         f"lotto_floor={lotto_desc} "
+        f"ratchet={'on' if cfg['ratchet'] else 'off'} "
         f"interval={cfg['interval']}s sell_slip={cfg['sell_slip']*100:.0f}%"
     )
     while True:

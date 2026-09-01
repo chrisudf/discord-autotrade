@@ -19,14 +19,18 @@ from autotrade.parsing.holidays import adjust_to_trading_day, is_trading_day
 # 不反向 import 本模块，无循环风险。
 from autotrade.parsing.close_parser import (
     _CHOP_HALF_PATTERN,
+    _DOWN_TO_FRACTION_PATTERN,
     _OUT_BARE_SYM_PATTERN,
     _OUT_FRACTION_PATTERN,
     _OUT_PCT_PATTERN,
     _OUT_REST_PATTERN,
     _RUNNERS_ONLY_PATTERN,
+    _SECURE_SOME_PATTERN,
     _TOOK_OFF_PATTERN,
+    _ZH_DOWN_TO_FRACTION_PATTERN,
     _ZH_OUT_FRACTION_PATTERN,
     _ZH_RUNNERS_ONLY_PATTERN,
+    _ZH_SECURE_SOME_PATTERN,
 )
 from autotrade.utils.logger import logger
 
@@ -1072,6 +1076,19 @@ WEAK_CLOSE_RE = re.compile(
     + r"|" + _OUT_REST_PATTERN
     + r"|" + _TOOK_OFF_PATTERN
     + r"|" + _RUNNERS_ONLY_PATTERN
+    # [9/1 COIN] "Down to 1/2." / "Start securing some." 双语双漏，enrich 一晚
+    # 喊了两次减仓，两次都整条落 OPEN 侧的 [parser] no signal，零告警。
+    # 四条 pattern（含 ZH 两条）全部 import 自 close_parser，路由与解析同进同退。
+    #
+    # **ZH 两条也放 WEAK 而不是 STRONG**，与既有 ZH 条目（减半/出半/削减一半）
+    # 的惯例相反，这是有意的：那些是明确的平仓动词，这两条的词根（降至/确保）
+    # 本身是中性词，只靠"跟分数"/"跟宾语"的边界条件才成为动作。留着
+    # OPEN_INTENT 一票否决这层保险，符合本文件一贯的"宁漏平不误平"。
+    # ZH 纯中文句里几乎不含 EN 的 OPEN_INTENT 词，实际行为与 STRONG 一致。
+    + r"|" + _DOWN_TO_FRACTION_PATTERN
+    + r"|" + _SECURE_SOME_PATTERN
+    + r"|" + _ZH_DOWN_TO_FRACTION_PATTERN
+    + r"|" + _ZH_SECURE_SOME_PATTERN
     + r"|\bselling\b"
     r"|\bscaling\s+down\b"
     # [8/26 扫描补漏] cut/cutting/dumped/dumping 在 close_parser.FULL_CLOSE_VERBS

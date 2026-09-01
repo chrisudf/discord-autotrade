@@ -380,6 +380,27 @@ def get_open_positions() -> list[dict]:
     return [_row_to_dict(r) for r in rows]
 
 
+def known_option_codes(codes: list[str]) -> set[str]:
+    """这些 code 里，**任何状态**下在本表出现过的那些。
+
+    [9/1] 给 reconciler 分辨 broker_only 的两种成因用：
+      - 出现过 → 我们开过它，broker 侧还在 = 记账脱钩（真漂移，要吼）；
+      - 从没出现过 → 手动/历史外仓，bot 既没开过也永远不会自动处理它
+        （见 reconciler 的 broker_only "凭空造记录" 那段），每轮 WARNING
+        只是把真漂移淹掉。
+    一次查询、参数化 IN；空列表直接返回空集，不打 DB。
+    """
+    if not codes:
+        return set()
+    placeholders = ",".join("?" * len(codes))
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            f"SELECT option_code FROM positions WHERE option_code IN ({placeholders})",
+            list(codes),
+        ).fetchall()
+    return {r[0] for r in rows}
+
+
 def get_open_symbols() -> set[str]:
     """活跃仓位的 symbol 集合 —— 供 CLOSE parser 做白名单消歧用。"""
     with sqlite3.connect(DB_PATH) as conn:

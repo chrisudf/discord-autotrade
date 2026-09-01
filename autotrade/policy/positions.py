@@ -212,3 +212,72 @@ LADDER = {
     ],
     # 0dte / lotto / 0dte_lotto 不在表里 = 不挂 TP
 }
+
+
+# ============ SL 棘轮：已落袋的档位把止损底抬上来 ============
+#
+# [9/1 实锤] COIN 190C 9/4，entry 2.08 两张。02:42 T1 命中卖 1 张 @2.99；
+# 03:12 T2 命中（last ≥ 4.16）但剩 1 张、trim 50% 取整为 0 → runner-preserve
+# 保留不卖，日志写着"后续交给 SL / EOD / 喊单员平仓信号"。那一夜这三条腿
+# 全是虚的：eod_force_close=0，喊单员的 "Down to 1/2" 没被解析出来（同批已修），
+# 而 **SL 仍然锚在 entry 上**——STOP_LOSS_PCT=50% → 触发价 1.04。
+#
+# 也就是说：一张已经摸到 4.16 的合约，要跌回 1.04 系统才会动手。已经确认
+# 到手的 +100% 可以全部还回去，而且**没有任何一条日志会说这件事正在发生**。
+#
+# 这里补的是最小的一层：SL 的锚从"入场价"改成"已触发档位的上一级"——
+# 回吐最多一级，不做逐 tick 的移动止损（那是另一个需要报价历史的东西）。
+#   T1 命中（weekly +50%）→ 底 = 保本价（真·零风险，含卖出滑点）
+#   T2 命中（weekly +100%）→ 底 = entry × 1.50 / (1-slip)，锁住 +50%
+#
+# 为什么除以 (1 - sell_slip)：阈值是**触发价**，真正的成交价是 last×(1-slip)
+# （SL 默认 8%）。不折算的话"保本止损"实际会亏掉一个滑点，那就不叫保本。
+# 方向上偏保守（早触发一点），对止盈保护是对的。
+#
+# **作用域限于已经在 SL watch 名单里的仓位**（apply_sl=True + lotto 硬底档）。
+# swing 类目 apply_sl=False，压根不进 watcher —— 它们的 runner 命中 T1/T2
+# 之后同样在裸奔，但"给 swing 上止损"是改变一整个类目有没有止损，属钱路
+# 决定，要单独拍板，不在本次修改范围（见 ROADMAP P1 §16）。
+SL_RATCHET_ENV = "SL_RATCHET_AFTER_TP"
+
+
+def sl_ratchet_enabled() -> bool:
+    """1 = 开（缺省）。出事时一个 env 关掉，行为退回"锚在 entry"。"""
+    return env_int(SL_RATCHET_ENV, 1, minimum=0) > 0
+
+
+def sl_ratchet_floor(category: str, tp_hits: int, avg_entry: float,
+                     sell_slip: float) -> "tuple[float, str] | tuple[None, str]":
+    """已触发的最高 TP 档位对应的止损底价。
+
+    Args:
+        category:   仓位类目（决定用哪张 LADDER）
+        tp_hits:    positions.tp_hits 位掩码（T1=1 / T2=2 / T3=4）
+        avg_entry:  我方实际成交均价
+        sell_slip:  SL 的卖出限价下偏移（用于把触发价折算成净额）
+
+    Returns:
+        (floor_price, 说明串)；无阶梯 / 一档未中 / 参数异常 → (None, "")
+
+    纯函数：不读 env、不碰 DB —— 开关与"取更高者"的决定留在 sl_watcher。
+    """
+    ladder = LADDER.get(category) or []
+    if not ladder or not tp_hits or not avg_entry or avg_entry <= 0:
+        return None, ""
+    if not 0 <= sell_slip < 1:
+        return None, ""
+
+    # 已命中的最高档在 ladder 里的下标；上一级的 threshold 就是要锁住的收益。
+    # 逐个比对位掩码而不是按 popcount：熔断/跳档的历史下 tp_hits 未必连续。
+    hit_idx = -1
+    for i, (_threshold, _trim, tier_bit) in enumerate(ladder):
+        if tp_hits & tier_bit:
+            hit_idx = i
+    if hit_idx < 0:
+        return None, ""
+
+    locked_pct = ladder[hit_idx - 1][0] if hit_idx > 0 else 0.0
+    floor = round(avg_entry * (1 + locked_pct) / (1 - sell_slip), 2)
+    tier_no = hit_idx + 1
+    desc = "保本" if locked_pct == 0 else f"锁 +{int(locked_pct * 100)}%"
+    return floor, f"T{tier_no} 已触发 → 棘轮底 {desc}"

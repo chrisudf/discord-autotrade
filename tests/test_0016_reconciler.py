@@ -431,19 +431,30 @@ async def test_auto_close_writes_db_and_drops_position_from_watchers(monkeypatch
 
 
 async def test_auto_close_never_touches_qty_mismatch_or_ghost(monkeypatch):
-    """只落 db_only：qty 不一致（升级路径 2 未拍板）和幽灵仓都不动。"""
+    """只落 db_only：qty 不一致（升级路径 2 未拍板）和 broker 多出来的仓都不动。
+
+    [9/1 扩充] broker 多出来的仓现在分两类（KIND_BROKER_ONLY / KIND_FOREIGN），
+    这里两类各放一条：本测试钉的是"自动落账一条都不许碰它们"，那条不变式
+    对两类同样成立，不能因为分了类就只剩一类在被测。
+    """
     monkeypatch.setenv("DRY_RUN", "false")
     mismatch = _uniq_code("AC3")
     _open_pos("AC3", mismatch, qty=2)
+    # 幽灵仓：我们开过、DB 已 CLOSED、broker 说还在 = 记账脱钩
+    ghost = _uniq_code("AC3G")
+    _open_pos("AC3G", ghost, qty=1)
+    positions_db.record_close(option_code=ghost, qty_sold=1, fill_price=1.0,
+                              trigger_source="ut", note="make it a ghost")
 
     tg = AsyncMock(return_value=True)
     with patch.object(reconciler, "list_open_option_positions",
-                      return_value={mismatch: 1, _uniq_code("GHOST"): 3}), \
+                      return_value={mismatch: 1, ghost: 1, _uniq_code("GHOST"): 3}), \
          patch.object(reconciler, "send_telegram", tg):
         diffs = await reconciler._reconcile_tick()
 
     kinds = {d["kind"] for d in diffs}
-    assert kinds == {reconciler.KIND_QTY_MISMATCH, reconciler.KIND_BROKER_ONLY}
+    assert kinds == {reconciler.KIND_QTY_MISMATCH, reconciler.KIND_BROKER_ONLY,
+                     reconciler.KIND_FOREIGN}
     pos = positions_db.get(mismatch)
     assert pos["status"] == "OPEN" and pos["qty_remaining"] == 2
     assert "已自动落账" not in tg.await_args.args[0]

@@ -45,6 +45,7 @@ from autotrade.broker.trade import list_open_option_positions
 from autotrade.notify.transport import send_telegram
 from autotrade.notify.watchdog import notify_tick_error, notify_tick_ok
 from autotrade.storage import positions_db
+from autotrade.utils import logdedup
 from autotrade.utils.envcfg import env_int
 from autotrade.utils.logger import logger
 
@@ -52,6 +53,18 @@ from autotrade.utils.logger import logger
 KIND_DB_ONLY = "db_only"            # DB 有 / broker 无：疑似已行权或场外平仓
 KIND_BROKER_ONLY = "broker_only"    # broker 有 / DB 无：幽灵仓，bot 不会保护
 KIND_QTY_MISMATCH = "qty_mismatch"  # 两边都有但张数不同：部分场外平仓/记账失败
+# [9/1] broker 有 / DB **从来没有过**：手动开的、或本仓库之前就存在的外部持仓。
+# 与 broker_only 的区别不是严重程度，是**成因与可行动作**：
+#   broker_only（幽灵）= 我们开过它、DB 说没了、broker 说还在 → 记账脱钩，要吼；
+#   foreign（外仓）    = 我们从没开过它 → 不是漂移，bot 也永远不会自动处理它
+#                        （见 docstring "凭空造记录要猜入场价" 那段）。
+#
+# 9/1 夜的实证：NVDA 250C 9/18、SOFI 20C 2027-01、UPS 130C 2027-01 三条
+# 每轮一条 WARNING 连报 49 轮 = 147 行，签名不变所以 TG 只响过一次。
+# 它们全都从没进过 trades.db（LEAPS，本 bot 只打 weekly/swing），也就是说
+# **这 147 行里没有一行是可行动的**，而下一次真漂移出现时长得一模一样。
+# 这类噪音的代价不是磁盘，是把 broker_only 这个信号训练成了背景色。
+KIND_FOREIGN = "foreign"
 
 # 上一轮的漂移签名（进程级）。同一份漂移每轮重发 TG 就是 7/23 夜
 # runner-preserve 6 连发的重演（0002 的教训：动作照常执行并留 log，
@@ -83,6 +96,10 @@ _last_signature: "tuple | None" = None
 #   3. 单轮最多落账 RECONCILE_AUTO_CLOSE_MAX 条（默认 3）：超过这个数更像
 #      查询侧出了问题，不像真有那么多仓同时消失。
 _DEFAULT_AUTO_CLOSE_MAX = 3
+
+# 外仓日志收敛窗口：6 小时。取值只需满足"整夜出现一两次"——比任何合理的
+# RECONCILE_INTERVAL_MIN 都长，又短到一整夜必留痕。不走 env：这不是策略参数。
+_FOREIGN_LOG_WINDOW_SEC = 6 * 3600
 
 
 def _auto_close_enabled() -> bool:
@@ -154,7 +171,8 @@ def _interval_min() -> int:
     return env_int("RECONCILE_INTERVAL_MIN", 0, minimum=0)
 
 
-def diff_positions(db_rows: list[dict], broker_rows: dict[str, int]) -> list[dict]:
+def diff_positions(db_rows: list[dict], broker_rows: dict[str, int],
+                   known_codes: "set[str] | None" = None) -> list[dict]:
     """本地 DB open 仓位 vs broker 持仓的差异列表。纯函数，不做 I/O。
 
     diff 逻辑抽自 ops/sync_positions.sync()（那边的 stale 判定 =
@@ -167,6 +185,10 @@ def diff_positions(db_rows: list[dict], broker_rows: dict[str, int]) -> list[dic
         db_rows: positions_db.get_open_positions() 形状的 dict 列表
                  （只消费 option_code / qty_remaining 两个键）
         broker_rows: {option_code: qty}（broker 侧期权持仓；qty<=0 视为无仓）
+        known_codes: 在 positions 表里**任何状态**出现过的 code 集合。
+                 只用来把 broker_only 拆成"幽灵仓"与"外仓"两类
+                 （见 KIND_FOREIGN）。**None = 不区分**，全部按
+                 broker_only 给出——0016 以来的行为逐字不变。
 
     Returns:
         [{kind, option_code, db_qty, broker_qty}, ...]
@@ -196,7 +218,10 @@ def diff_positions(db_rows: list[dict], broker_rows: dict[str, int]) -> list[dic
         qty = int(broker_rows.get(code) or 0)
         if qty <= 0 or code in seen_db:
             continue
-        diffs.append({"kind": KIND_BROKER_ONLY, "option_code": code,
+        kind = KIND_BROKER_ONLY
+        if known_codes is not None and code not in known_codes:
+            kind = KIND_FOREIGN
+        diffs.append({"kind": kind, "option_code": code,
                       "db_qty": 0, "broker_qty": qty})
 
     return diffs
@@ -220,6 +245,11 @@ def _format_report(diffs: list[dict], auto_note: str = "") -> str:
     if KIND_BROKER_ONLY in by_kind:
         lines.append("• broker 有 / DB 无（幽灵仓，SL/TP/EOD 不会保护它）:")
         for d in by_kind[KIND_BROKER_ONLY]:
+            lines.append(f"  - {d['option_code']} broker {d['broker_qty']} 张")
+    if KIND_FOREIGN in by_kind:
+        lines.append("• broker 有 / DB 从无此记录（外仓：非本 bot 开的，"
+                     "SL/TP/EOD 不管它，对账也不会自动处理）:")
+        for d in by_kind[KIND_FOREIGN]:
             lines.append(f"  - {d['option_code']} broker {d['broker_qty']} 张")
     if KIND_QTY_MISMATCH in by_kind:
         lines.append("• 张数不一致（部分场外平仓 / 记账失败）:")
@@ -251,7 +281,13 @@ async def _reconcile_tick() -> list[dict]:
     # 每轮告警就是新的噪音源，连接类故障已有 probe/stale-session 通道兜着）。
     broker_rows = await asyncio.to_thread(list_open_option_positions)
 
-    diffs = diff_positions(db_rows, broker_rows)
+    # broker 侧比 DB 多出来的 code 先过一遍历史表，分出"幽灵仓/外仓"（见 KIND_FOREIGN）。
+    # 只查这几个 code，不是全表扫描；没有多余 code 时连 DB 都不碰。
+    open_codes = {p["option_code"] for p in db_rows}
+    extra = [c for c, q in broker_rows.items() if int(q or 0) > 0 and c not in open_codes]
+    known = positions_db.known_option_codes(extra)
+
+    diffs = diff_positions(db_rows, broker_rows, known_codes=known)
     if not diffs:
         # 漂移清零 → 重置签名：同样的漂移将来再出现，属于新事件要重新告警
         _last_signature = None
@@ -259,11 +295,20 @@ async def _reconcile_tick() -> list[dict]:
             f"[reconcile] OK: broker {len(broker_rows)} / DB {len(db_rows)}，无漂移")
         return []
 
-    # log 每轮完整记录（半夜 TG 被节流时，复盘还有日志可查）
+    # log 每轮完整记录（半夜 TG 被节流时，复盘还有日志可查）——**真漂移照旧
+    # 每轮一条 WARNING，这是 0016 的有意设计，不动**。
+    # 外仓是唯一的例外：它不是漂移、没有可行动作、内容永远不变（9/1 夜 147 行），
+    # 逐轮 WARNING 只会把上面那条真信号淹掉。降到 INFO + 长窗口收敛，
+    # 一晚仍会留痕，但不再是背景色。
     for d in diffs:
-        logger.warning(
-            f"[reconcile] drift {d['kind']}: {d['option_code']} "
-            f"db={d['db_qty']} broker={d['broker_qty']}")
+        line = (f"[reconcile] drift {d['kind']}: {d['option_code']} "
+                f"db={d['db_qty']} broker={d['broker_qty']}")
+        if d["kind"] == KIND_FOREIGN:
+            logdedup.log_throttled(
+                f"reconcile-foreign:{d['option_code']}:{d['broker_qty']}",
+                line, level="INFO", window=_FOREIGN_LOG_WINDOW_SEC)
+        else:
+            logger.warning(line)
 
     # [0018] 确定性漂移自动落账。放在 TG 节流**之前**：这一轮真的动了 DB，
     # 那就是新事件，不能被"与上一轮签名相同"压掉（8/13 那一夜正是被压掉的）。
