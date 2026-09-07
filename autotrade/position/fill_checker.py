@@ -27,6 +27,7 @@ TODO（实测调整）：
 import asyncio
 import os
 
+from autotrade.broker import inflight
 from autotrade.broker.trade import query_order_status
 from autotrade.notify.transport import send_telegram
 from autotrade.notify.messages import format_error
@@ -91,6 +92,12 @@ async def confirm_buy_fill(order_id: str, option_code: str, qty: int, limit_pric
         return
     try:
         res = await _poll_until_terminal(order_id)
+        # [9/2] 在飞登记销账。**只在拿到终态时销** —— timeout 的语义是"仍然
+        # 不知道成没成交"，那正是 naked-short 该被豁免的状态（见 broker/inflight）。
+        # 9/2 TSLA 就死在这里：超时之后 2 分钟来的平仓信号撞上 broker 的 0 长仓，
+        # 被判成确定性拒单永久熔断，而那张单后来是成交了的。
+        if res["outcome"] != "timeout":
+            inflight.clear(option_code)
         if res["outcome"] == "filled":
             dealt = res.get("filled_avg_price") or 0.0
             # [ROADMAP P1 #14 (a)] filled 分支无论走哪条都留一行。
