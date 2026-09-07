@@ -1118,6 +1118,32 @@ def _drop_unattributable_price(symbols: list, signal_price, lang: str, text: str
     return None, True
 
 
+def _normalize_en(text: str) -> str:
+    """EN 侧的从句剥离链。
+
+    **`_parse_close_en` 与 `parse_symbolless_close` 共用同一份** —— 两边各写
+    一遍就是一条误平裂缝（同 signal_parser 与本模块 pattern 共享的理由）。
+    每一条的实锤见对应 RE 的定义处注释。
+    """
+    # 建议句（7/29 SPY "if you want to exit"）。与 ZH 侧同一层：
+    # EN 当晚返回 None 靠的是 KC 写了小写 "spy"，不是防护。
+    text = EN_SUGGESTION_CLAUSE_RE.sub(" ", text)
+    text = EN_OPTIONAL_CLAUSE_RE.sub(" ", text)   # 否定条件句抹到句末（8/3 SPY）
+    text = EN_AFTER_CLAUSE_RE.sub(" ", text)      # 时间状语从句（8/20 PLTR EN 侧）
+    return text
+
+
+def _normalize_zh(text: str) -> str:
+    """ZH 侧的归一化 + 从句剥离链。共用理由同 `_normalize_en`。"""
+    text = ZH_OUT_HALF_RE.sub("减半", text)          # "出半(仓)" → 减半（7/23 NBIS）
+    text = ZH_OUT_FRACTION_RE.sub(r"卖出\1", text)   # "出 1/2" → 卖出 1/2（8/3 TSLA）
+    text = ZH_SL_ADJUST_CLAUSE_RE.sub(" ", text)     # 移动止损备注（7/23 AVGO）
+    text = ZH_SUGGESTION_CLAUSE_RE.sub(" ", text)    # 建议句（7/29 SPY）
+    text = ZH_OPTIONAL_CLAUSE_RE.sub(" ", text)      # 否定条件句（8/3 SPY）
+    text = ZH_AFTER_CLAUSE_RE.sub(" ", text)         # 时间状语从句（8/20 PLTR）
+    return text
+
+
 def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
     """英文路径（原 parse_close 逻辑）。"""
     text_lower = text.lower()
@@ -1127,13 +1153,7 @@ def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
     if any(m in text_lower for m in AUTHOR_HOLD_MARKERS):
         logger.info(f"[close_parser] EN skip (author holding): {text[:80]}")
         return None
-    # 建议句抹掉（见 EN_SUGGESTION_CLAUSE_RE 注释，7/29 SPY "if you want to exit"）。
-    # 与 ZH 侧同一层：EN 当晚返回 None 靠的是 KC 写了小写 "spy"，不是防护。
-    text = EN_SUGGESTION_CLAUSE_RE.sub(" ", text)
-    # 否定条件句抹到句末（见 EN_OPTIONAL_CLAUSE_RE 注释，8/3 SPY）
-    text = EN_OPTIONAL_CLAUSE_RE.sub(" ", text)
-    # 时间状语从句抹掉（见 EN_AFTER_CLAUSE_RE 注释，8/20 PLTR 的 EN 侧）
-    text = EN_AFTER_CLAUSE_RE.sub(" ", text)
+    text = _normalize_en(text)
     text_lower = text.lower()
     if not _has_action_verb(text_lower, text):
         return None
@@ -1327,18 +1347,7 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
     if any(m in text for m in ZH_AUTHOR_HOLD_MARKERS):
         logger.info(f"[close_parser] ZH skip (author holding): {text[:80]}")
         return None
-    # "出半(仓)" 带边界归一化成"减半"（见 ZH_OUT_HALF_RE 注释，7/23 NBIS）
-    text = ZH_OUT_HALF_RE.sub("减半", text)
-    # "出 1/2" 带边界归一化成"卖出 1/2"（见 ZH_OUT_FRACTION_RE 注释，8/3 TSLA）
-    text = ZH_OUT_FRACTION_RE.sub(r"卖出\1", text)
-    # 移动止损备注抹掉（见 ZH_SL_ADJUST_CLAUSE_RE 注释，7/23 AVGO 误判）
-    text = ZH_SL_ADJUST_CLAUSE_RE.sub(" ", text)
-    # 建议句抹掉（见 ZH_SUGGESTION_CLAUSE_RE 注释，7/29 SPY "若想止盈离场"）
-    text = ZH_SUGGESTION_CLAUSE_RE.sub(" ", text)
-    # 否定条件句抹到句末（见 ZH_OPTIONAL_CLAUSE_RE 注释，8/3 SPY "若不想…可…平仓"）
-    text = ZH_OPTIONAL_CLAUSE_RE.sub(" ", text)
-    # 时间状语从句抹掉（见 ZH_AFTER_CLAUSE_RE 注释，8/20 PLTR 误平）
-    text = ZH_AFTER_CLAUSE_RE.sub(" ", text)
+    text = _normalize_zh(text)
     if not _has_zh_action(text):
         return None
 
@@ -1411,3 +1420,79 @@ def parse_close(text: str, open_symbols: set[str]) -> Optional[dict]:
     text = strip_relay_prefix(text)
 
     return _parse_close_en(text, open_symbols) or _parse_close_zh(text, open_symbols)
+
+
+def parse_symbolless_close(text: str) -> Optional[dict]:
+    """**没写标的**的平仓跟进指令 —— 只做抽取，不决定平谁。
+
+    [9/2 实锤 -$166] KC 的习惯是开仓带 ticker、后续减仓不带。TSLA 345P
+    开仓 90 秒后第一条减仓就没有 ticker，双语双漏：
+
+        23:40:03  out half 2.82        → [CLOSE] parser skipped
+        23:40:05  2.82减半仓            → [zh_unrecognized]
+
+    `parse_close` 对这两条返回 None 是**对的** —— 它手里只有一句话，
+    没有任何依据决定平哪个仓。缺的判据（哪个频道、哪个仓刚开、喊价对不对得上）
+    全在 close_flow 那一层，所以本函数只回答"这是不是一条无标的平仓指令、
+    比例和喊价是多少"，绑定留给调用方（见 close_flow._bind_symbolless_close）。
+
+    **刻意不复用 parse_close 的返回值**：那个 None 契约被 48 条用例断言着，
+    是本仓库最贵的一条防线（误平的代价远高于漏平，见模块顶部）。本函数是
+    additive 的第二个入口，parse_close 的行为一个字节都没动。
+
+    五道闸门，缺一返回 None：
+      1. recap / 作者自述持有 —— 双语两套 marker 都在**原文**上跑（同主路径，
+         掩码会拆掉"将把"这类未来意图标记）
+      2. 有当前动作动词（EN 或 ZH 任一）
+      3. **不是** bulk —— "close all positions" 有 BULK_TRIM 走，不归这里
+      4. **全文抓不到任何 ticker**（连白名单外的也不许有）。抓到了但不在持仓，
+         那是"无仓可平"，必须继续返回 None —— 拿一句提到 META 的话去平
+         TSLA 是这条改动最该防的事故
+      5. 有喊价 —— 喊价是 close_flow 验证绑定对不对的唯一凭据（2.82 落在
+         TSLA 345P 的报价区间里，这条约束比任何词表都硬）
+    """
+    if not text or len(text.strip()) < 3:
+        return None
+    text = strip_relay_prefix(text)
+
+    # 1. recap / 持有自述：双语都拦，在任何改写之前跑原文
+    if _has_recap_marker(text.lower()) or _has_zh_recap(text):
+        return None
+    if (any(m in text.lower() for m in AUTHOR_HOLD_MARKERS)
+            or any(m in text for m in ZH_AUTHOR_HOLD_MARKERS)):
+        return None
+
+    en_text = _normalize_en(text)
+    zh_text = _normalize_zh(text)
+    en_lower = en_text.lower()
+
+    # 2. 当前动作动词
+    is_en = _has_action_verb(en_lower, en_text)
+    is_zh = _has_zh_action(zh_text)
+    if not (is_en or is_zh):
+        return None
+
+    # 3. bulk 有自己的路（BULK_TRIM 会遍历全部持仓，语义与"绑定到一个仓"相反）
+    if _has_bulk_marker(en_lower) or _has_zh_bulk(zh_text):
+        return None
+
+    # 4. 全文不许出现任何 ticker（_ANY_SYMBOLS = 跳过白名单，见其 docstring）
+    if _extract_symbols(en_text, _ANY_SYMBOLS) or _extract_zh_symbols(zh_text, _ANY_SYMBOLS):
+        return None
+
+    # 5. 喊价：绑定的凭据
+    lang = "en" if is_en else "zh"
+    scope = _action_sentences(en_text) if is_en else _zh_action_sentences(zh_text)
+    signal_price = _extract_signal_price(scope)
+    if signal_price is None:
+        return None
+
+    pct = _extract_pct(en_text, en_lower) if is_en else _extract_zh_pct(zh_text)
+    logger.info(
+        f"[close_parser] {lang.upper()} SYMBOLLESS close pct={pct} "
+        f"price={signal_price} text={text[:80]}"
+    )
+    return {"kind": "SYMBOLLESS", "symbols": [], "pct": pct,
+            "hint_strike": None, "hint_side": None,
+            "signal_price": signal_price, "signal_pnl_pct": None,
+            "matched": text[:120], "lang": lang}
