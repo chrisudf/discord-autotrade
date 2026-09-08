@@ -234,8 +234,8 @@ def place_order(signal: dict, qty: int = None) -> dict:
             order_id = str(data["order_id"].iloc[0])
             logger.info(f"[broker] 下单成功 order_id={order_id}")
             # [9/2] 提交 ≠ 成交。登记在飞，供下面 naked-short 判据用；
-            # fill_checker 拿到终态后销账。
-            inflight.mark_submitted(option_code)
+            # fill_checker 拿到终态后按 order_id 销账（同 code 可能有加仓单同时在飞）。
+            inflight.mark_submitted(option_code, order_id)
             return {
                 "success": True, "message": "submitted",
                 "order_id": order_id, "code": option_code,

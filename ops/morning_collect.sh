@@ -182,7 +182,9 @@ rm -f "$DIGEST_ERR"
 #
 # 同一条文案在一次故障里会重复几十遍（EOD 每 30s 一轮），所以按正文归并计数，
 # 只留首末时间。用 awk 不用 jq/python：本脚本的契约是纯 shell（见文件头）。
-UNDELIVERED="$PROJ/logs/undelivered_alerts.tsv"
+# 路径必须和 transport._undelivered_path() 同一个口径：那边认 LOG_DIR，
+# 这边写死 $PROJ/logs 的话，任何设了 LOG_DIR 的部署都会静默漏掉全部未送达告警。
+UNDELIVERED="${LOG_DIR:-$PROJ/logs}/undelivered_alerts.tsv"
 if [[ -s "$UNDELIVERED" ]]; then
   UNDELIVERED_SECTION=$(mktemp)
   awk -F'\t' -v since="$SINCE_UTC" '

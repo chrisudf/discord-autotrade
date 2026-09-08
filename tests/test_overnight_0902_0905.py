@@ -45,17 +45,45 @@ def _clean_state():
 
 def test_pending_buy_is_tracked_until_terminal():
     assert inflight.is_pending(CODE) is False
-    inflight.mark_submitted(CODE)
+    inflight.mark_submitted(CODE, "2104813")
     assert inflight.is_pending(CODE) is True
-    inflight.clear(CODE)
+    inflight.clear(CODE, "2104813")
     assert inflight.is_pending(CODE) is False
 
 
 def test_pending_expires_after_grace(monkeypatch):
     """豁免是有窗口的：过了窗口 broker 还说 0 张，那就是真脱钩，该熔断就熔断。"""
     monkeypatch.setenv("INFLIGHT_BUY_GRACE_SEC", "0")
-    inflight.mark_submitted(CODE)
+    inflight.mark_submitted(CODE, "2104813")
     assert inflight.is_pending(CODE) is False
+
+
+def test_overlapping_buys_on_one_code_do_not_clear_each_other():
+    """[PR#6 review] open_or_add 支持加仓，同 code 可以两张单同时在飞。
+
+    按 code 存单个时间戳的话，先到终态的那张会把另一张还活着的单的豁免
+    一起销掉 —— 那正是本模块要防的失败。
+    """
+    inflight.mark_submitted(CODE, "2104813")
+    inflight.mark_submitted(CODE, "2104999")   # 加仓单
+    inflight.clear(CODE, "2104813")            # 第一张成交了
+    assert inflight.is_pending(CODE) is True, "第二张还在飞，豁免不该没"
+    inflight.clear(CODE, "2104999")
+    assert inflight.is_pending(CODE) is False
+
+
+def test_clearing_an_unknown_order_is_harmless():
+    inflight.mark_submitted(CODE, "2104813")
+    inflight.clear(CODE, "别人的单")
+    inflight.clear("US.NOPE260904C1000", "2104813")
+    assert inflight.is_pending(CODE) is True
+
+
+def test_rebuild_restores_exemptions_after_a_restart():
+    """[PR#6 review] 崩溃重启后本表是空的，而 broker 那边的限价单可能还活着。"""
+    assert inflight.is_pending(CODE) is False
+    assert inflight.rebuild([CODE, "", None]) == 1
+    assert inflight.is_pending(CODE) is True
 
 
 def test_refused_message_still_trips_the_breaker():
@@ -86,13 +114,13 @@ def test_sell_order_picks_the_deferred_branch_while_buy_in_flight(monkeypatch):
     monkeypatch.setattr(trade, "_get_long_qty", lambda code: 0)
     monkeypatch.setattr(trade, "_is_dry_run", lambda: False)
 
-    inflight.mark_submitted(CODE)
+    inflight.mark_submitted(CODE, "2104813")
     res = trade.place_sell_order(CODE, qty=1, limit_price=2.80)
     assert res["success"] is False
     assert "naked-short deferred" in res["message"]
     assert is_deterministic_reject(res["message"]) is False
 
-    inflight.clear(CODE)
+    inflight.clear(CODE, "2104813")
     res2 = trade.place_sell_order(CODE, qty=1, limit_price=2.80)
     assert res2["success"] is False
     assert "naked-short refused" in res2["message"]
@@ -111,7 +139,7 @@ def _run_confirm(monkeypatch, outcome: dict):
 
     monkeypatch.setattr(fill_checker, "_poll_until_terminal", fake_poll)
     monkeypatch.setattr(fill_checker, "send_telegram", _noop_async)
-    inflight.mark_submitted(CODE)
+    inflight.mark_submitted(CODE, "2104813")
     asyncio.run(fill_checker.confirm_buy_fill("2104813", CODE, 2, 2.59))
 
 
@@ -159,12 +187,12 @@ def _sink(transport) -> str:
     return p.read_text(encoding="utf-8") if p.exists() else ""
 
 
-def test_failed_alert_lands_on_disk(_tg):
+def test_failed_alert_lands_on_disk(_tg, monkeypatch):
     """9/5 那 90 条 EOD 告警要在断网时留下痕迹，而不是只剩一行 WARNING。"""
     async def fail(text, parse_mode):
         return False
 
-    _tg._send_telegram_inner = fail
+    monkeypatch.setattr(_tg, "_send_telegram_inner", fail)
     assert asyncio.run(_tg.send_telegram("🕒 到期未平\nUS.NBIS260904C215000\t需人工")) is False
 
     lines = _sink(_tg).splitlines()
@@ -175,11 +203,11 @@ def test_failed_alert_lands_on_disk(_tg):
     assert body == "🕒 到期未平 / US.NBIS260904C215000 需人工"
 
 
-def test_successful_alert_is_not_recorded(_tg):
+def test_successful_alert_is_not_recorded(_tg, monkeypatch):
     async def ok(text, parse_mode):
         return True
 
-    _tg._send_telegram_inner = ok
+    monkeypatch.setattr(_tg, "_send_telegram_inner", ok)
     assert asyncio.run(_tg.send_telegram("正常送达")) is True
     assert _sink(_tg) == ""
 
@@ -191,14 +219,25 @@ def test_unconfigured_is_not_recorded(monkeypatch, _tg):
     assert _sink(_tg) == ""
 
 
-def test_sink_stops_growing_past_the_cap(_tg, monkeypatch):
-    """7/31 是磁盘写满引发的事故。断网期间这个文件是唯一还在长的东西。"""
+def test_sink_rotates_instead_of_going_silent(_tg, monkeypatch):
+    """7/31 是磁盘写满引发的事故，所以要有上限。
+
+    [PR#6 review] 但上限**不能是停写**：早间摘要只读最近 9 小时、没人截断这个
+    文件，停写等于"攒够 5MB 之后这条兜底永久静默"—— 而它恰恰是断网时唯一
+    还活着的告知路径。轮转保留一代，新告警永远写得进去。
+    """
     monkeypatch.setattr(_tg, "_UNDELIVERED_MAX_BYTES", 10)
 
     async def fail(text, parse_mode):
         return False
 
-    _tg._send_telegram_inner = fail
-    for _ in range(5):
-        asyncio.run(_tg.send_telegram("超过十个字节的一条告警"))
-    assert len(_sink(_tg).splitlines()) == 1
+    monkeypatch.setattr(_tg, "_send_telegram_inner", fail)
+    for i in range(5):
+        asyncio.run(_tg.send_telegram(f"超过十个字节的第 {i} 条告警"))
+
+    # 每次写完都超限 → 下一次先轮转，所以主文件里恒有最新那条
+    body = _sink(_tg)
+    assert "第 4 条" in body, ("最新的告警必须写得进去", body)
+    rotated = _tg._undelivered_path().with_suffix(
+        _tg._undelivered_path().suffix + ".1")
+    assert rotated.exists(), "旧的一代应轮转保留"

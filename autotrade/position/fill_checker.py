@@ -97,7 +97,7 @@ async def confirm_buy_fill(order_id: str, option_code: str, qty: int, limit_pric
         # 9/2 TSLA 就死在这里：超时之后 2 分钟来的平仓信号撞上 broker 的 0 长仓，
         # 被判成确定性拒单永久熔断，而那张单后来是成交了的。
         if res["outcome"] != "timeout":
-            inflight.clear(option_code)
+            inflight.clear(option_code, order_id)
         if res["outcome"] == "filled":
             dealt = res.get("filled_avg_price") or 0.0
             # [ROADMAP P1 #14 (a)] filled 分支无论走哪条都留一行。

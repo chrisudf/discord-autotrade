@@ -92,8 +92,10 @@ def escape_md(s) -> str:
 _UNDELIVERED_NAME = "undelivered_alerts.tsv"
 # 落盘失败不能反过来放倒调用方，但也不能无声——每进程只抱怨一次。
 _undelivered_broken = False
-# 7/31 是磁盘写满引发的事故。断网期间这个文件是唯一还在增长的东西，
-# 给它一个上限：超了就停写（日志仍在），不要为了记录告警把磁盘写满。
+# 7/31 是磁盘写满引发的事故。断网期间这个文件是唯一还在增长的东西，所以要有上限。
+# **超了轮转不是停写**（PR#6 review）：早间摘要只读最近 9 小时，没人截断这个文件，
+# 停写等于"攒够 5MB 之后这条兜底永久静默"——而它恰恰是断网时唯一还活着的告知路径。
+# 轮转保留一代（.1），最坏占 2×cap，新告警永远写得进去。
 _UNDELIVERED_MAX_BYTES = 5 * 1024 * 1024
 
 
@@ -108,12 +110,11 @@ def _record_undelivered(text: str) -> None:
     global _undelivered_broken
     try:
         path = _undelivered_path()
-        if path.exists() and path.stat().st_size >= _UNDELIVERED_MAX_BYTES:
-            if not _undelivered_broken:
-                _undelivered_broken = True
-                logger.error(f"[notify] {path} 已超 {_UNDELIVERED_MAX_BYTES} 字节，停止落盘")
-            return
         path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size >= _UNDELIVERED_MAX_BYTES:
+            # 轮转掉旧的那一代，新告警继续写得进去
+            path.replace(path.with_suffix(path.suffix + ".1"))
+            logger.warning(f"[notify] {path} 超过 {_UNDELIVERED_MAX_BYTES} 字节，已轮转")
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         line = str(text).replace("\t", " ").replace("\n", " / ")
         with path.open("a", encoding="utf-8") as f:
