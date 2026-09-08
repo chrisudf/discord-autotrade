@@ -32,6 +32,7 @@ import re
 import threading
 
 from autotrade.utils.logger import logger
+from autotrade.broker import inflight  # 在飞买单登记（naked-short 是否可豁免）
 from autotrade.broker import quote  # close_ctx 关行情 ctx 用（跨模块 global 只能经模块属性操作）
 from autotrade.broker.common import (
     ACC_ID,
@@ -232,6 +233,9 @@ def place_order(signal: dict, qty: int = None) -> dict:
         if ret == RET_OK:
             order_id = str(data["order_id"].iloc[0])
             logger.info(f"[broker] 下单成功 order_id={order_id}")
+            # [9/2] 提交 ≠ 成交。登记在飞，供下面 naked-short 判据用；
+            # fill_checker 拿到终态后按 order_id 销账（同 code 可能有加仓单同时在飞）。
+            inflight.mark_submitted(option_code, order_id)
             return {
                 "success": True, "message": "submitted",
                 "order_id": order_id, "code": option_code,
@@ -411,6 +415,24 @@ def place_sell_order(
             "order_id": None, "code": option_code, "qty": qty, "price": limit_price,
         }
     if available < qty:
+        # [9/2 实锤 -$166] 同一个 "0 长仓" 有两种成因，代价天差地别：
+        #   a. DB 与 broker 真脱钩（8/13 MU）→ 退避多久都不自愈，该熔断；
+        #   b. **买单还在飞**（9/2 TSLA）→ 几分钟后就成交了，熔断等于把这个
+        #      合约当晚所有喊单员平仓信号永久掐掉。
+        # 措辞必须分叉：`is_deterministic_reject` 认的是 "naked-short refused"
+        # 这个串，换成 deferred 就自动落到瞬时组走退避 —— 判据在 broker 这层，
+        # 不必让四个 on_reject 调用点各自感知（见 broker/inflight.py）。
+        if inflight.is_pending(option_code):
+            msg = (
+                f"naked-short deferred: broker has only {available} long of {option_code}, "
+                f"asked to sell {qty}, but a submitted buy is still unconfirmed — "
+                f"treating as transient, will retry."
+            )
+            logger.warning(f"[broker] {msg}")
+            return {
+                "success": False, "message": msg,
+                "order_id": None, "code": option_code, "qty": qty, "price": limit_price,
+            }
         msg = (
             f"naked-short refused: broker has only {available} long of {option_code}, "
             f"asked to sell {qty}. This would open a naked short — refusing."
