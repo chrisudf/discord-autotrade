@@ -1285,6 +1285,51 @@ from a swing expiring in three weeks.
 depends on, and whether it shares a failure domain with the thing being
 escalated. A safety mechanism whose alarm dies with the fault has no alarm —
 it just stops.
+## 36. When the parser is right to refuse, the fix belongs in the layer that has the missing context
+
+**Symptom**: 9/2, KC opened TSLA 345P and then, ninety seconds later, asked to
+trim it three times. None of the three executed:
+
+```
+23:40:03  out half 2.82                            → [CLOSE] parser skipped
+23:40:05  2.82减半仓                                → [zh_unrecognized]
+23:43:52  trimmed Tesla 2.95, stop is at 2.35 now  → parsed fine, hit the breaker (#34)
+```
+
+The first two carry no ticker. KC's habit is to name the ticker on entry and
+omit it on every follow-up, so this is not an edge case — it is the normal
+shape of an exit instruction from that channel.
+
+**Why non-obvious**: the instinct after twenty word-list fixes (#21, #24, #25,
+#32) is that this is another gap in a pattern — some preposition or verb form
+the parser doesn't know. It isn't. `parse_close` already understood
+"out half" perfectly; it returned `None` because it could not answer *which
+position*, and with one sentence in hand that refusal is **correct**. Widening
+the parser here would mean inventing a target, and this repo's whole close-side
+posture is 宁漏平不误平. The evidence that decides it — which channel, which
+position was opened minutes ago, whether 2.82 is even in that contract's price
+range — was never in the sentence. It lives one layer up, in `close_flow`,
+which knows the channel and the book.
+
+**Defense**: `parse_symbolless_close` is a **second, additive entry point** that
+only extracts (pct, price, language) and explicitly refuses when any ticker
+appears anywhere — a ticker that isn't held means "no position to close", which
+must keep returning `None`. `parse_close`'s contract, asserted by 48 existing
+tests, is untouched. `close_flow._bind_symbolless_close` then supplies the
+missing context: same channel, exactly one position opened today (ET) in that
+channel, and the quoted price within [0.25×, 4×] of its cost basis. It emits an
+**ordinary CLOSE dict** with `symbols` + `hint_strike` + `hint_side` — the
+existing "pin to one contract" mechanism from #11 — so the execution loop,
+channel filter, bilingual-twin guards, runner-preserve and quote fallback all
+apply with no changes. That pinning is load-bearing: that night KC held both
+TSLA 345P (fresh) and TSLA 380C (an 8/14 swing), and binding by symbol alone
+would have trimmed a three-week-old position.
+
+**General form**: a component that refuses for lack of information is not the
+component to fix. Find the layer that already holds the missing fact and let it
+answer, in the vocabulary the rest of the system already speaks — a new `kind`
+would have meant new handling in every downstream guard; an ordinary CLOSE
+inherits all of them for free.
 
 ---
 
@@ -1800,6 +1845,7 @@ downside is priced in dollars.
 | 33 | 无动作可做的告警会把有动作的那条训练成背景色 | `test_overnight_0901.py::test_never_seen_broker_positions_are_foreign_not_drift`（当晚三条 LEAPS 的真 code）、`::test_a_code_we_once_held_is_still_a_real_ghost`（8/13 MU 形状必须继续每轮 WARNING）、`::test_foreign_report_says_it_will_never_be_handled`（文案要说清"不会自动处理"）。**不变量**：`::test_known_codes_omitted_keeps_0016_behaviour_verbatim`（不传参数 = 0016 行为逐字）。契约扩充：`test_0016_reconciler.py::test_auto_close_never_touches_qty_mismatch_or_ghost` 现在两类各放一条 —— 分了类不许让"自动落账一条都不碰"只剩一类在被测 |
 | 34 | "确定性"是对未来的断言，而证据只是一条来自过去的字符串 | `test_overnight_0902_0905.py::test_deferred_message_does_not_trip_the_breaker`（契约翻转：同一个 0 长仓不再熔断）、`::test_sell_order_picks_the_deferred_branch_while_buy_in_flight`（走真 `place_sell_order`，不只是措辞）、`::test_pending_buy_is_tracked_until_terminal`、`::test_pending_expires_after_grace`。**不变量**：`::test_refused_message_still_trips_the_breaker`（8/13 MU 那种真脱钩照旧立刻熔断）、`test_tp_retry_guard.py` 全部既有用例不变。**上游**（缺了它豁免窗口永远开着）：`::test_timeout_keeps_the_buy_in_flight`（超时=仍然不知道）、`::test_filled_clears_the_flight`、`::test_dead_order_clears_the_flight` |
 | 35 | 求援的那条腿和故障走同一根网线 | `test_overnight_0902_0905.py::test_failed_alert_lands_on_disk`（含单行 TSV 的压平约定——morning_collect 的 awk 依赖它）、`::test_sink_stops_growing_past_the_cap`（7/31 磁盘写满不许重演）。**反向护栏**：`::test_successful_alert_is_not_recorded`、`::test_unconfigured_is_not_recorded`（没配 token 是部署问题，不是送不出去）。摘要侧（shell，无自动回归）：`ops/morning_collect.sh` 的「⛔ 昨晚有 TG 告警没送出去」与「⚠️ 已过期 / 今日到期但仍未平」两节，验证方法是 `zsh -n` + 对着 9/4 那晚的状态跑一遍那段 SQL |
+| 36 | 解析器因缺信息而拒绝时，要改的不是它，是持有那条信息的那一层 | `test_symbolless_close_binding.py::test_last_nights_out_half_now_sells`（端到端重放 9/2 原文，断言下了一张卖单）、`::test_binds_to_the_lone_fresh_position_in_that_channel`、`::test_does_not_touch_the_old_swing_of_the_same_symbol`（同 symbol 的陈年 swing 不许被碰——钉合约不是钉 symbol，见 #11）。**四道闸门各一条**：`::test_refuses_when_two_positions_opened_today_in_the_channel`、`::test_refuses_across_channels`、`::test_refuses_when_the_quoted_price_is_a_different_order_of_magnitude`（含正向对照，证明拦下的是价格）、`::test_kill_switch_reproduces_todays_silence`。**不变量**：`::test_parse_close_contract_is_untouched`（主解析器仍返回 None）、`::test_these_must_stay_none`（9 条，含「有 ticker 但不在持仓 = 无仓可平」这条最该防的）|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |

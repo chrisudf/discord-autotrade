@@ -6,6 +6,7 @@
 """
 import asyncio
 import os
+import re
 from datetime import date, datetime, timezone
 
 from autotrade.broker.quote import get_sell_ref_price
@@ -26,9 +27,9 @@ from autotrade.notify.messages import (
     format_error,
 )
 from autotrade.notify.transport import _safe_notify
-from autotrade.parsing.close_parser import parse_close
+from autotrade.parsing.close_parser import parse_close, parse_symbolless_close
 from autotrade.policy.positions import strategy_b_decision
-from autotrade.utils.envcfg import env_float
+from autotrade.utils.envcfg import env_float, env_int
 from autotrade.utils.timeutil import ET_TZ, today_et
 from autotrade.policy.pricing import calc_sell_limit
 from autotrade.position import fill_checker
@@ -41,6 +42,108 @@ from autotrade.position.sell_executor import (
     execute_sell,
 )
 from autotrade.utils.logger import logger
+
+
+# 喊价与仓位成本的合理区间。绑定的**唯一硬凭据**就是这个数：
+# 9/2 那条 "out half 2.82" 对 TSLA 345P（entry 2.59）是 1.09×，落在带内；
+# 拿它去撞一个 entry 0.54 的 UBER 就是 5.2×，直接出局。
+# 带子开得宽（4 倍）是因为喊单员减仓时价格常已翻倍，而误绑的典型形态是
+# 数量级不同（0.5 vs 5.0），不是 30% 的偏差。
+_BIND_PRICE_BAND_LO, _BIND_PRICE_BAND_HI = 0.25, 4.0
+
+
+def _bind_symbolless_close(raw: str, channel_name: "str | None") -> "dict | None":
+    """把一条没写标的的平仓指令绑到**同频道当日唯一新开仓**，产出正常的 CLOSE dict。
+
+    [9/2 实锤 -$166] KC 开仓带 ticker、后续减仓不带。TSLA 345P 开仓 90 秒后：
+
+        23:40:03  out half 2.82   → parser skipped，只发了 TG
+        23:40:05  2.82减半仓       → 同上
+        23:43:52  trimmed Tesla 2.95 → 这条有 ticker，解析对了，但撞上熔断
+
+    三条平仓喊话零执行，最后 EOD 以 1.76 强平。
+
+    **产出的是普通 CLOSE dict，不是新 kind** —— symbols + hint_strike + hint_side
+    三件套是既有的"钉到具体合约"机制（lessons #11，6/30 TSLA 420c 误平 425c）。
+    于是执行循环、频道过滤、双语孪生防护、runner-preserve、报价 fallback
+    全部原样复用，一行都不用改。这也是必须钉到合约而不是 symbol 的原因：
+    9/2 那晚 KC 频道同时持有 TSLA 345P（当日新开）和 TSLA 380C（8/14 的 swing），
+    只按 symbol 绑会把三周前的 swing 一起 trim 掉。
+
+    四道闸门（parse_symbolless_close 自己那五道之外）：
+      1. 必须有频道 —— "同源唯一新仓"这个判据的全部重量都在频道上
+      2. 该频道**当日（ET）新开仓恰好一个**。判据同 _has_lone_fresh_position
+         （8/26 定的：喊单员省略 ticker 时说的必然是刚开的那个），但这里
+         **按频道收窄** —— 那个函数是全库口径，只用来决定发不发 TG
+      3. 喊价落在该仓成本的合理带内
+      4. 仓位得有正的成本基准（坏数据不猜）
+
+    绑不上就返回 None，逐字退回今天的行为（发一条"CLOSE 未执行"的 TG）。
+    CLOSE_BIND_SYMBOLLESS=0 整条关掉。
+    """
+    if env_int("CLOSE_BIND_SYMBOLLESS", 1, minimum=0) == 0:
+        return None
+    parsed = parse_symbolless_close(raw)
+    if parsed is None:
+        return None
+    if not channel_name:
+        logger.info("[CLOSE] symbolless 无频道信息，不绑定")
+        return None
+
+    try:
+        today = today_et()
+        fresh = [
+            p for p in position_mgr.get_open_positions()
+            if p.get("channel_name") == channel_name
+            and _opened_on_et(p.get("opened_at"), today)
+        ]
+    except Exception:
+        logger.exception("[CLOSE] symbolless 选仓失败，不绑定")
+        return None
+
+    if len(fresh) != 1:
+        logger.info(
+            f"[CLOSE] symbolless 不绑定：频道 '{channel_name}' 当日新开仓 "
+            f"{len(fresh)} 个（需恰好 1 个）: {raw[:60]}"
+        )
+        return None
+
+    # [PR#7 review 的延伸] `$ticker` 那道闸门在 parser 里，但**裸小写** ticker
+    # （"trimmed spy here 2.82"）没有 $ 可认，靠正则分不出它和普通英文词。
+    # 这里用手上真有的持仓去兜最危险的那一半：文本里若出现任何一个我们持有的
+    # 标的（大小写无关、带词边界），说明这句话很可能在点名某个仓位，
+    # 绝不能再"猜"成当日唯一新开仓。
+    held = position_mgr.get_open_symbols()
+    named = [sym for sym in held
+             if re.search(rf"\b{re.escape(sym)}\b", raw, re.IGNORECASE)]
+    if named:
+        logger.info(
+            f"[CLOSE] symbolless 不绑定：原文点名了持仓标的 {named}"
+            f"（疑似小写 ticker，交给 parse_close 而不是猜）: {raw[:60]}"
+        )
+        return None
+
+    pos = fresh[0]
+    entry = pos.get("avg_entry_price") or 0.0
+    price = parsed["signal_price"]
+    if entry <= 0:
+        logger.warning(f"[CLOSE] symbolless 不绑定：{pos.get('option_code')} 成本基准异常 {entry}")
+        return None
+    if not (entry * _BIND_PRICE_BAND_LO <= price <= entry * _BIND_PRICE_BAND_HI):
+        logger.warning(
+            f"[CLOSE] symbolless 不绑定：喊价 {price} 不在 {pos.get('option_code')} "
+            f"成本 {entry} 的 [{_BIND_PRICE_BAND_LO}, {_BIND_PRICE_BAND_HI}] 倍带内: {raw[:60]}"
+        )
+        return None
+
+    logger.info(
+        f"[CLOSE] symbolless 绑定 → {pos.get('option_code')} "
+        f"(频道 {channel_name} 当日唯一新开仓，喊价 {price} / 成本 {entry}) "
+        f"pct={parsed['pct']} lang={parsed['lang']}"
+    )
+    return {**parsed, "kind": "CLOSE", "symbols": [pos["symbol"]],
+            "hint_strike": pos["strike"], "hint_side": pos["side"],
+            "bound_symbolless": True}
 
 
 def _has_lone_fresh_position() -> bool:
@@ -122,6 +225,10 @@ async def handle_close_signal(
         return
 
     parsed = parse_close(raw, open_symbols)
+    if parsed is None:
+        # [9/2] 没写标的的跟进指令（"out half 2.82"）在这里还有一次机会：
+        # 同频道当日唯一新开仓 + 喊价对得上 → 绑定后按普通 CLOSE 走完全程。
+        parsed = _bind_symbolless_close(raw, channel_name)
     if parsed is None:
         logger.info(f"[CLOSE] parser skipped: {raw[:80]}")
         # EN 原文判定"不是平仓指令"要留痕，供 60s 内的 ZH 机翻孪生查
