@@ -1422,6 +1422,12 @@ def parse_close(text: str, open_symbols: set[str]) -> Optional[dict]:
     return _parse_close_en(text, open_symbols) or _parse_close_zh(text, open_symbols)
 
 
+# $ 后面跟 1-5 个字母 = 喊单员在标注标的，不管大小写。
+# 只用于 parse_symbolless_close 的"这句话有没有写标的"判定，不参与抽取
+# （抽取仍走 _extract_symbols 的大写口径，那是白名单消歧的前提）。
+_DOLLAR_TICKER_ANYCASE_RE = re.compile(r"\$[A-Za-z]{1,5}\b")
+
+
 def parse_symbolless_close(text: str) -> Optional[dict]:
     """**没写标的**的平仓跟进指令 —— 只做抽取，不决定平谁。
 
@@ -1476,7 +1482,15 @@ def parse_symbolless_close(text: str) -> Optional[dict]:
     if _has_bulk_marker(en_lower) or _has_zh_bulk(zh_text):
         return None
 
-    # 4. 全文不许出现任何 ticker（_ANY_SYMBOLS = 跳过白名单，见其 docstring）
+    # 4. 全文不许出现任何 ticker（_ANY_SYMBOLS = 跳过白名单，见其 docstring）。
+    #
+    # [PR#7 review] _extract_symbols 的 $SYMBOL / 裸 ticker 两条正则**都只认大写**，
+    # 于是 "out half $spy 2.82" 会被当成无标的指令绑到当日唯一新开仓上 ——
+    # 而喊单员写小写是真实存在的（7/29 SPY 那次 EN 侧返回 None 靠的正是
+    # KC 写了小写 "spy"，见 _parse_close_en 里那句注释）。绑错标的是这条
+    # 改动最该防的事故，所以这里单独补一道大小写无关的 $ticker 闸门。
+    if _DOLLAR_TICKER_ANYCASE_RE.search(text):
+        return None
     if _extract_symbols(en_text, _ANY_SYMBOLS) or _extract_zh_symbols(zh_text, _ANY_SYMBOLS):
         return None
 

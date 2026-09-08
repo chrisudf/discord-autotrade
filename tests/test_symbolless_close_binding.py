@@ -19,7 +19,6 @@ KC 的习惯就是**开仓带 ticker、后续减仓不带**。`parse_close` 对�
 **parse_close 的 None 契约一个字节都没动**（那 48 条断言仍然全绿），
 本次是 additive 的第二个入口。
 """
-import os
 import sqlite3
 from datetime import date, datetime
 from unittest.mock import patch
@@ -77,6 +76,11 @@ def test_symbolless_instructions_are_extracted(text, pct, price, lang):
     ("I am holding half here 2.82", "作者自述持有"),
     ("2.82", "没有动作动词"),
     ("$SPY levels for the day: blue zone 2.82", "根本不是平仓"),
+    # [PR#7 review] $ticker 的正则只认大写，小写会整条漏过来绑到别的仓上。
+    # 喊单员写小写是真实存在的（7/29 SPY 那次靠的就是 KC 写了小写）。
+    ("out half $spy 2.82", "小写 $ticker"),
+    ("out half $Spy 2.82", "首字母大写 $ticker"),
+    ("out half $tsla 2.82", "小写 $ticker（恰好是我们持有的）"),
 ])
 def test_these_must_stay_none(text, why):
     assert parse_symbolless_close(text) is None, why
@@ -169,8 +173,8 @@ def test_kill_switch_reproduces_todays_silence(monkeypatch):
 # ============================================================
 
 @pytest.mark.asyncio
-async def test_last_nights_out_half_now_sells():
-    os.environ["DRY_RUN"] = "true"
+async def test_last_nights_out_half_now_sells(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "true")
     code = _open(f"US.TSLA{datetime.now().strftime('%H%M%S%f')}P345000", "TSLA", 345.0)
     dedup._close_fps.clear()
 
@@ -202,13 +206,13 @@ async def test_last_nights_out_half_now_sells():
 # ============================================================
 
 @pytest.mark.asyncio
-async def test_bilingual_twins_only_sell_once():
+async def test_bilingual_twins_only_sell_once(monkeypatch):
     """9/2 那晚两条是**双发**：23:40:03 EN、23:40:05 ZH，相隔 2 秒。
 
     绑定之后两条都能解析出 CLOSE/[TSLA]/50 —— 指纹相同，必须只卖一次。
     漏网就是 7/8 那次"qty>=2 时 trim 两次"的翻版，只是这回从无 ticker 的路进来。
     """
-    os.environ["DRY_RUN"] = "true"
+    monkeypatch.setenv("DRY_RUN", "true")
     code = _open(f"US.TSLA{datetime.now().strftime('%H%M%S%f')}P345000", "TSLA", 345.0)
     dedup._close_fps.clear()
 
@@ -234,7 +238,7 @@ async def test_bilingual_twins_only_sell_once():
 
 
 @pytest.mark.asyncio
-async def test_bound_sell_on_an_unfilled_buy_does_not_trip_the_breaker():
+async def test_bound_sell_on_an_unfilled_buy_does_not_trip_the_breaker(monkeypatch):
     """把 9/2 那一晚的两条修复接起来跑一遍。
 
     当晚真实顺序：买单挂着没成交 → 无 ticker 的减仓喊话进不来（本 PR 修）→
@@ -245,7 +249,7 @@ async def test_bound_sell_on_an_unfilled_buy_does_not_trip_the_breaker():
     from autotrade.broker import inflight
     from autotrade.position import retry_guard
 
-    os.environ["DRY_RUN"] = "true"
+    monkeypatch.setenv("DRY_RUN", "true")
     code = _open(f"US.TSLA{datetime.now().strftime('%H%M%S%f')}P345000", "TSLA", 345.0)
     dedup._close_fps.clear()
     retry_guard.reset_state()
@@ -270,3 +274,19 @@ async def test_bound_sell_on_an_unfilled_buy_does_not_trip_the_breaker():
     assert retry_guard.is_tripped(f"kc:{code}") is False, "在飞买单期间不该熔断"
     assert retry_guard.blocked(f"kc:{code}") is None, "后续孪生/重试必须进得来"
     positions_db.record_close(code, 2, 2.59, "manual", note="ut cleanup")
+
+
+def test_bare_lowercase_ticker_naming_a_held_position_does_not_bind():
+    """[PR#7 review 的延伸] 裸小写 ticker 没有 $ 可认，正则分不出它和普通英文词。
+
+    用手上真有的持仓兜最危险的那一半：原文点名了某个持仓标的，就绝不能再
+    "猜"成当日唯一新开仓 —— 那正是绑错标的的形状。
+    """
+    code = _open("US.TSLA260904P345000BIND7", "TSLA", 345.0)
+    try:
+        assert close_flow._bind_symbolless_close("trimmed tsla here 2.82", KC) is None
+        assert close_flow._bind_symbolless_close("Trimmed TSLA here 2.82", KC) is None
+        # 反向：不点名任何持仓标的时照常绑定（证明拦下的是"点名"这件事）
+        assert close_flow._bind_symbolless_close("out half 2.82", KC) is not None
+    finally:
+        positions_db.record_close(code, 2, 2.59, "manual", note="ut")

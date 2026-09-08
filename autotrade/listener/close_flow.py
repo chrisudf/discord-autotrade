@@ -6,6 +6,7 @@
 """
 import asyncio
 import os
+import re
 from datetime import date, datetime, timezone
 
 from autotrade.broker.quote import get_sell_ref_price
@@ -104,6 +105,21 @@ def _bind_symbolless_close(raw: str, channel_name: "str | None") -> "dict | None
         logger.info(
             f"[CLOSE] symbolless 不绑定：频道 '{channel_name}' 当日新开仓 "
             f"{len(fresh)} 个（需恰好 1 个）: {raw[:60]}"
+        )
+        return None
+
+    # [PR#7 review 的延伸] `$ticker` 那道闸门在 parser 里，但**裸小写** ticker
+    # （"trimmed spy here 2.82"）没有 $ 可认，靠正则分不出它和普通英文词。
+    # 这里用手上真有的持仓去兜最危险的那一半：文本里若出现任何一个我们持有的
+    # 标的（大小写无关、带词边界），说明这句话很可能在点名某个仓位，
+    # 绝不能再"猜"成当日唯一新开仓。
+    held = position_mgr.get_open_symbols()
+    named = [sym for sym in held
+             if re.search(rf"\b{re.escape(sym)}\b", raw, re.IGNORECASE)]
+    if named:
+        logger.info(
+            f"[CLOSE] symbolless 不绑定：原文点名了持仓标的 {named}"
+            f"（疑似小写 ticker，交给 parse_close 而不是猜）: {raw[:60]}"
         )
         return None
 
