@@ -27,13 +27,19 @@ from autotrade.notify.messages import (
     format_error,
 )
 from autotrade.notify.transport import _safe_notify
-from autotrade.parsing.close_parser import parse_close, parse_symbolless_close
+from autotrade.parsing.close_parser import (
+    STOP_AT_BREAKEVEN,
+    parse_close,
+    parse_stop_adjust,
+    parse_symbolless_close,
+)
 from autotrade.policy.positions import strategy_b_decision
 from autotrade.utils.envcfg import env_float, env_int
 from autotrade.utils.timeutil import ET_TZ, today_et
 from autotrade.policy.pricing import calc_sell_limit
 from autotrade.position import fill_checker
 from autotrade.position import manager as position_mgr
+from autotrade.storage import positions_db
 from autotrade.position import retry_guard
 from autotrade.position.sell_executor import (
     Outcome,
@@ -197,6 +203,35 @@ def _opened_on_et(opened_at: "str | None", today: date) -> bool:
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
     return ts.astimezone(ET_TZ).date() == today
+
+def _apply_stop_adjust(raw: str, positions: list) -> None:
+    """把喊单员声明的止损落库。**任何情况下都不抛** —— 它不该拖垮平仓主链路。
+
+    保本档锚在**我们自己的成交均价**上（喊单员说的 "entry" 是他的入场，
+    但语义是"回到不亏"，对我们就是我们的成本）；绝对价直接用他的数字
+    —— 期权报价两边是同一个。
+
+    只落库不下单：真正的抬底在 sl_watcher，和 TP 棘轮同一条"只取更高者"的路。
+    """
+    try:
+        adj = parse_stop_adjust(raw)
+        if not adj:
+            return
+        for pos in positions:
+            entry = pos.get("avg_entry_price") or 0.0
+            stop = adj["stop"]
+            target = entry if stop == STOP_AT_BREAKEVEN else float(stop)
+            if target <= 0:
+                continue
+            if positions_db.set_manual_stop(pos["option_code"], target):
+                logger.info(
+                    f"[CLOSE] 止损声明已记录 {pos['option_code']}: "
+                    f"{'保本' if stop == STOP_AT_BREAKEVEN else stop} → {target:.2f} "
+                    f"(entry={entry:.2f}, lang={adj['lang']})"
+                )
+    except Exception:
+        logger.exception("[CLOSE] _apply_stop_adjust failed（不影响平仓主链路）")
+
 
 # ============================================================
 # CLOSE 信号处理
@@ -372,6 +407,14 @@ async def handle_close_signal(
                 f"{len(matched)}/{len(positions)} positions selected"
             )
             positions = matched
+
+        # [9/9] 喊单员顺手声明的止损（"stop at entry now" / "止损设置为保本"）。
+        # 放在这里而不是循环外：twin 防护、频道过滤、strike 过滤都已经生效，
+        # 也就是说**能改止损的仓位集合 == 能被这条消息平掉的仓位集合**，
+        # 不会出现"平不了它、却把它的止损改了"。
+        # 与减仓互不依赖：runner-preserve 跳过了 trim，止损照样该抬
+        # （9/9 TSLA 00:09 正是这一种）。
+        _apply_stop_adjust(raw, positions)
 
         for pos in positions:
             # TG 展示/节流 key 用的仓位标签（字段不可变，锁外算安全）
