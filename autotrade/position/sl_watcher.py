@@ -289,6 +289,16 @@ async def _sl_tick():
                 pos["avg_entry_price"], cfg["sell_slip"])
             if floor is not None and floor > threshold:
                 threshold, reason = floor, why
+        # [9/9] 喊单员自己声明的止损（close_flow 落库，见 positions.manual_stop）。
+        # 与棘轮同一条规矩：**只取更高者，永不放松**。除以 (1-slip) 是把"净额"
+        # 折算成触发价 —— 触发之后还要挨一个卖出滑点，不折算的"保本止损"
+        # 会亏掉一个 slip（同 sl_ratchet_floor 的换算）。
+        manual = pos.get("manual_stop")
+        if manual and manual > 0:
+            m_floor = round(float(manual) / (1 - cfg["sell_slip"]), 2)
+            if m_floor > threshold:
+                threshold = m_floor
+                reason = f"喊单员声明止损 {float(manual):.2f}"
         if last <= threshold:
             await _trigger_sl(pos, last, threshold, cfg["sell_slip"], reason)
 

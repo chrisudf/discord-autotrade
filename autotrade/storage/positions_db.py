@@ -135,6 +135,11 @@ def _init_db():
                 "ALTER TABLE positions ADD COLUMN tp_hits INTEGER NOT NULL DEFAULT 0"
             )
             logger.info("[positions] migrated: added tp_hits column")
+        if "manual_stop" not in cols:
+            # [9/9] 喊单员自己声明的止损（"stop at entry now" / "止损设置为保本"）。
+            # NULL = 没声明过，行为与本列不存在时逐字一致。
+            conn.execute("ALTER TABLE positions ADD COLUMN manual_stop REAL")
+            logger.info("[positions] migrated: added manual_stop column")
 
 
 def init():
@@ -345,6 +350,32 @@ def record_close(
 
 
 # ============ 查询 ============
+
+def set_manual_stop(option_code: str, stop_price: float) -> bool:
+    """记下喊单员声明的止损价。返回是否真的写进去了。
+
+    [9/9] 一周内第三次遇到"减仓 + 顺手说止损挪到哪"：
+        9/2  trimmed Tesla 2.95, stop is at 2.35 now
+        9/9  TSLA 3.90 new high of day trim, stop at entry now
+        9/9  $DELL - 减持一半，止损设置为保本
+    减仓那半都执行了，止损那半一直没人接 —— DELL 剩的那张于是还挂在
+    entry×0.5=1.60，而喊单员说的是保本 3.20，$160 的敞口差。
+
+    **只抬不放**：新值必须高于已记录的值才覆盖。喊单员往上移止损是锁利润，
+    往下移（或我们把某条旧消息重放）不该把已经收紧的保护放开 ——
+    与 sl_watcher 里棘轮"只取更高者"同一个立场。
+    """
+    if not option_code or not stop_price or stop_price <= 0:
+        return False
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "UPDATE positions SET manual_stop = ?, last_action_at = ? "
+            "WHERE option_code = ? AND status IN ('OPEN','PARTIAL') "
+            "AND (manual_stop IS NULL OR manual_stop < ?)",
+            (stop_price, _utc_iso(), option_code, stop_price),
+        )
+        return cur.rowcount > 0
+
 
 def _row_to_dict(row: sqlite3.Row) -> dict:
     d = dict(row)

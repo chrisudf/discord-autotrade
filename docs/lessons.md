@@ -1333,6 +1333,92 @@ inherits all of them for free.
 
 ---
 
+## 37. A trailing space is not a word boundary — and the test that should have caught it always typed a space
+
+**Symptom**: 9/9, 00:09:51, KC asked for a second trim on a position we held:
+
+```
+TSLA 3.90 💵 new high of day trim, stop at entry now to secure green trade
+    detect_action -> CLOSE   ✅
+    parse_close   -> None    ❌   _has_action_verb == False
+```
+
+`ACTION_VERBS` carries `"trim "` — a bare verb with a **trailing space standing in
+for a word boundary**, matched by plain substring. `trim TSLA` hits; `trim,` does
+not. Every bare `trim`/`cut` followed by a comma, period, exclamation mark or
+newline was invisible to the parser while `detect_action`'s `trim(?:med|ming)?\b`
+routed it as CLOSE. `_ACTION_RE`, used for sentence scoping, had the identical
+`\btrim\s|\bcut\s`.
+
+**Why non-obvious**: the trailing space was deliberate and documented — `"cut "`
+exists that way to avoid matching *scout* and *circuit*. It reads like a word
+boundary and behaves like one in the middle of a sentence, which is where every
+example anyone tried put it. And `test_close_routing_sync.py`, written precisely
+to catch routing/parsing drift, could not see it: its templates are
+`"{v} NVDA 3.05"` and `"NVDA {v} 3.05"` — the verb is **always followed by a
+space**. The test's invariant is also single-directional (parse ⇒ route), while
+this bug is the other direction (route ⇒ parse), which the file's own docstring
+declares as deliberately not an invariant, since routing is legitimately broader.
+
+The damage propagated across languages: the ZH twin arrived 2s later and parsed
+perfectly (`pct=33 price=3.9`), then `_close_is_zh_twin_of_skipped_en` suppressed
+it — that guard's premise is "the EN verdict of *not a close* is trustworthy."
+Here the EN verdict was a false negative, so a correct parse was discarded. Zero
+loss that night only because one contract remained and runner-preserve would have
+skipped the trim anyway.
+
+**Defense**: `_BARE_ACTION_VERB_RE = re.compile(r"\b(?:trim|cut)\b")` feeding
+`_has_action_verb`, and `\btrim\b|\bcut\b` in `_ACTION_RE`. `\b` still refuses
+*scout* and *circuit* (both have a word character before the `c`), so the original
+reason for the space survives. Regressions pin the punctuation variants
+explicitly — comma, period, bang, newline — because those are the shapes a
+space-terminated template can never produce.
+
+**General form**: when a guard is expressed in one notation (substring) but
+reasoned about in another (word boundary), the gap shows up only in inputs nobody
+writes by hand. Ask what shapes your fixtures structurally cannot generate.
+
+---
+
+## 38. Text you strip to avoid misreading it still has to be read by someone
+
+**Symptom**: three times in eight days, the caller trimmed and adjusted a stop in
+the same breath. The trim executed all three times; the stop never did:
+
+```
+9/2   trimmed Tesla 2.95, stop is at 2.35 now
+9/9   TSLA 3.90 new high of day trim, stop at entry now
+9/9   $DELL - 减持一半，止损设置为保本
+```
+
+DELL's remaining contract sat at `entry × 0.5 = 1.60` while the caller had said
+break-even, 3.20 — $160 of downside the instruction had explicitly removed.
+
+**Why non-obvious**: the system was not ignoring these clauses by accident. It
+was **deliberately deleting them**: `ZH_SL_ADJUST_CLAUSE_RE` (added 7/23 after an
+AVGO misparse) strips stop-adjustment wording precisely so it is not mistaken for
+a close instruction — "止损设在 2.35" contains a price and a position-ish verb and
+had caused a wrong sell. Stripping was the correct fix for the wrong-close bug,
+and it made the clause *invisible* rather than *handled*. Nothing in the logs says
+"a stop instruction was discarded"; the message parses cleanly, the trim executes,
+and the review sees a successful close.
+
+**Defense**: `parse_stop_adjust` extracts the clause the stripper was hiding
+(absolute price, or break-even anchored on **our** fill, not the caller's),
+`close_flow._apply_stop_adjust` records it on the position, and `sl_watcher`
+treats `manual_stop` exactly like the TP ratchet — `max(existing, declared)`,
+divided by `(1 - sell_slip)` so the fill lands at the declared level rather than
+a slip below it. It runs only on messages already routed to CLOSE, so it adds no
+new routing surface, and it is independent of whether the trim executed: on 9/9
+runner-preserve skipped the trim, and the stop still had to move.
+
+**General form**: "strip it so it can't hurt us" and "handle it" look the same in
+a green test suite. Every deliberate deletion is a silent decision to not act;
+when the deleted thing is an instruction, write down where its consumer is
+supposed to live — even if the answer is "nowhere, yet."
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -1846,6 +1932,8 @@ downside is priced in dollars.
 | 34 | "确定性"是对未来的断言，而证据只是一条来自过去的字符串 | `test_overnight_0902_0905.py::test_deferred_message_does_not_trip_the_breaker`（契约翻转：同一个 0 长仓不再熔断）、`::test_sell_order_picks_the_deferred_branch_while_buy_in_flight`（走真 `place_sell_order`，不只是措辞）、`::test_pending_buy_is_tracked_until_terminal`、`::test_pending_expires_after_grace`。**不变量**：`::test_refused_message_still_trips_the_breaker`（8/13 MU 那种真脱钩照旧立刻熔断）、`test_tp_retry_guard.py` 全部既有用例不变。**上游**（缺了它豁免窗口永远开着）：`::test_timeout_keeps_the_buy_in_flight`（超时=仍然不知道）、`::test_filled_clears_the_flight`、`::test_dead_order_clears_the_flight` |
 | 35 | 求援的那条腿和故障走同一根网线 | `test_overnight_0902_0905.py::test_failed_alert_lands_on_disk`（含单行 TSV 的压平约定——morning_collect 的 awk 依赖它）、`::test_sink_stops_growing_past_the_cap`（7/31 磁盘写满不许重演）。**反向护栏**：`::test_successful_alert_is_not_recorded`、`::test_unconfigured_is_not_recorded`（没配 token 是部署问题，不是送不出去）。摘要侧（shell，无自动回归）：`ops/morning_collect.sh` 的「⛔ 昨晚有 TG 告警没送出去」与「⚠️ 已过期 / 今日到期但仍未平」两节，验证方法是 `zsh -n` + 对着 9/4 那晚的状态跑一遍那段 SQL |
 | 36 | 解析器因缺信息而拒绝时，要改的不是它，是持有那条信息的那一层 | `test_symbolless_close_binding.py::test_last_nights_out_half_now_sells`（端到端重放 9/2 原文，断言下了一张卖单）、`::test_binds_to_the_lone_fresh_position_in_that_channel`、`::test_does_not_touch_the_old_swing_of_the_same_symbol`（同 symbol 的陈年 swing 不许被碰——钉合约不是钉 symbol，见 #11）。**四道闸门各一条**：`::test_refuses_when_two_positions_opened_today_in_the_channel`、`::test_refuses_across_channels`、`::test_refuses_when_the_quoted_price_is_a_different_order_of_magnitude`（含正向对照，证明拦下的是价格）、`::test_kill_switch_reproduces_todays_silence`。**不变量**：`::test_parse_close_contract_is_untouched`（主解析器仍返回 None）、`::test_these_must_stay_none`（9 条，含「有 ticker 但不在持仓 = 无仓可平」这条最该防的）|
+| 37 | 尾空格不是词边界；而该抓住它的同步测试永远在动词后面打了个空格 | `test_overnight_0909.py::test_last_nights_trim_now_parses`（契约翻转：当晚原文逐字，含 @everyone 前缀与 emoji）、`::test_bare_verb_followed_by_punctuation`（5 个形状：逗号/句号/感叹号/换行/原本就能的祈使式 —— 前四个是空格模板结构上造不出来的）。**反向护栏**：`::test_word_boundary_does_not_widen_into_other_words`（scout / circuit，`"cut "` 加空格的原始理由不许丢）、`::test_the_zh_twin_is_no_longer_collateral_damage`（EN 误判经 zh-twin guard 传染中文这条链）。同族前案：#21 #25 #32 |
+| 38 | 为了不误读而抹掉的文本，仍然需要有人去读它 | `test_overnight_0909.py::test_declared_stops_are_extracted`（7 条，含 9/2 与 9/9 的六条双语原文）、`::test_dell_replay_records_breakeven_against_our_own_entry`（端到端重放，保本锚在**我们**的成交均价上）、`::test_sl_uses_the_declared_stop_instead_of_entry_times_half`（消费端：底从 1.60 抬到 3.48，缺了它前两层全是空转，见 #22）。**不变量**：`::test_manual_stop_only_ever_ratchets_up`、`::test_declared_stop_never_loosens_a_tighter_threshold`（同棘轮 #31 的"只抬不放"）。**反向护栏**：`::test_these_carry_no_stop`（4 条，含 `stopped out` 是平仓动词不是设止损）|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |

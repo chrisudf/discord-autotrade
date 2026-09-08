@@ -134,9 +134,16 @@ _BULK_EVERYTHING_RE = re.compile(
 # 把普通 trim 误升级成 100% 全平（实测 "Trimmed SPY ... overall outlook" 案例）。
 ACTION_VERBS = [
     "trimming", "trimmed",
-    "trim ",                  # 祈使式 "trim SPY runner at 3.10"（7/9 实测漏接，
-                              # detect_action 的 \btrim\b 认但这里没有 → parser 拒）
-    "cutting", "cut ",        # "cut " 加空格避免匹配 "scout/circuit"
+    # [9/9 实锤] 这两条的尾空格是拿来当词边界用的，于是**动词后面跟标点就整条漏掉**：
+    # "TSLA 3.90 💵 new high of day trim, stop at entry now" 里的 `trim,` 不匹配
+    # `"trim "`，_has_action_verb 返回 False，parse_close 返回 None ——
+    # 而 detect_action 的 `trim(?:med|ming)?\b` 认得它，于是又是一次
+    # "路由认得、解析不认得"（同族前案 7/3 "all out TSLA"）。
+    # 当晚还连累了中文：ZH 孪生解析完全正确，却被 zh-twin guard 挡掉了 ——
+    # 那道防护的前提是"EN 判为非平仓指令是可信的"，这次 EN 是误判。
+    # 词边界现在交给 _BARE_ACTION_VERB_RE，下面两条保留只为记录意图（是它的子集）。
+    "trim ",                  # 祈使式 "trim SPY runner at 3.10"（7/9 实测漏接）
+    "cutting", "cut ",        # 边界见 _BARE_ACTION_VERB_RE（不许匹配 scout/circuit）
     "selling", "sold here",
     "closing", "closed",
     "dumping", "dumped",
@@ -828,6 +835,11 @@ _EXTRA_ACTION_RE = re.compile(
 )
 
 
+# 裸动词的词边界。\b 而不是尾空格：标点 / 换行 / 句末后面的 `trim` `cut` 同样算动作。
+# "scout" / "circuit" 不会命中（\b 要求 c 前面是非词字符）。
+_BARE_ACTION_VERB_RE = re.compile(r"\b(?:trim|cut)\b", re.IGNORECASE)
+
+
 def _has_action_verb(text_lower: str, text: str = "") -> bool:
     """text 传**原文**时才能命中裸 "out <TICKER>"（大写敏感，见 _OUT_BARE_SYM_PATTERN）。
 
@@ -835,6 +847,7 @@ def _has_action_verb(text_lower: str, text: str = "") -> bool:
     """
     return (
         any(v in text_lower for v in ACTION_VERBS)
+        or bool(_BARE_ACTION_VERB_RE.search(text_lower))
         or bool(_OUT_PHRASE_RE.search(text_lower))
         or bool(text and _OUT_PHRASE_RE.search(text))
         or bool(_EXTRA_ACTION_RE.search(text_lower))
@@ -855,7 +868,7 @@ def _has_full_close_verb(text_lower: str, text: str = "") -> bool:
 # action 句，signal_price / strike hint 都退化到全文扫描）
 _ACTION_RE = re.compile(
     r"\b(?:trimming|trimmed|cutting|selling|closing|closed|dumping|dumped)\b"
-    r"|\btrim\s|\bcut\s|\bsold\s+here\b|\bscaling\s+(?:out|down)\b|bang!|\bbang\s+-"
+    r"|\btrim\b|\bcut\b|\bsold\s+here\b|\bscaling\s+(?:out|down)\b|bang!|\bbang\s+-"
     r"|\ball\s+out\b|\bout\s+(?:half|full|majority)\b"
     r"|" + _OUT_FRACTION_PATTERN
     + r"|(?-i:" + _OUT_BARE_SYM_PATTERN + r")"
@@ -1510,3 +1523,60 @@ def parse_symbolless_close(text: str) -> Optional[dict]:
             "hint_strike": None, "hint_side": None,
             "signal_price": signal_price, "signal_pnl_pct": None,
             "matched": text[:120], "lang": lang}
+
+
+# ============================================================
+# 喊单员声明的止损（"stop at entry now" / "止损设置为保本"）
+# ============================================================
+# [9/9] 一周内第三次：9/2 `stop is at 2.35 now`、9/9 `stop at entry now`、
+# 9/9 `止损设置为保本`。三次的减仓那半都执行了，止损那半一次都没接住 ——
+# ZH_SL_ADJUST_CLAUSE_RE 的作用是把这类子句**抹掉**（免得误判成平仓指令），
+# 抹完就没有下文了。DELL 剩的那张因此还挂在 entry×0.5，而喊单员说的是保本。
+#
+# 这里只做抽取，**存不存、抬不抬由 close_flow / sl_watcher 决定**（同
+# parse_symbolless_close 的分工）。刻意不进 detect_action 的路由表：
+# 纯止损消息（不含平仓动作）不该因此被路由成 CLOSE —— 本函数只在
+# 已经判定为 CLOSE 的消息上跑，加零新路由风险。
+
+# 绝对价："stop is at 2.35" / "stop at 2.35" / "raising stop to 3.00"
+# `stops?` 的 \b 天然排除 "stopped"（那是平仓动词，不是设止损）。
+_EN_STOP_ABS_RE = re.compile(
+    r"\bstops?\b[^.\n]{0,24}?\b(?:at|to|is)\b\s*\$?(\d+(?:\.\d+)?)", re.IGNORECASE)
+# 保本档："stop at entry" / "stop set to break-even" / "stop to BE"
+_EN_STOP_BE_RE = re.compile(
+    r"\bstops?\b[^.\n]{0,24}?\b(?:entry|break[-\s]?even|breakeven)\b", re.IGNORECASE)
+
+# ZH 孪生。"止损"后面跟设/移/调/现/在，再跟保本/入场/成本 或一个数字。
+_ZH_STOP_ABS_RE = re.compile(r"止损[^。\n]{0,12}?(\d+(?:\.\d+)?)")
+_ZH_STOP_BE_RE = re.compile(r"止损[^。\n]{0,12}?(?:保本|入场|成本|开仓价)")
+
+# 语义哨兵：调用方拿到它就知道"锚在我们自己的成本上"，而不是一个绝对价。
+STOP_AT_BREAKEVEN = "breakeven"
+
+
+def parse_stop_adjust(text: str) -> "dict | None":
+    """抽取喊单员声明的止损。返回 {"stop": float | STOP_AT_BREAKEVEN, "lang": str} 或 None。
+
+    保本档**优先于**绝对价：`stop at entry now to secure green trade` 里没有
+    数字，但 `trimmed 2.95, stop is at 2.35` 有 —— 先判保本能避免把句子里
+    别处的价格（成交价、目标价）误当成止损。
+    """
+    if not text:
+        return None
+    text = strip_relay_prefix(text)
+
+    if _EN_STOP_BE_RE.search(text):
+        return {"stop": STOP_AT_BREAKEVEN, "lang": "en"}
+    if _ZH_STOP_BE_RE.search(text):
+        return {"stop": STOP_AT_BREAKEVEN, "lang": "zh"}
+
+    for rx, lang in ((_EN_STOP_ABS_RE, "en"), (_ZH_STOP_ABS_RE, "zh")):
+        m = rx.search(text)
+        if m:
+            try:
+                price = float(m.group(1))
+            except ValueError:
+                continue
+            if price > 0:
+                return {"stop": price, "lang": lang}
+    return None
