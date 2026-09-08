@@ -21,11 +21,15 @@ import asyncio
 import os
 import signal
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from loguru import logger
 
+from autotrade.broker import inflight
 from autotrade.settings import load_settings
+from autotrade.storage import positions_db
+from autotrade.utils.envcfg import env_int
 from autotrade.utils.logger import setup_logging
 
 ENV_PATH = Path(__file__).resolve().parents[2] / "config" / ".env"
@@ -176,6 +180,32 @@ def setup_signal_handlers(loop):
 _watcher_tasks: set = set()
 
 
+def _rebuild_inflight_buys() -> None:
+    """把窗口内新开的仓位重新登记为"买单可能还在飞"（见 broker/inflight.rebuild）。
+
+    近似是刻意的：可能给一张其实已经成交的仓位多留一段豁免。代价方向对 ——
+    多豁免 = 拒单走退避后照旧熔断（max_fails 兜着），少豁免 = 9/2 那 $166。
+    """
+    grace = env_int("INFLIGHT_BUY_GRACE_SEC", 900, minimum=0)
+    if grace <= 0:
+        return
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=grace)
+    codes = []
+    for pos in positions_db.get_open_positions():
+        opened = pos.get("opened_at")
+        if not opened:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(opened).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if ts >= cutoff:
+            codes.append(pos["option_code"])
+    n = inflight.rebuild(codes)
+    if n:
+        logger.info(f"[inflight] 重启重建 {n} 个可能在飞的买单豁免: {codes}")
+
+
 async def main():
     global client
     global registry, validate_channels, handle_message, handle_message_edit
@@ -258,6 +288,15 @@ async def main():
         await sweep_expired_and_notify()
     except Exception:
         logger.exception("startup expiry sweep failed (continuing)")
+
+    # [PR#6 review] 崩溃重启后 inflight 表是空的，而 broker 那边提交过的限价买单
+    # 可能还活着。此时一条平仓信号撞上尚未更新的 broker 持仓 → naked-short refused
+    # → 熔断，正是 9/2 那个 $166 的失败。用"最近开的仓"近似重建豁免，
+    # 窗口取 INFLIGHT_BUY_GRACE_SEC（重启一般十几秒，窗口外的本来就不该豁免）。
+    try:
+        _rebuild_inflight_buys()
+    except Exception:
+        logger.exception("startup inflight rebuild failed (continuing)")
 
     # 保护性 watcher：SL 止损 / EOD 到期强平 / TP 分批止盈。
     # 之前只有 src.main（start_listener）启动它们，而这个生产入口一直没起——

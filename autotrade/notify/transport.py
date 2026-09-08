@@ -10,6 +10,9 @@ Telegram 通知模块
 import os
 import re
 import asyncio
+from datetime import datetime, timezone
+from pathlib import Path
+
 import httpx
 from typing import Optional
 from loguru import logger
@@ -69,6 +72,59 @@ def escape_md(s) -> str:
     return re.sub(rf"([{re.escape(_MDV2_ESCAPE)}])", r"\\\1", text)
 
 
+# ============ 送不出去的告警落盘 ============
+# [7/31 postmortem 的第二层] watchdog.py 顶部那段的结论是"告警链路不能只挂在
+# 日志上"，当时补的第二条通道就是 TG。9/3 和 9/5 两晚证明这个结论还差一层：
+# **TG 自己就是死掉的那个**，而它的兜底又变回了一行日志。
+#
+# 9/5 实测：本机断网（Discord + OpenD + Telegram 同时死），EOD 15:50 ET 准时
+# 进窗、每 30s 重试到收盘，三张当日到期合约全部卡在 no-quote，
+# 90 条"需要人工处理"的告警外加 101 次 ConnectError —— 全部只剩日志里的
+# WARNING 行，而日志要等第二天早上才有人读。三张合约当天到期，$714。
+#
+# 这套系统所有 fail-closed 的设计（熔断 / no-quote 拒卖 / 成交价闸门 /
+# 买单超时）形状都是"停手 + 大声喊人"。喊人这条腿跟根因一起死的时候，
+# 它们全部退化成纯粹的"停手"。这里给它补一条不依赖网络的腿。
+#
+# 格式刻意是单行 TSV 不是 JSONL：morning_collect.sh 的契约是"全是纯 shell、
+# 不依赖任何 app"（见其文件头），jq / python 都不能用。正文里的换行压成 " / "，
+# 与 digest 的 note/content 列同一个约定。
+_UNDELIVERED_NAME = "undelivered_alerts.tsv"
+# 落盘失败不能反过来放倒调用方，但也不能无声——每进程只抱怨一次。
+_undelivered_broken = False
+# 7/31 是磁盘写满引发的事故。断网期间这个文件是唯一还在增长的东西，所以要有上限。
+# **超了轮转不是停写**（PR#6 review）：早间摘要只读最近 9 小时，没人截断这个文件，
+# 停写等于"攒够 5MB 之后这条兜底永久静默"——而它恰恰是断网时唯一还活着的告知路径。
+# 轮转保留一代（.1），最坏占 2×cap，新告警永远写得进去。
+_UNDELIVERED_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _undelivered_path() -> Path:
+    """per-call 读 env，跟 settings.log_dir 同一个口径（缺省 <repo>/logs）。"""
+    log_dir = os.getenv("LOG_DIR") or str(Path(__file__).resolve().parents[2] / "logs")
+    return Path(log_dir) / _UNDELIVERED_NAME
+
+
+def _record_undelivered(text: str) -> None:
+    """把一条没送出去的告警追加到本地文件。**任何情况下都不抛。**"""
+    global _undelivered_broken
+    try:
+        path = _undelivered_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size >= _UNDELIVERED_MAX_BYTES:
+            # 轮转掉旧的那一代，新告警继续写得进去
+            path.replace(path.with_suffix(path.suffix + ".1"))
+            logger.warning(f"[notify] {path} 超过 {_UNDELIVERED_MAX_BYTES} 字节，已轮转")
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = str(text).replace("\t", " ").replace("\n", " / ")
+        with path.open("a", encoding="utf-8") as f:
+            f.write(f"{ts}\t{line}\n")
+    except Exception as e:
+        if not _undelivered_broken:
+            _undelivered_broken = True
+            logger.error(f"[notify] 落盘未送达告警失败: {type(e).__name__}: {e}")
+
+
 async def send_telegram(text: str, parse_mode: str = "MarkdownV2") -> bool:
     """发送 Telegram 消息。
 
@@ -77,12 +133,21 @@ async def send_telegram(text: str, parse_mode: str = "MarkdownV2") -> bool:
         parse_mode: "MarkdownV2" / "HTML" / None（纯文本）
 
     Returns:
-        True 成功；False 失败（失败只记日志，不抛异常）
+        True 成功；False 失败（失败只记日志 + 落盘，不抛异常）
     """
+    # 未配置不算"送不出去"：那是部署问题，落盘只会在 DRY_RUN / 测试里刷垃圾。
     if not BOT_TOKEN or not CHAT_ID:
         logger.warning("[Telegram] BOT_TOKEN 或 CHAT_ID 未配置，跳过通知")
         return False
 
+    ok = await _send_telegram_inner(text, parse_mode)
+    if not ok:
+        _record_undelivered(text)
+    return ok
+
+
+async def _send_telegram_inner(text: str, parse_mode: str) -> bool:
+    """原 send_telegram 的正文（配置检查已上移到调用方）。"""
     payload = {
         "chat_id": CHAT_ID,
         "text": text,
@@ -177,6 +242,14 @@ def send_telegram_sync(text: str, parse_mode: str = "MarkdownV2") -> bool:
         logger.warning("[Telegram] BOT_TOKEN 或 CHAT_ID 未配置，跳过通知")
         return False
 
+    ok = _send_telegram_sync_inner(text, parse_mode)
+    if not ok:
+        _record_undelivered(text)
+    return ok
+
+
+def _send_telegram_sync_inner(text: str, parse_mode: str) -> bool:
+    """原 send_telegram_sync 的正文（loop / 配置检查已上移到调用方）。"""
     payload = {
         "chat_id": CHAT_ID,
         "text": text,
@@ -242,7 +315,7 @@ async def _safe_notify(msg: str, parse_mode: str = "MarkdownV2"):
         if ok:
             logger.info(f"[notify] TG sent: {head}")
         else:
-            logger.warning(f"[notify] TG send returned False: {head}")
+            logger.warning(f"[notify] TG send returned False（已落盘待早间摘要）: {head}")
     except Exception as e:
         logger.error(f"[notify] TG raised: {type(e).__name__}: {e} (msg head: {head})")
 

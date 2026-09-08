@@ -1190,6 +1190,101 @@ reader is supposed to *do*, and what happens on the thousandth time they can't.
 
 ---
 
+## 34. "Deterministic" is a claim about time, not about the error string
+
+**Symptom**: 9/2, TSLA 345P, four minutes end to end:
+
+```
+23:38:46  buy 2104813 submitted OK, DB books qty=2 @2.59 (optimistic path)
+23:41:47  TG「买单超时未确认成交」— fill_checker polled 180s, never saw FILLED_ALL
+23:43:52  "trimmed Tesla 2.95" parses perfectly (EN CLOSE symbols=['TSLA'] pct=33)
+          → broker: naked-short refused: broker has only 0 long
+          → is_deterministic_reject → retry_guard trips immediately
+23:43:54  the ZH twin parses just as well, and is blocked by the trip
+05:50:21  EOD force-closes 2 contracts @1.76 — the broker had them by then
+```
+
+The parser was right, the router was right, the naked-short guard was right,
+and the position was real. -$166 on a trade whose exit signal arrived, in two
+languages, ninety seconds after entry.
+
+**Why non-obvious**: the classification was derived from a real postmortem
+(8/13 MU: DB says 2, broker says 0, retried 1918 times from 00:11 to 06:00).
+That night the cause genuinely was a DB/broker desync, which no amount of
+backoff repairs. So `naked-short refused` went into
+`_DETERMINISTIC_REJECT_HINTS` and the guard trips on the first rejection.
+But the *same sentence from the broker* has two causes with opposite costs:
+a desync (retrying is pure noise) and **a buy still in flight** (retrying is
+the whole point). The error string cannot tell them apart, and the module's
+own comment had already predicted the failure — "宁可漏判成瞬时…也不要把真
+瞬时的失败错判成确定性而永久停掉一条止盈路径" — without a way to act on it.
+
+**Defense**: `broker/inflight.py`, a state-only module in the shape of
+`retry_guard` (imports no siblings, so `broker.trade` can read it and
+`position.fill_checker` can write it without a cycle). `place_order` registers
+on submit; `fill_checker` clears on a *terminal* status only — **a timeout
+does not clear**, because "timed out" means "still unknown", which is exactly
+the state that deserves the exemption. With a buy in flight, the naked-short
+branch returns a differently-worded message (`naked-short deferred: …`) that
+`is_deterministic_reject` does not match, so all four `on_reject` call sites
+fall into the transient group with no change. The exemption expires after
+`INFLIGHT_BUY_GRACE_SEC` (900s; the real rejection came 5.5 min after submit) —
+after that a 0-long reading is a desync again and trips as before.
+
+**General form**: when you classify a failure as permanent, you are asserting
+something about the future, and the evidence you have is a string from the
+past. Ask what else produces this exact message, and whether the system knows
+something the message doesn't — here it did: another component was actively
+polling that very order.
+
+---
+
+## 35. The leg that asks a human for help runs over the same cable as the failure
+
+**Symptom**: 9/5, the host lost its network around 02:27 AEST. Discord flapped,
+OpenD returned `Network interruption.` on every reconcile tick, and Telegram
+returned `ConnectError` 101 times. At 15:50 ET the EOD watcher entered its
+window exactly on schedule and retried every 30s until 16:05 — three contracts
+expiring that day, all refusing to sell:
+
+```
+[eod] no quote for US.NBIS260904C215000, refusing entry-fallback sell, manual close required
+[eod] no-quote TG FAILED for US.NBIS260904C215000
+```
+
+Ninety "a human must handle this" alerts, none delivered. All three contracts
+expired unclosed: ~$714 of cost basis. Nothing in the system was broken —
+the fail-closed refusal was *correct* (8/22's lesson: never fall back to the
+entry price when you can't get a quote), the un-throttled expiry-day alert was
+a deliberate fix that worked, and the machine was awake.
+
+**Why non-obvious**: every fail-closed path in this codebase has the shape
+"停手 + 大声喊人" — the circuit breaker, the no-quote refusal, the fill-price
+gate, the buy timeout. Each was reviewed on the assumption that stopping is
+safe *because* a human gets told. 7/31's postmortem had already found one
+version of this ("告警链路不能只挂在日志上", when the disk filled and the logs
+themselves stopped writing) and the fix was to add Telegram as a second
+channel. What that fix did not consider is that Telegram, Discord and the
+broker feed all run over one cable: the outage that creates the emergency is
+the same outage that removes the ability to report it. The remaining fallback
+was a WARNING line in a log nobody reads until morning — by which time a
+same-day option is settled.
+
+**Defense**: two legs that do not touch the network.
+`transport.send_telegram` appends every undelivered message to
+`logs/undelivered_alerts.tsv` (single-line TSV, not JSONL, because
+`morning_collect.sh`'s contract is pure shell — no jq, no python), capped at
+5 MB so the sink can't repeat 7/31's disk-full failure. `morning_collect.sh`
+groups last night's entries by body with counts and first/last timestamps and
+prepends them to the digest. Separately, the digest now leads with
+**已过期 / 今日到期但仍未平** — those three rows were present in both the 9/4
+and 9/5 digests with `expiry` right there in the column, indistinguishable
+from a swing expiring in three weeks.
+
+**General form**: for any "stop and escalate" design, ask what the escalation
+depends on, and whether it shares a failure domain with the thing being
+escalated. A safety mechanism whose alarm dies with the fault has no alarm —
+it just stops.
 ## 36. When the parser is right to refuse, the fix belongs in the layer that has the missing context
 
 **Symptom**: 9/2, KC opened TSLA 345P and then, ninety seconds later, asked to
@@ -1748,6 +1843,8 @@ downside is priced in dollars.
 | 31 | 规则日志里点名的兜底，不查就不是兜底 | 策略层：`test_overnight_0901.py::test_last_nights_runner_was_naked_below_entry`（契约翻转：前身阈值就是 1.04）、`::test_t1_floor_is_true_breakeven_not_bare_entry`（滑点折算——不折算的"保本止损"会亏掉一个 slip）、`::test_ratchet_locks_one_rung_below_the_highest_hit_tier`（weekly/swing × 档位矩阵，含 T1 熔断跳档）、`::test_ratchet_stays_out_of_the_way`（一档未中/无阶梯类目/坏 entry 一律沉默）。**不变量**：`::test_ratchet_never_loosens_the_stop`（棘轮只抬不放，钉死 `max(旧阈值, 棘轮底)` 这个决定）。**消费端**（缺了它策略层就是空转，见 #22）：`::test_watcher_sells_the_runner_at_the_ratchet_floor`、`::test_ratchet_off_reproduces_last_nights_silence`（开关关掉逐字复现 9/1 那晚）、`::test_ratchet_does_not_touch_a_position_that_never_hit_a_tier`。**swing 仍裸奔**（apply_sl=False 压根不进 watcher）未修，见 ROADMAP P1 §16 |
 | 32 | 同一个形状换个介词；抽取管道在、门没开 | 语料：`tests/corpus/2026-09-01.jsonl`（4 条当晚漏平原文 + 2 条反向护栏 + 2 条 holding recap + 当晚唯一开仓）。断言：`test_overnight_0901.py::test_last_nights_missed_trims_now_route_and_parse`（断的是下游 kind/symbols/pct，不是"能解析了"）。**反向护栏**：`::test_commentary_still_routes_to_open`（8 条，含同夜 `确保它保持这样` 与 7/23 的移动止损子句）、`::test_secure_purpose_clause_still_means_full_close_not_a_new_trim`（8/18 AMZN 的 100% 不许退化成 33）。**不变量**：`::test_holding_recap_is_still_not_a_close`（#24 的结论不许被本次外溢）。同族前案：#21 #24 #25 |
 | 33 | 无动作可做的告警会把有动作的那条训练成背景色 | `test_overnight_0901.py::test_never_seen_broker_positions_are_foreign_not_drift`（当晚三条 LEAPS 的真 code）、`::test_a_code_we_once_held_is_still_a_real_ghost`（8/13 MU 形状必须继续每轮 WARNING）、`::test_foreign_report_says_it_will_never_be_handled`（文案要说清"不会自动处理"）。**不变量**：`::test_known_codes_omitted_keeps_0016_behaviour_verbatim`（不传参数 = 0016 行为逐字）。契约扩充：`test_0016_reconciler.py::test_auto_close_never_touches_qty_mismatch_or_ghost` 现在两类各放一条 —— 分了类不许让"自动落账一条都不碰"只剩一类在被测 |
+| 34 | "确定性"是对未来的断言，而证据只是一条来自过去的字符串 | `test_overnight_0902_0905.py::test_deferred_message_does_not_trip_the_breaker`（契约翻转：同一个 0 长仓不再熔断）、`::test_sell_order_picks_the_deferred_branch_while_buy_in_flight`（走真 `place_sell_order`，不只是措辞）、`::test_pending_buy_is_tracked_until_terminal`、`::test_pending_expires_after_grace`。**不变量**：`::test_refused_message_still_trips_the_breaker`（8/13 MU 那种真脱钩照旧立刻熔断）、`test_tp_retry_guard.py` 全部既有用例不变。**上游**（缺了它豁免窗口永远开着）：`::test_timeout_keeps_the_buy_in_flight`（超时=仍然不知道）、`::test_filled_clears_the_flight`、`::test_dead_order_clears_the_flight` |
+| 35 | 求援的那条腿和故障走同一根网线 | `test_overnight_0902_0905.py::test_failed_alert_lands_on_disk`（含单行 TSV 的压平约定——morning_collect 的 awk 依赖它）、`::test_sink_stops_growing_past_the_cap`（7/31 磁盘写满不许重演）。**反向护栏**：`::test_successful_alert_is_not_recorded`、`::test_unconfigured_is_not_recorded`（没配 token 是部署问题，不是送不出去）。摘要侧（shell，无自动回归）：`ops/morning_collect.sh` 的「⛔ 昨晚有 TG 告警没送出去」与「⚠️ 已过期 / 今日到期但仍未平」两节，验证方法是 `zsh -n` + 对着 9/4 那晚的状态跑一遍那段 SQL |
 | 36 | 解析器因缺信息而拒绝时，要改的不是它，是持有那条信息的那一层 | `test_symbolless_close_binding.py::test_last_nights_out_half_now_sells`（端到端重放 9/2 原文，断言下了一张卖单）、`::test_binds_to_the_lone_fresh_position_in_that_channel`、`::test_does_not_touch_the_old_swing_of_the_same_symbol`（同 symbol 的陈年 swing 不许被碰——钉合约不是钉 symbol，见 #11）。**四道闸门各一条**：`::test_refuses_when_two_positions_opened_today_in_the_channel`、`::test_refuses_across_channels`、`::test_refuses_when_the_quoted_price_is_a_different_order_of_magnitude`（含正向对照，证明拦下的是价格）、`::test_kill_switch_reproduces_todays_silence`。**不变量**：`::test_parse_close_contract_is_untouched`（主解析器仍返回 None）、`::test_these_must_stay_none`（9 条，含「有 ticker 但不在持仓 = 无仓可平」这条最该防的）|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |

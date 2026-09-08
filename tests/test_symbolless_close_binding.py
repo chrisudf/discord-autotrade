@@ -195,3 +195,78 @@ async def test_last_nights_out_half_now_sells():
     assert sold_code == code
     assert qty == 1                       # 2 张 trim 50%
     positions_db.record_close(code, 1, 2.59, "manual", note="ut cleanup")
+
+
+# ============================================================
+# 4. 与 #6（在飞买单豁免）合并后才出现的交互
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_bilingual_twins_only_sell_once():
+    """9/2 那晚两条是**双发**：23:40:03 EN、23:40:05 ZH，相隔 2 秒。
+
+    绑定之后两条都能解析出 CLOSE/[TSLA]/50 —— 指纹相同，必须只卖一次。
+    漏网就是 7/8 那次"qty>=2 时 trim 两次"的翻版，只是这回从无 ticker 的路进来。
+    """
+    os.environ["DRY_RUN"] = "true"
+    code = _open(f"US.TSLA{datetime.now().strftime('%H%M%S%f')}P345000", "TSLA", 345.0)
+    dedup._close_fps.clear()
+
+    sells = []
+
+    async def capture(msg):
+        pass
+
+    def fake_sell(option_code, qty, limit_price, **kw):
+        sells.append((option_code, qty))
+        return {"success": True, "message": "submitted", "order_id": "1",
+                "code": option_code, "qty": qty, "price": limit_price}
+
+    with patch.object(close_flow, "_safe_notify", side_effect=capture), \
+         patch.object(close_flow, "place_sell_order", side_effect=fake_sell):
+        await close_flow.handle_close_signal(
+            "KC Trades Bot:out half 2.82", msg_id=1, channel_name=KC)
+        await close_flow.handle_close_signal(
+            "KC交易机器人：2.82减半仓", msg_id=2, channel_name=KC)
+
+    assert len(sells) == 1, ("双语孪生只该卖一次", sells)
+    positions_db.record_close(code, 1, 2.59, "manual", note="ut cleanup")
+
+
+@pytest.mark.asyncio
+async def test_bound_sell_on_an_unfilled_buy_does_not_trip_the_breaker():
+    """把 9/2 那一晚的两条修复接起来跑一遍。
+
+    当晚真实顺序：买单挂着没成交 → 无 ticker 的减仓喊话进不来（本 PR 修）→
+    带 ticker 的那条进来了却撞上 0 长仓被判确定性拒单而永久熔断（#6 修）。
+    两条都修完之后：绑定成功 → 卖单被 broker 判为 deferred（瞬时）→
+    **熔断不该触发**，后续孪生/重试仍进得来。
+    """
+    from autotrade.broker import inflight
+    from autotrade.position import retry_guard
+
+    os.environ["DRY_RUN"] = "true"
+    code = _open(f"US.TSLA{datetime.now().strftime('%H%M%S%f')}P345000", "TSLA", 345.0)
+    dedup._close_fps.clear()
+    retry_guard.reset_state()
+    inflight.reset_state()
+    inflight.mark_submitted(code, "2104813")   # 买单还在飞
+
+    deferred = (f"naked-short deferred: broker has only 0 long of {code}, "
+                f"asked to sell 1, but a submitted buy is still unconfirmed — "
+                f"treating as transient, will retry.")
+
+    async def capture(msg):
+        pass
+
+    with patch.object(close_flow, "_safe_notify", side_effect=capture), \
+         patch.object(close_flow, "place_sell_order",
+                      return_value={"success": False, "message": deferred,
+                                    "order_id": None, "code": code,
+                                    "qty": 1, "price": 2.8}):
+        await close_flow.handle_close_signal(
+            "KC Trades Bot:out half 2.82", msg_id=3, channel_name=KC)
+
+    assert retry_guard.is_tripped(f"kc:{code}") is False, "在飞买单期间不该熔断"
+    assert retry_guard.blocked(f"kc:{code}") is None, "后续孪生/重试必须进得来"
+    positions_db.record_close(code, 2, 2.59, "manual", note="ut cleanup")

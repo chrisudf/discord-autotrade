@@ -75,6 +75,9 @@ fi
 # 不写死偏移量，换时区的机器也对。
 # 取过去 9 小时（23:15 开跑到 07:00 是 7h45m，留点余量）。
 SINCE_UTC=$(date -u -v-9H '+%Y-%m-%dT%H:%M:%SZ')
+# [9/5 实锤 -$714] 到期日判据要用 **ET 日期**，不是本机日期：摘要在 07:00 AEST
+# 生成，那时美东还是前一天下午。用 TZ= 让 date 自己算，不写死偏移量（DST 自动对）。
+TODAY_ET=$(TZ=America/New_York date +%Y-%m-%d)
 DIGEST="$OUT_DIR/digest_${STAMP}.txt"
 
 # list 模式：box/markdown 模式会按终端宽度折行，长消息会被切成续行，喂给模型会串行。
@@ -90,6 +93,26 @@ sqlite3 "$PROJ/data/trades.db" <<SQL > "$DIGEST" 2>"$DIGEST_ERR"
 .separator ' | '
 .headers on
 
+-- [9/5 实锤 -\$714] NBIS / IONQ / NVDA 三张 9/4 到期的合约，在 9/4 和 9/5 两份
+-- 摘要的"停机时仍未平的持仓"里都在，`expiry` 列也写着 2026-09-04 —— 但它们
+-- 混在 7 行持仓中间，跟"还有两周到期"的 swing 长得一模一样，没人看出来。
+-- 那晚 EOD 准时进窗、每 30s 重试到收盘，全部卡在 no-quote（OpenD 跟着断网一起
+-- 死了），90 条"需要人工"的 TG 一条没发出去（101 次 ConnectError）。
+-- 于是唯一还活着的告知路径就是这份摘要，而它当时什么都没强调。
+--
+-- 单列一节放最前面：**已经到期 / 今天到期但还没平**，这是唯一需要人今天动手的东西。
+-- 空表 = 没有这类仓位，也是有效信息（别因为"通常是空的"就删掉这一节）。
+.print '## ⚠️ 已过期 / 今日到期但仍未平（ET 日期 $TODAY_ET，需人工处理）'
+SELECT option_code, channel_name, status, qty_remaining AS qty_left,
+       avg_entry_price AS entry, expiry,
+       CASE WHEN expiry < '$TODAY_ET' THEN '已过期' ELSE '今日到期' END AS urgency,
+       apply_sl, eod_force_close,
+       datetime(opened_at, 'localtime') AS opened_local
+FROM positions
+WHERE status IN ('OPEN', 'PARTIAL') AND expiry <= '$TODAY_ET'
+ORDER BY expiry, opened_at;
+
+.print ''
 .print '## 当晚开仓（时间均为本机本地时区）'
 SELECT option_code, channel_name, side, qty_total AS qty,
        avg_entry_price AS entry, status,
@@ -150,6 +173,44 @@ if [[ -s "$DIGEST_ERR" ]]; then
   } > "$DIGEST.tmp" && mv "$DIGEST.tmp" "$DIGEST"
 fi
 rm -f "$DIGEST_ERR"
+
+# ---------- 3a. 昨晚没送出去的 TG 告警 ----------
+# [9/5 实锤 -$714] 断网那晚 TG 101 次 ConnectError，其中 90 条是 EOD 的
+# "当日到期 + 拿不到报价 + 需要人工"。那些告警只存在于日志里，而日志没人当晚读。
+# transport.py 现在把送不出去的告警追加到 $UNDELIVERED，这里把**昨晚那批**
+# 顶到摘要最前面 —— 这是断网时唯一还活着的告知路径。
+#
+# 同一条文案在一次故障里会重复几十遍（EOD 每 30s 一轮），所以按正文归并计数，
+# 只留首末时间。用 awk 不用 jq/python：本脚本的契约是纯 shell（见文件头）。
+# 路径必须和 transport._undelivered_path() 同一个口径：那边认 LOG_DIR，
+# 这边写死 $PROJ/logs 的话，任何设了 LOG_DIR 的部署都会静默漏掉全部未送达告警。
+UNDELIVERED="${LOG_DIR:-$PROJ/logs}/undelivered_alerts.tsv"
+if [[ -s "$UNDELIVERED" ]]; then
+  UNDELIVERED_SECTION=$(mktemp)
+  awk -F'\t' -v since="$SINCE_UTC" '
+    $1 >= since {
+      n[$2]++
+      if (first[$2] == "") first[$2] = $1
+      last[$2] = $1
+    }
+    END {
+      for (m in n)
+        printf "%d 次 | %s ~ %s | %s\n", n[m], first[m], last[m], m
+    }
+  ' "$UNDELIVERED" | sort -t'|' -k1,1nr > "$UNDELIVERED_SECTION"
+
+  if [[ -s "$UNDELIVERED_SECTION" ]]; then
+    { echo "## ⛔ 昨晚有 TG 告警没送出去（按正文归并，时间为 UTC）"
+      echo "count | first ~ last | message"
+      cat "$UNDELIVERED_SECTION"
+      echo
+      cat "$DIGEST"
+    } > "$DIGEST.tmp" && mv "$DIGEST.tmp" "$DIGEST"
+    log_ops "⛔ 昨晚有未送达 TG 告警，已顶进摘要（$(wc -l < "$UNDELIVERED_SECTION" | tr -d ' ') 组）"
+  fi
+  rm -f "$UNDELIVERED_SECTION"
+fi
+
 log_ops "digest built -> $DIGEST"
 
 # ---------- 3b. 日志摘要（折叠重复行）----------
