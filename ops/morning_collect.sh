@@ -94,7 +94,7 @@ sqlite3 "$PROJ/data/trades.db" <<SQL > "$DIGEST" 2>"$DIGEST_ERR"
 .headers on
 
 -- [9/5 实锤 -\$714] NBIS / IONQ / NVDA 三张 9/4 到期的合约，在 9/4 和 9/5 两份
--- 摘要的"停机时仍未平的持仓"里都在，`expiry` 列也写着 2026-09-04 —— 但它们
+-- 摘要的"停机时仍未平的持仓"里都在，\`expiry\` 列也写着 2026-09-04 —— 但它们
 -- 混在 7 行持仓中间，跟"还有两周到期"的 swing 长得一模一样，没人看出来。
 -- 那晚 EOD 准时进窗、每 30s 重试到收盘，全部卡在 no-quote（OpenD 跟着断网一起
 -- 死了），90 条"需要人工"的 TG 一条没发出去（101 次 ConnectError）。
@@ -151,7 +151,7 @@ ORDER BY received_at;
 .print ''
 .print '## 停机时仍未平的持仓（含更早开的）'
 -- [8/14] status 必须含 PARTIAL：部分平仓过的仓位 status 会从 OPEN 变成
--- PARTIAL，老写法 `WHERE status = 'OPEN'` 把它们整行漏掉 —— 8/13 夜真实过夜
+-- PARTIAL，老写法 \`WHERE status = 'OPEN'\` 把它们整行漏掉 —— 8/13 夜真实过夜
 -- 是 6 个合约 10 张，摘要只显示了 4 个 8 张，SPCX 120P 在两张持仓表里完全隐身。
 -- 复盘据此答"持仓状态"这一节，等于系统性少报被 trim 过的仓（恰恰是最该盯的那些）。
 -- 判据与 position_mgr / watcher 选仓口径对齐（那边一直是 IN ('OPEN','PARTIAL')）。

@@ -16,6 +16,17 @@ set -u
 TARGET="${1:?用法: launch_in_terminal.sh <要在 Terminal 里跑的脚本> [参数...]}"
 shift
 
+# [9/10] 夜间有 4 个触发点（23:11/15/20/25，唤醒窗口冗余见 lesson #28），可守卫
+# 一直在 night_run.sh 里 —— 窗口已经开出来才发现"已在跑"，每晚白留 3 个只打印
+# 一行就退出的 Terminal 窗口（shellExitAction 又不关它们，一周攒 20 多个）。
+# 守卫前移到这一层：pgrep 不碰 TCC 保护目录，launchd 直接跑得了，命中就连
+# Terminal 都不开。**night_run.sh 里那道守卫要保留** —— 手动启动不经过本文件。
+# 模式由调用方经 env 给（night.plist 的 EnvironmentVariables），本文件不写死。
+if [[ -n "${SKIP_IF_RUNNING:-}" ]] && pgrep -f "$SKIP_IF_RUNNING" > /dev/null; then
+  echo "$(date '+%F %T') launch_in_terminal: 已有进程匹配 /$SKIP_IF_RUNNING/，不开窗口"
+  exit 0
+fi
+
 CMD_DIR="${0:A:h}"
 CMD="$CMD_DIR/$(basename "${TARGET%.sh}").command"
 

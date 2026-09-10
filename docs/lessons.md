@@ -1419,6 +1419,82 @@ supposed to live — even if the answer is "nowhere, yet."
 
 ---
 
+## 39. The installer and the thing it installed drifted, and re-running the installer is the rollback
+
+**Symptom**: `com.chengqiu.autotrade.night.plist` has had four
+`StartCalendarInterval` entries since 8/29 — 23:11 / 23:15 / 23:20 / 23:25, the
+wake-window redundancy from #28. `ops/install.sh`, the script whose header says
+"换机器就跑这一条", only ever emitted **one** (23:15). Running the documented
+install command silently deletes three quarters of a fix.
+
+**Why non-obvious**: the installer is idempotent *with respect to itself*. Every
+check you would think to run after it passes — `plutil -lint` is clean,
+`launchctl print` shows the job loaded and enabled, the plist is valid, the
+23:15 trigger fires. Nothing anywhere compares the generated artifact to the one
+it replaced, because a generator has no memory of what it generated last time
+and the live file was the only place the extra three points existed. And the
+failure it re-arms does not surface at install time: it surfaces weeks later, on
+the one night the Mac happens to be asleep at 23:15, with no causal thread back
+to the day someone re-ran a setup script.
+
+This is the same asymmetry as #22 in a different medium. There, a parsed field
+had no consumer. Here, a hand-edit had no generator — and the direction of the
+silence is worse, because the artifact looks *more* correct than the source.
+
+**Defense**: `emit_plist` now takes a variadic `HH:MM` list plus an optional
+extra-env block, and the night job passes all four points; the summary line
+prints them so a wrong count is visible at install time. Verification was a
+sandboxed dry-run (`LA_DIR`/`APPSUP` redirected, `launchctl` stubbed) diffed
+against the live plist — identical except the redirected paths. `ops/README.md`
+now says the four points are deliberate and must not be trimmed.
+
+**General form**: the moment you hand-edit something a script generates, the
+script has become a loaded rollback. Fold the edit back into the generator in
+the same change, or you have written a time bomb whose fuse is the next person
+following your own setup instructions.
+
+---
+
+## 40. A script's error reporting cannot see the layer that builds the script
+
+**Symptom**: every morning `morning_collect.sh` printed two lines nobody chased:
+
+```
+morning_collect.sh:91: command not found: expiry
+morning_collect.sh:91: command not found: WHERE
+```
+
+**Why non-obvious**: that an unquoted heredoc runs command substitution is in the
+shell manual, and the author clearly knew expansion was live — `\$714` is escaped
+by hand a few lines away. The heredoc *has* to stay unquoted; it interpolates
+`$TODAY_ET` and `$SINCE_UTC`. What is not in any manual is the second half: this
+script had already been hardened on 9/5 to stop swallowing errors. It routes
+sqlite3's stderr to a separate file (`DIGEST_ERR`) precisely so that a bad column
+name cannot end up written into the digest and read by the review as "no records
+of that kind" — and it shouts into `ops.log` if that file is non-empty.
+
+These two errors bypass all of it. They are raised by zsh while **constructing**
+the heredoc, before `sqlite3` is executed, so they belong to no redirection the
+script set up for the command it was about to run. The mechanism built to catch
+exactly this class of failure cannot see it, because it lives inside the process
+whose own construction is failing.
+
+The backticks here happened to sit in SQL `--` comments, so the query was still
+correct and the digest was fine. That is luck, not design: the same 73 lines
+would have executed anything else in backticks just as willingly.
+
+**Defense**: both occurrences escaped as `` \` ``, matching the file's existing
+`\$714` idiom. Verified by extracting lines 91-164 into a standalone script and
+running the old and new versions side by side: errors gone, SQL output
+byte-identical, line count matching that morning's real digest.
+
+**General form**: an error channel you install inside a process cannot observe
+that process being built. When a script's diagnostics live in the same file as
+the thing being diagnosed, ask which layer they actually cover — and check the
+terminal, not just the log the script writes.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -1934,6 +2010,8 @@ downside is priced in dollars.
 | 36 | 解析器因缺信息而拒绝时，要改的不是它，是持有那条信息的那一层 | `test_symbolless_close_binding.py::test_last_nights_out_half_now_sells`（端到端重放 9/2 原文，断言下了一张卖单）、`::test_binds_to_the_lone_fresh_position_in_that_channel`、`::test_does_not_touch_the_old_swing_of_the_same_symbol`（同 symbol 的陈年 swing 不许被碰——钉合约不是钉 symbol，见 #11）。**四道闸门各一条**：`::test_refuses_when_two_positions_opened_today_in_the_channel`、`::test_refuses_across_channels`、`::test_refuses_when_the_quoted_price_is_a_different_order_of_magnitude`（含正向对照，证明拦下的是价格）、`::test_kill_switch_reproduces_todays_silence`。**不变量**：`::test_parse_close_contract_is_untouched`（主解析器仍返回 None）、`::test_these_must_stay_none`（9 条，含「有 ticker 但不在持仓 = 无仓可平」这条最该防的）|
 | 37 | 尾空格不是词边界；而该抓住它的同步测试永远在动词后面打了个空格 | `test_overnight_0909.py::test_last_nights_trim_now_parses`（契约翻转：当晚原文逐字，含 @everyone 前缀与 emoji）、`::test_bare_verb_followed_by_punctuation`（5 个形状：逗号/句号/感叹号/换行/原本就能的祈使式 —— 前四个是空格模板结构上造不出来的）。**反向护栏**：`::test_word_boundary_does_not_widen_into_other_words`（scout / circuit，`"cut "` 加空格的原始理由不许丢）、`::test_the_zh_twin_is_no_longer_collateral_damage`（EN 误判经 zh-twin guard 传染中文这条链）。同族前案：#21 #25 #32 |
 | 38 | 为了不误读而抹掉的文本，仍然需要有人去读它 | `test_overnight_0909.py::test_declared_stops_are_extracted`（7 条，含 9/2 与 9/9 的六条双语原文）、`::test_dell_replay_records_breakeven_against_our_own_entry`（端到端重放，保本锚在**我们**的成交均价上）、`::test_sl_uses_the_declared_stop_instead_of_entry_times_half`（消费端：底从 1.60 抬到 3.48，缺了它前两层全是空转，见 #22）。**不变量**：`::test_manual_stop_only_ever_ratchets_up`、`::test_declared_stop_never_loosens_a_tighter_threshold`（同棘轮 #31 的"只抬不放"）。**反向护栏**：`::test_these_carry_no_stop`（4 条，含 `stopped out` 是平仓动词不是设止损）|
+| 39 | 生成器与它生成的东西漂移之后，重跑生成器就是回滚 | 无自动回归（launchd/plist 是宿主状态，测不了）。防御在 `ops/install.sh::emit_plist` 的可变触发点列表 + 安装时打印全部点位（数量不对当场看得见）。**验证方法**：`LA_DIR`/`APPSUP` 重定向到沙盒、`launchctl` 打桩跑一遍 install.sh，`plutil -convert xml1` 后与线上 plist diff —— 除重定向的三条路径外必须逐字节相同。`ops/README.md` 记着那 4 个点位是刻意的 |
+| 40 | 脚本自己装的错误上报，看不见构造这个脚本的那一层 | 无自动回归（zsh heredoc 构造期行为）。防御是 `ops/morning_collect.sh` 里两处 `` \` `` 转义（与同文件 `\$714` 同一写法）。**验证方法**：把 91-164 行抽成独立脚本，新旧两版对跑 —— 旧版必然打出 `command not found: expiry` / `WHERE`，新版无报错且 SQL 输出逐字节一致 |
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |
