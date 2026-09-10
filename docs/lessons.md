@@ -1495,6 +1495,124 @@ terminal, not just the log the script writes.
 
 ---
 
+## 41. A new source's format is not vocabulary drift
+
+**Symptom**: the `ashley` channel was enabled and on its first live night lost
+**9 of 9** `:RedAlert:` open signals — 18 messages counting the bilingual twins,
+every one of them `[parser] no signal`.
+
+**Why non-obvious**: every previous parser miss in this repo was drift — a
+synonym, a punctuation change, a word order swap, a preposition, inside a channel
+that was already working (#21, #24, #25, #32, #37). The reflex those built is to
+widen a vocabulary. Nothing drifted here. A new channel writes a shape no pattern
+family ever covered: bare ticker (`SKHY - $195 CALLS ...`) where all six Pattern B
+variants anchor on `\$([A-Z]{1,5})`, while the families that *do* accept a bare
+ticker want `195c` glued together (A/C) or an `NDTE` (D).
+
+From the alert side the two are indistinguishable — both are `Parse failed` × N —
+but the fixes point in opposite directions, and the wrong one is actively
+dangerous. Widening means deleting the `$` anchor from six regexes, and that
+anchor is the only thing stopping `[A-Z]{1,5}` under `IGNORECASE` from eating
+ordinary English words; the A series already learned this on 7/8 when `but` in
+"taking AAPL again but 300p 7/17" became a ticker. Six loops would each need an
+`isupper()` check and a stopword table.
+
+The tell is in the numbers: drift is partial (one phrasing of many stops working),
+a shape gap is total. 100% loss on exactly one source, 0% on the others, starting
+the night that source was switched on.
+
+**Defense**: `_normalize_bare_ticker` rewrites the leading bare ticker to
+`$TICKER` at the entry, the same move already used for ZH direction words and
+inverted prices — every downstream pattern, guard and expiry rule is reused
+verbatim. The shape is pinned hard: start of message, optional `:emoji:`
+shortcode, 1-5 uppercase letters **matched without IGNORECASE**, optional dash,
+and a mandatory `$digit` lookahead. Stopwords are the second line; the third is
+that Pattern B still demands `calls/puts` and a second quoted price, which is
+what stops `TODAY - $195 was the pivot` (a corpus row).
+
+**General form**: before widening a matcher, ask whether the source is new. Drift
+degrades a working path; a new source arrives with a total outage on one channel
+and none anywhere else. Widening is the wrong tool for the second one, and it
+spends your false-positive budget to fix a problem you do not have.
+
+---
+
+## 42. The fallback that asks for nothing wins every race it is entered in
+
+**Symptom**: `:RedAlert: INTC - $110 CALLS 10/2 $4.70` parsed cleanly and
+produced expiry **9/11** — this Friday — instead of 10/2. No warning, no alert,
+no log line. A valid order for the wrong contract.
+
+**Why non-obvious**: Pattern B0 exists and is literally titled "含明确 MM/DD". It
+looks like it covers this. It does not: B0 requires the date to appear *before*
+the strike, and this channel writes it after `CALLS`. The variant that does cover
+it, B3, was last in the chain — and B2, which requires **no date at all**, sat in
+front of it.
+
+A pattern with fewer requirements matches a superset of the inputs of one with
+more. Put it earlier in an ordered chain and it wins every input they share, so
+in a chain like this the order is not a tiebreak between equals, it *is* the
+specificity policy. The docstring even listed B3 last, which reads like priority
+documentation and was in fact an accurate description of a bug.
+
+And the failure mode is the dangerous one: not a miss, a silent downgrade. The
+signal parses, the order fills, the position opens, and the only evidence is an
+expiry field nobody diffs against the message. The B0.5 comment in the same
+function records this exact shape — "英文月份日期被无视，expiry 悄悄退成 next
+Friday" — from a different entry point, months earlier.
+
+**Defense**: B3 moved ahead of B2; the docstring now states the rule ("带日期的
+一律排在无日期兜底前面") instead of describing the order. The corpus asserts
+`expiry_date` on both INTC rows in both languages, and a reverse invariant pins
+that the genuinely date-less message still falls back to this Friday.
+
+**General form**: in any ordered chain of matchers, sort by specificity and write
+the rule down next to the chain. The branch that requires nothing must be last —
+it is a default, and a default in front of a specific case is a silent downgrade
+generator.
+
+---
+
+## 43. One fact, two entrances — you guarded one
+
+**Symptom**: #38 shipped the entire declared-stop pipeline on 9/9: extraction
+from the caller's wording, `manual_stop` on the position, a watcher that ratchets
+the floor up to it. On 9/10 the new channel's opening messages said
+`STOP LOSS AT $4.20` in three of nine signals and **none of it fired**.
+
+**Why non-obvious**: #38 is not incomplete. Every layer it built works and is
+tested. What it is not is *entrance*-complete: `parse_stop_adjust` is called from
+exactly one place, `close_flow`, because on the channels that existed when it was
+written the stop always arrived in a **follow-up** message — "trimmed Tesla 2.95,
+stop is at 2.35 now". A new source puts the identical fact in the *opening*
+message, which is routed to OPEN and never passes the function that knows how to
+read it. The pipeline is not bypassed by a parsing failure; it is simply never
+called.
+
+Then it fails a second time, at a layer that also looks complete on its own. The
+contract carrying that stop expires 10/2 — DTE 23 — so `categorize` returns
+`swing`, `apply_sl=False`, and `sl_watcher`'s watch list never includes it. Even
+had the stop been recorded, nothing would read it. Two layers, each correct by
+its own contract, each silently dropping the same instruction.
+
+**Defense**: `open_flow._apply_declared_stop` records the stop after
+`on_order_filled` (the row has to exist first), and `sl_watcher` grows a third
+watch-list branch for any position carrying a `manual_stop`, entered at
+`pct=1.0` so it brings **no percentage floor of its own** — the threshold comes
+entirely from the number the caller stated. That distinction is the whole scope:
+this does not give swings a stop loss (still a money-path decision, ROADMAP P1
+§16 and the tail of #31), it executes a stop the caller declared and we dropped.
+Both layers have tests, plus the reverse invariant that a swing *without* a
+declared stop is still not watched at -99.8%.
+
+**General form**: #22 says a parsed field with no consumer is decoration. Its
+sibling: a consumer wired to one entrance is decoration for every other entrance.
+When you add a handler for a fact, enumerate the paths that fact can arrive on —
+message kinds, channels, sources — rather than the one in front of you, and write
+down which ones you are choosing not to cover.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -2012,6 +2130,9 @@ downside is priced in dollars.
 | 38 | 为了不误读而抹掉的文本，仍然需要有人去读它 | `test_overnight_0909.py::test_declared_stops_are_extracted`（7 条，含 9/2 与 9/9 的六条双语原文）、`::test_dell_replay_records_breakeven_against_our_own_entry`（端到端重放，保本锚在**我们**的成交均价上）、`::test_sl_uses_the_declared_stop_instead_of_entry_times_half`（消费端：底从 1.60 抬到 3.48，缺了它前两层全是空转，见 #22）。**不变量**：`::test_manual_stop_only_ever_ratchets_up`、`::test_declared_stop_never_loosens_a_tighter_threshold`（同棘轮 #31 的"只抬不放"）。**反向护栏**：`::test_these_carry_no_stop`（4 条，含 `stopped out` 是平仓动词不是设止损）|
 | 39 | 生成器与它生成的东西漂移之后，重跑生成器就是回滚 | 无自动回归（launchd/plist 是宿主状态，测不了）。防御在 `ops/install.sh::emit_plist` 的可变触发点列表 + 安装时打印全部点位（数量不对当场看得见）。**验证方法**：`LA_DIR`/`APPSUP` 重定向到沙盒、`launchctl` 打桩跑一遍 install.sh，`plutil -convert xml1` 后与线上 plist diff —— 除重定向的三条路径外必须逐字节相同。`ops/README.md` 记着那 4 个点位是刻意的 |
 | 40 | 脚本自己装的错误上报，看不见构造这个脚本的那一层 | 无自动回归（zsh heredoc 构造期行为）。防御是 `ops/morning_collect.sh` 里两处 `` \` `` 转义（与同文件 `\$714` 同一写法）。**验证方法**：把 91-164 行抽成独立脚本，新旧两版对跑 —— 旧版必然打出 `command not found: expiry` / `WHERE`，新版无报错且 SQL 输出逐字节一致 |
+| 41 | 新来源的格式不是词表漂移（总丢 vs 部分丢是指纹） | `test_overnight_0910.py::test_dollar_prefixed_shapes_are_untouched`（不变量：老形状一个字不许变）。语料 `tests/corpus/2026-09-09.jsonl` 的 12 条当晚原文（6 信号 × 中英）逐字段断言。**反向护栏**：`bare_uppercase_word_is_not_a_ticker`（`TODAY - $195 …` 会被补成 `$TODAY`，靠 B 系列仍要求 calls/puts + 第二个喊价挡住）、`stopword_head_is_not_a_ticker`、`normalized_bare_ticker_still_needs_a_direction_word`（补 $ 不等于放宽方向词） |
+| 42 | 无日期兜底排在带日期的前面 = 静默降级（顺序即语义） | `test_overnight_0910.py::test_explicit_mmdd_after_calls_beats_the_no_date_fallback`（契约翻转：前身返回 9/11）、`::test_next_week_is_a_week_past_this_friday`（同类，另一个入口）。**反向不变量**：`::test_no_date_still_falls_back_to_this_friday`（B3 前移不许把无日期那条带走）、`::test_bare_next_week_does_not_shift_the_expiry`（2 个形状，"持有到下周" 不是 "下周到期"）。语料 4 条 INTC/ARM 中英断 `expiry_date` |
+| 43 | 同一个事实有两个入口，你只接了一个（#22 的兄弟命题） | 抽取侧：`test_overnight_0910.py::test_declared_stop_in_the_open_message_is_recorded`、`::test_an_open_message_without_a_stop_records_nothing`（反向：不许凭空造）。**消费端**（缺了它抽取就是空转）：`::test_a_swing_with_a_declared_stop_enters_the_watch_list`。**反向不变量**：`::test_a_swing_without_a_declared_stop_is_still_not_watched`（-99.8% 也不许动 —— 本条改的不是"给 swing 加止损"）|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |
