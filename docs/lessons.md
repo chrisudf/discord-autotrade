@@ -1613,6 +1613,147 @@ down which ones you are choosing not to cover.
 
 ---
 
+## 44. Three gates against the query failing, none against a good answer missing a row
+
+**Symptom**: 01:47:39, the reconciler reported `drift db_only:
+US.AMZN260911C250000 db=2 broker=0` and auto-closed the position at
+`fill_price=0`. Two hours later, and every hour after that:
+
+```
+03:47:42  drift broker_only: US.AMZN260911C250000 db=0 broker=2
+04:47:43  （同上）
+05:47:43  （同上）
+06:47:43  （同上）
+```
+
+The position had never left. It expired that same day, and the auto-close had
+dropped it out of the SL / TP / EOD selection — a live contract with nothing
+watching it, plus a fabricated -100% row in `position_events`.
+
+**Why non-obvious**: the auto-close already had three gates, and **all three
+were correct, and all three passed.** A kill-switch env; "never write when the
+broker reports zero option positions" (can't distinguish a real flat account
+from an empty dataframe); "never close more than N in one round" (more than that
+looks like the query side is broken). Read them together and they sound
+exhaustive.
+
+They are not. Every one of them models the same failure — *the whole query went
+wrong*. None models the failure that actually happened: one otherwise-healthy
+response, listing the other positions correctly, missing a single row. Against
+that, gate 2 sees a non-empty result and waves it through, and gate 3 sees one
+diff and waves it through. The shape that defeats a set of gates is usually the
+one they all share an assumption about.
+
+The cost is doubled by the write itself: `fill_price=0` is not a price, it is the
+absence of one, and writing it as `0.0` turns "we no longer know where this
+position went" into "it was sold for nothing." The log line even said so —
+`（fill_price=0，非成交价；PnL 需人工核）` — which is an admission that the
+value being written is wrong, recorded next to the act of writing it.
+
+**Defense**: a fourth gate that does not model the query at all —
+`_split_by_confirmation` requires the **same** `option_code` to be `db_only` on
+two consecutive rounds. A vetoed round stores no evidence (a reading that failed
+the first three gates cannot be the first of two), and a clean round clears it.
+At the default 60-minute interval this costs one extra hour, and auto-close is a
+bookkeeping convenience, not a time-critical action. `fill_price` is now `None`;
+`record_close` takes `Optional[float]` and the column stores NULL.
+
+**General form**: when you write several guards against the same failure, you
+have one guard with three spellings. Ask what they all assume — here, that
+brokenness is visible at the level of the whole response — and write the guard
+that holds when it isn't. A guard that needs a second, independent observation is
+the cheapest form of that, because it stops modelling the failure entirely.
+
+---
+
+## 45. "Will retry" is a claim about your caller, not about you
+
+**Symptom**: 00:30:09, the caller said `LITE OUT 40%`. The sell hit a position
+the broker had not yet confirmed (the buy went in at 00:28:38; the fill came back
+at 00:31:38 — three minutes) and was refused with:
+
+```
+naked-short deferred: ... a submitted buy is still unconfirmed
+— treating as transient, will retry.
+```
+
+Nothing retried. That 40% exit was simply lost, and the Telegram alert about it
+ended in a promise that the system had no way to keep.
+
+**Why non-obvious**: the sentence was true when it was written. It was added on
+9/2 to split a genuine desync (retrying never helps — trip the breaker) from a
+buy still in flight (retrying works — back off), and for the caller it was
+written against, `tp_watcher`, "will retry" is a plain statement of fact: the
+watcher comes back in five seconds whether or not anyone tells it to.
+
+What changed is not the code but who calls it. `close_flow` handles a **message**
+— one Discord line, consumed once, with no loop behind it. Same function, same
+return value, same sentence, and now it is false. The broker layer cannot tell
+which caller it has, so the sentence describes a property the callee does not
+own.
+
+The bilingual twin, which exists precisely so a transient failure gets a second
+attempt, was suppressed as a duplicate 0.8s later — and would have failed anyway,
+since the buy stayed unconfirmed for another minute. Redundancy that expires
+faster than the condition it is meant to survive is not redundancy.
+
+**Defense**: the message now states what is true for each caller —
+watcher-driven sells retry on their next tick, a caller-driven close is one-shot
+and will not be retried, decide manually. No behaviour changed; the reader of the
+3am alert now knows whether it needs them. An invariant test pins that the
+reworded string is still classified transient rather than deterministic — moving
+it into the deterministic set would trip the breaker, which is the -$166 the 9/2
+change was written to avoid.
+
+**General form**: a message written at the callee describes the callee. The
+moment a second caller appears with different control flow, any sentence about
+what happens *next* is a guess about someone else's loop. Say what you did; let
+the caller say what it will do — or name the callers explicitly.
+
+---
+
+## 46. A comment saying "does not block startup" is not a mechanism
+
+**Symptom**: the OPRA quote probe hung for **16 minutes 45 seconds** at startup
+(23:11:13 → 23:27:59), ending only when OpenD gave up with `KeepAliveFail`. For
+that entire window the process was alive and doing nothing: no watchers, no
+Discord login. It ended 90 seconds before the US open, and the machine then slept
+for another 19m48s — first order 18 minutes after the bell.
+
+**Why non-obvious**: the code says what it intends, two lines above the call:
+
+```python
+# 期权行情订阅探测：决定 SL/TP/EOD watcher 真盘是否真能工作
+# 不阻塞启动，只 log；运营自己决定是否升级订阅
+```
+
+And the *result* is handled exactly as described — every branch only logs, none
+exits. The advisory intent is real and fully implemented on the answer side.
+Nothing implements it on the **waiting** side, because a synchronous SDK call
+with no timeout has no answer side until it returns. An advisory check silently
+becomes a hard dependency the moment its transport hangs, and no amount of
+correct handling downstream can undo that.
+
+What makes it expensive rather than merely slow is *when* it runs. Startup checks
+occupy the one stretch of the day that cannot be rescheduled or recovered: the
+minutes before the open. Every other slow path in this system costs a late
+message; this one costs the open.
+
+**Defense**: `_probe_quote_with_timeout` runs the probe on a daemon thread and
+gives up after `PREFLIGHT_QUOTE_TIMEOUT_SEC` (45s), recording `QUOTE_ERROR` with
+"继续启动" and moving on. A daemon thread specifically — `ThreadPoolExecutor`
+would defeat the timeout twice over, once when `__exit__` calls
+`shutdown(wait=True)` and again when the interpreter joins its non-daemon workers
+at exit. The regression asserts elapsed time, not the return value, because the
+thing that was broken was how long it waited.
+
+**General form**: "advisory", "best-effort" and "non-blocking" are properties of
+the call, not of what you do with its result. If you cannot point at the timeout,
+the retry budget, or the cancellation, the comment is a wish. Check the ones on
+the startup path first — that is where a hang is charged at the highest rate.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -2133,6 +2274,9 @@ downside is priced in dollars.
 | 41 | 新来源的格式不是词表漂移（总丢 vs 部分丢是指纹） | `test_overnight_0910.py::test_dollar_prefixed_shapes_are_untouched`（不变量：老形状一个字不许变）。语料 `tests/corpus/2026-09-09.jsonl` 的 12 条当晚原文（6 信号 × 中英）逐字段断言。**反向护栏**：`bare_uppercase_word_is_not_a_ticker`（`TODAY - $195 …` 会被补成 `$TODAY`，靠 B 系列仍要求 calls/puts + 第二个喊价挡住）、`stopword_head_is_not_a_ticker`、`normalized_bare_ticker_still_needs_a_direction_word`（补 $ 不等于放宽方向词） |
 | 42 | 无日期兜底排在带日期的前面 = 静默降级（顺序即语义） | `test_overnight_0910.py::test_explicit_mmdd_after_calls_beats_the_no_date_fallback`（契约翻转：前身返回 9/11）、`::test_next_week_is_a_week_past_this_friday`（同类，另一个入口）。**反向不变量**：`::test_no_date_still_falls_back_to_this_friday`（B3 前移不许把无日期那条带走）、`::test_bare_next_week_does_not_shift_the_expiry`（2 个形状，"持有到下周" 不是 "下周到期"）。语料 4 条 INTC/ARM 中英断 `expiry_date` |
 | 43 | 同一个事实有两个入口，你只接了一个（#22 的兄弟命题） | 抽取侧：`test_overnight_0910.py::test_declared_stop_in_the_open_message_is_recorded`、`::test_an_open_message_without_a_stop_records_nothing`（反向：不许凭空造）。**消费端**（缺了它抽取就是空转）：`::test_a_swing_with_a_declared_stop_enters_the_watch_list`。**反向不变量**：`::test_a_swing_without_a_declared_stop_is_still_not_watched`（-99.8% 也不许动 —— 本条改的不是"给 swing 加止损"）|
+| 44 | 三道闸门防的是同一种失败：整个查询坏掉。防不住"一次良好响应里少了一行" | `test_overnight_0911.py::test_last_nights_amzn_is_not_closed_by_one_reading`（契约翻转：当晚这个序列第一轮就落账）、`::test_split_by_confirmation_matrix`（纯函数）、`::test_auto_close_records_no_fill_price`（NULL 不是 0）。**反向不变量**：`::test_two_consecutive_db_only_still_closes`（缺了它闸门 4 等于把 0018 整个关掉，8/13 夜 1918 次拒单的止血就没了）、`::test_a_vetoed_round_is_not_evidence`（坏读数 + 好读数不许凑满两轮）。既有契约同批更新：`test_0016_reconciler.py::test_auto_close_writes_db_and_drops_position_from_watchers`、`::test_auto_close_breaks_signature_throttle` 现在都跑两轮 |
+| 45 | "会重试"是对调用方控制流的断言，而被调用方不拥有它 | `test_overnight_0911.py::test_deferred_says_a_caller_close_will_not_be_retried`（契约翻转：当晚结尾是 "will retry."）。**不变量**：`::test_deferred_is_still_transient_not_deterministic`（改措辞不许把 deferred 推进确定性组 —— 那是 9/2 TSLA -$166 要避免的熔断）|
+| 46 | "不阻塞启动"写在注释里不等于有机制；启动路径上的挂起按最高价计费 | `test_overnight_0911.py::test_a_hung_quote_probe_no_longer_blocks_startup`（断的是**耗时**不是返回值 —— 坏掉的是"等多久"）、`::test_a_fast_probe_is_passed_through_untouched`（正常路径逐字不变）|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |

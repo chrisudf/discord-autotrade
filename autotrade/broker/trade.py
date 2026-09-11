@@ -423,10 +423,18 @@ def place_sell_order(
         # 这个串，换成 deferred 就自动落到瞬时组走退避 —— 判据在 broker 这层，
         # 不必让四个 on_reject 调用点各自感知（见 broker/inflight.py）。
         if inflight.is_pending(option_code):
+            # [9/11] 措辞改过一次。原文结尾是 "treating as transient, will retry."，
+            # 而"会重试"只对**自带循环**的调用方成立（TP/SL watcher 每 5s 再来一轮）。
+            # 喊单员喊的平仓是一次性消息：9/10 夜 00:30 的 `LITE OUT 40%` 撞上
+            # 00:28:38 那张还没确认的买单（FILL_ADJUST 直到 00:31:38 才回来，隔了
+            # 3 分钟），那 40% 的离场就此丢失，而日志和 TG 都在说"会重试"。
+            # 半夜看 TG 的人据此判断"不用管"，是被这句话误导的。
             msg = (
                 f"naked-short deferred: broker has only {available} long of {option_code}, "
                 f"asked to sell {qty}, but a submitted buy is still unconfirmed — "
-                f"treating as transient, will retry."
+                f"transient, so no circuit-break. NOTE: watcher-driven sells (TP/SL) "
+                f"retry on their next tick; a caller-driven close is one-shot and will "
+                f"NOT be retried — decide manually whether to re-exit."
             )
             logger.warning(f"[broker] {msg}")
             return {
