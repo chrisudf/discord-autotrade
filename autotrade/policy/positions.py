@@ -199,6 +199,57 @@ def strategy_b_decision(
     )
 
 
+def last_spare_trim_decision(
+    avg_entry: float,
+    quote_ref: "float | None",
+    kc_pnl_pct: "float | None",
+    min_pnl_pct: float,
+) -> tuple[str, str]:
+    """[9/10] **最后一张备用合约**的 trim 闸门：按我方实时浮盈决定减还是留。
+
+    Args / Returns / 语义与 strategy_b_decision 逐字同构（同一个谓词：我方浮盈
+    是否达标），只是结局换成 ("TRIM" | "PRESERVE", reason)。
+
+    为什么需要它（9/9 夜 TSLA 385C + DELL 570C 双实锤）：两笔都是 qty=2 开仓，
+    喊单员的早期 trim 各吃掉一张 —— TSLA 在 +6.3%（3.35 → 3.56）、DELL 在
+    +12.8%（3.20 → 3.61）。剩下单张之后，weekly 阶梯的 T1(+50%)、T2(+100%)
+    两档**全部空转**：calc_qty_to_sell 的 runner-preserve 让 trim 取整为 0 张，
+    tp_hits 却照样置位，于是棘轮只锁"已命中档位的**上一级**"。两张 runner 都
+    摸到过 +100%，最后按 +50% 的棘轮底被冲掉，回吐 ≈ 已实现（各 $16x/张）。
+    "打印到 +100%、出在 +50%" 是这套组合的**稳态行为**，不是偶发 —— 9/1 COIN
+    190C 是第一次，9/9 夜是第二、第三次。
+
+    换句话说：**喊单员的低位 trim 拿走了阶梯的子弹。** 已有的浮盈闸门
+    （strategy_b_decision 的 min_pnl_pct）只在 remaining==1 时才介入，
+    而子弹恰恰是在 remaining==2 那一步被打光的 —— 门开在马已经跑了之后。
+
+    与 strategy_b_decision 的边界：那个管"已经只剩 1 张、KC 还在喊 trim"，
+    这个管"再减一次就只剩 1 张"。两者不会同时触发（qty_to_sell 一个是 0、
+    一个是 >0），共用同一个阈值语义但各自读各自的 env。
+
+    纯函数：不读 env、不碰 DB —— 开关与取价 I/O 留在 close_flow。
+    """
+    kc_txt = (
+        f"KC 自报 {kc_pnl_pct:+g}%" if kc_pnl_pct is not None else "KC 未报盈亏"
+    )
+    # 与 strategy_b_decision 同一条哲学：拿不到可靠参照就**不拦**——本闸门的
+    # 副作用是"少卖一张"，而误拦一次真该减的仓比漏拦一次更贵（6/30 SPY 748c
+    # 那类提前平掉的教训在 calc_qty_to_sell 的 docstring 里）。所以这里的
+    # fail-open 方向与策略B（fail 向 PRESERVE）**相反**，是刻意的。
+    if quote_ref is None:
+        return "TRIM", f"无新鲜报价参照（{kc_txt}），不拦"
+    if avg_entry is None or avg_entry <= 0:
+        return "TRIM", f"avg_entry 异常（{avg_entry}），不拦"
+    our_pnl = (quote_ref - avg_entry) / avg_entry * 100
+    if our_pnl >= min_pnl_pct:
+        return "TRIM", f"我方浮盈 {our_pnl:+.1f}% ≥ 阈值 {min_pnl_pct:g}%（{kc_txt}）"
+    return (
+        "PRESERVE",
+        f"我方浮盈 {our_pnl:+.1f}% < 阈值 {min_pnl_pct:g}%，"
+        f"留住最后一张备用合约给 TP 阶梯（{kc_txt}）",
+    )
+
+
 # Ladder 定义：(threshold_pct, trim_pct_of_remaining, tier_bit)
 # 注意 trim_pct 是相对"当时剩余"，所以 T1 卖 50% → 剩 50%；T2 再卖 50% → 剩 25%
 LADDER = {

@@ -277,7 +277,7 @@ def open_or_add(
 
 
 def record_close(
-    option_code: str, qty_sold: int, fill_price: float,
+    option_code: str, qty_sold: int, fill_price: Optional[float],
     trigger_source: str, ref_msg_id: Optional[str] = None,
     order_id: Optional[str] = None, note: str = "",
 ) -> Optional[dict]:
@@ -285,6 +285,9 @@ def record_close(
 
     Args:
         qty_sold: 本次卖出张数（正数）
+        fill_price: 成交价；**None = 没有成交价**（reconciler 的自动落账：
+            仓位是"消失"了不是"卖了"）。写 0 会被下游当成真成交价，
+            一笔 -100% 的假账就此入库（9/10 夜 AMZN 实锤）。
         trigger_source: kc_signal / sl_polling / tp_polling / eod / manual
         ref_msg_id: 触发源是 discord 时填 msg_id
         order_id: broker 返回的卖单 ID
@@ -342,8 +345,9 @@ def record_close(
             trigger_source, ref_msg_id, order_id, now, note,
         ))
 
+    px = f"{fill_price:.2f}" if fill_price is not None else "无成交价"
     logger.info(
-        f"[positions] {event_type} {option_code}: -{qty_sold} @ {fill_price:.2f} "
+        f"[positions] {event_type} {option_code}: -{qty_sold} @ {px} "
         f"({trigger_source}) remaining={remaining}"
     )
     return get(option_code)
