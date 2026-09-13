@@ -56,6 +56,7 @@ class Outcome(Enum):
     SKIPPED_NOTIFIED = "skipped_notified"  # 确定性跳过，已发专属 TG（无价/strike/twin/频道）
     SKIPPED_SILENT = "skipped_silent"      # 确定性跳过，仅 log（等锁期间已被别人卖掉等）
     RUNNER_PRESERVED = "runner_preserved"  # runner-preserve 拦下（循环外合并 TG）
+    SPARE_PRESERVED = "spare_preserved"    # [9/10] 最后一张备用合约的浮盈闸门拦下（同上，另一条文案）
     BROKER_FAILED = "broker_failed"        # broker 异常/拒单（瞬时，值得孪生重试）
     NOT_FOUND = "not_found"                # 没找到可操作仓位（唯一不算 executed 的结局）
 

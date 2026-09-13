@@ -74,6 +74,10 @@ KIND_FOREIGN = "foreign"
 # TG 恰好发送失败，同一份漂移不会重试——log 里每轮都有完整记录兜底。
 _last_signature: "tuple | None" = None
 
+# [9/11] 第四道闸门的记忆：上一轮被判为 db_only 的 code。
+# 只有连续两轮都说"broker 没有"才落账，见 _split_by_confirmation。
+_db_only_seen: "set[str]" = set()
+
 
 # ---- 自动落账（0018，2026-08-13）----------------------------------------
 # 8/13 夜实证：reconciler **看见了**（00:27 一条 db_only: MU 945C db=2 broker=0，
@@ -95,6 +99,15 @@ _last_signature: "tuple | None" = None
 #      "position_list_query 返回了个空 df"，而后者会把全部活仓一次清空。
 #   3. 单轮最多落账 RECONCILE_AUTO_CLOSE_MAX 条（默认 3）：超过这个数更像
 #      查询侧出了问题，不像真有那么多仓同时消失。
+#   4. [9/11] **同一个 code 连续两轮都是 db_only 才落账**（_split_by_confirmation）。
+#      上面三道防的都是"**整个查询**坏掉"——返回空 df、一次消失一大片。9/10 夜
+#      栽在它们都不覆盖的那一种：一次**良好**响应里少了一行。01:47:39 报
+#      AMZN 250C db=2 broker=0 当场落账，03:47/04:47/05:47/06:47 连续四轮又报
+#      它 broker_only ——仓位一直都在。代价是双份的：那 2 张当天到期却掉出了
+#      SL/TP/EOD 的选仓（幽灵仓，没有任何东西再看它），同时 fill_price=0 把一笔
+#      -100% 的假账写进了 position_events。
+#      一次读数不足以宣告一个仓位消失。默认 60min 间隔下这条闸门要多等一轮，
+#      而自动落账是记账便利、不是时效动作——一小时很便宜。
 _DEFAULT_AUTO_CLOSE_MAX = 3
 
 # 外仓日志收敛窗口：6 小时。取值只需满足"整夜出现一两次"——比任何合理的
@@ -124,27 +137,57 @@ def _auto_close_veto(diffs: list[dict], broker_rows: dict[str, int]) -> "str | N
     return None
 
 
+def _split_by_confirmation(
+    stale_codes: "set[str]", seen: "set[str]"
+) -> "tuple[set[str], set[str]]":
+    """第四道闸门：(本轮可落账的, 仅初次观测到的)。纯函数，便于单测穷举。"""
+    return stale_codes & seen, stale_codes - seen
+
+
 def _auto_close(diffs: list[dict], broker_rows: dict[str, int]) -> tuple[list[str], str]:
     """把确定性 db_only 落账为 CLOSED。返回 (已落账的 code 列表, 说明串)。
 
     单条失败不影响其余（逐条 try）：对账是止血路径，一条写不进去不该让
     另外几条也留在陈旧状态。
     """
+    global _db_only_seen
+
     stale = [d for d in diffs if d["kind"] == KIND_DB_ONLY]
     if not stale:
+        _db_only_seen = set()      # 漂移消失 → 证据清零
         return [], ""
 
     veto = _auto_close_veto(diffs, broker_rows)
     if veto is not None:
+        # 读数本身就不可信，不能拿它当"第一次观测"存下来 —— 否则下一轮
+        # 一旦放行，闸门 4 会被这次坏读数直接满足。
+        _db_only_seen = set()
         logger.warning(f"[reconcile] 自动落账跳过：{veto}")
         return [], f"⚠️ 自动落账跳过：{veto}"
 
+    codes = {d["option_code"] for d in stale}
+    confirmed, first_seen = _split_by_confirmation(codes, _db_only_seen)
+    _db_only_seen = codes
+    if first_seen:
+        logger.warning(
+            f"[reconcile] db_only 首次观测，本轮不落账、等下一轮确认: "
+            f"{sorted(first_seen)}")
+    if not confirmed:
+        return [], (
+            "⏳ db_only 首次观测，等下一轮对账确认后再落账（一次读数不足以宣告"
+            "仓位消失，9/10 夜 AMZN 实锤）：\n"
+            + "\n".join(f"  - {c}" for c in sorted(first_seen))
+        )
+
     closed: list[str] = []
-    for d in stale:
+    for d in [d for d in stale if d["option_code"] in confirmed]:
         code = d["option_code"]
         try:
             positions_db.record_close(
-                option_code=code, qty_sold=d["db_qty"], fill_price=0.0,
+                # fill_price=None 而不是 0：这个仓位是"消失"了不是"卖了"，
+                # 0 会被当成成交价，一笔 -100% 的假账就此进了 position_events。
+                # NULL 的语义是"没有成交价"，PnL 统计据此跳过它。
+                option_code=code, qty_sold=d["db_qty"], fill_price=None,
                 trigger_source="broker_sync",
                 note="reconcile auto-close: broker no longer has this position "
                      "(auto-exercise / expired / manual close)",
@@ -152,14 +195,14 @@ def _auto_close(diffs: list[dict], broker_rows: dict[str, int]) -> tuple[list[st
             closed.append(code)
             logger.warning(
                 f"[reconcile] ✅ 自动落账 CLOSED: {code} qty={d['db_qty']} "
-                f"（fill_price=0，非成交价；PnL 需人工核）")
+                f"（无成交价：仓位是消失不是卖出；PnL 需人工核）")
         except Exception as e:
             logger.error(f"[reconcile] ❌ 自动落账失败 {code}: {type(e).__name__}: {e}")
 
     if not closed:
         return [], ""
     return closed, (
-        f"✅ 已自动落账 {len(closed)} 条陈旧 OPEN 为 CLOSED（fill_price=0，非成交价）：\n"
+        f"✅ 已自动落账 {len(closed)} 条陈旧 OPEN 为 CLOSED（连续两轮确认，无成交价）：\n"
         + "\n".join(f"  - {c}" for c in closed)
         + "\n这些仓位从此掉出 SL/TP/EOD 选仓，止盈不会再对着空仓硬打。PnL 需人工核。"
     )
@@ -291,6 +334,8 @@ async def _reconcile_tick() -> list[dict]:
     if not diffs:
         # 漂移清零 → 重置签名：同样的漂移将来再出现，属于新事件要重新告警
         _last_signature = None
+        # 漂移清零 → 闸门 4 的记忆同样清零（此路径不经过 _auto_close）
+        globals()["_db_only_seen"] = set()
         logger.info(
             f"[reconcile] OK: broker {len(broker_rows)} / DB {len(db_rows)}，无漂移")
         return []

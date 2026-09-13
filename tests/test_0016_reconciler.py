@@ -33,8 +33,10 @@ def _reset_reconciler_state():
     # TG 节流签名是模块级状态——不清会让先跑的测试压掉后跑测试的告警
     # （与 conftest 清 runner-preserve 节流同一教训）
     reconciler._last_signature = None
+    reconciler._db_only_seen = set()      # 闸门 4 的记忆，同样是模块级状态
     yield
     reconciler._last_signature = None
+    reconciler._db_only_seen = set()
 
 
 def _uniq_code(prefix: str) -> str:
@@ -407,8 +409,13 @@ def test_sub_100_strike_not_reported_as_phantom_drift():
 # 要动手"，以及三道不许动手的闸门。
 
 async def test_auto_close_writes_db_and_drops_position_from_watchers(monkeypatch):
-    """db_only + broker 侧还有别的仓 → 落账 CLOSED，掉出 watcher 选仓。"""
+    """db_only + broker 侧还有别的仓 → 落账 CLOSED，掉出 watcher 选仓。
+
+    [9/11 契约翻转] 落账现在要**连续两轮**确认（闸门 4）。本用例前身只跑一轮，
+    那正是 9/10 夜 AMZN 被一次坏读数误平的形状；见 test_auto_close_needs_two_ticks。
+    """
     monkeypatch.setenv("DRY_RUN", "false")
+    reconciler._db_only_seen = set()
     stale = _uniq_code("AC1")
     alive = _uniq_code("AC2")
     _open_pos("AC1", stale, qty=2)
@@ -418,8 +425,11 @@ async def test_auto_close_writes_db_and_drops_position_from_watchers(monkeypatch
     with patch.object(reconciler, "list_open_option_positions",
                       return_value={alive: 1}), \
          patch.object(reconciler, "send_telegram", tg):
+        first = await reconciler._reconcile_tick()
+        assert positions_db.get(stale)["status"] != "CLOSED", "第一轮只观测不落账"
         diffs = await reconciler._reconcile_tick()
 
+    assert [d["kind"] for d in first] == [reconciler.KIND_DB_ONLY]
     assert [d["kind"] for d in diffs] == [reconciler.KIND_DB_ONLY]
     assert positions_db.get(stale)["status"] == "CLOSED"
     assert positions_db.get(alive)["status"] == "OPEN"  # 活仓一根汗毛都不许动
@@ -537,8 +547,15 @@ async def test_auto_close_breaks_signature_throttle(monkeypatch):
         await reconciler._reconcile_tick()
         assert tg.await_count == 1
 
-        # 第三轮打开自动落账：签名依旧相同，但这一轮真动了 DB，必须出声
+        # [9/11] 第三轮打开自动落账：闸门 4 要连续两轮确认，而前两轮被闸门 1
+        # 否决过（RECONCILE_AUTO_CLOSE=0），那两轮的读数不算证据 —— 所以这一轮
+        # 只是"首次观测"，不动 DB，签名也没变 → 仍然不发 TG。
         monkeypatch.setenv("RECONCILE_AUTO_CLOSE", "1")
+        await reconciler._reconcile_tick()
+        assert tg.await_count == 1
+        assert positions_db.get(stale)["status"] == "OPEN"
+
+        # 第四轮拿到第二次确认：真动了 DB，签名依旧相同也必须出声
         await reconciler._reconcile_tick()
 
     assert tg.await_count == 2

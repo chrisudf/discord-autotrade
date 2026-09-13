@@ -266,6 +266,19 @@ async def _sl_tick():
             watch.append((p, cfg["sl_pct"]))
         elif cfg["lotto_pct"] > 0 and p.get("category") in LOTTO_CATEGORIES:
             watch.append((p, cfg["lotto_pct"]))
+        elif p.get("manual_stop"):
+            # [9/10] 喊单员**自己声明了绝对止损价**的仓位，无论类目都要看护。
+            # 触发场景：ashley 的 ":RedAlert: INTC - $110 CALLS 10/2 $4.70,
+            # STOP LOSS AT $4.20" —— 10/2 = DTE 23 → categorize 归 swing →
+            # apply_sl=False → 原本连本名单都进不来。结果是一个**明说了**的
+            # 止损被丢掉两次：开仓侧没人读（已补，见 open_flow._apply_declared_stop），
+            # watcher 侧不看护。只补前者等于没补（lesson #22 的形状）。
+            #
+            # pct=1.0 → entry×(1-1)=0，自身不带任何百分比底；底完全由下面
+            # manual_stop 那段给。**不发明止损**，只执行喊单员明说的那个数字。
+            # 所以这不是"给 swing 加止损"（那是钱路决定，见 ROADMAP P1 §16 与
+            # lesson #31 结尾）—— 作用域严格限定在"有绝对价声明"这一种。
+            watch.append((p, 1.0))
     if not watch:
         return
 

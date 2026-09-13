@@ -1419,6 +1419,341 @@ supposed to live — even if the answer is "nowhere, yet."
 
 ---
 
+## 39. The installer and the thing it installed drifted, and re-running the installer is the rollback
+
+**Symptom**: `com.chengqiu.autotrade.night.plist` has had four
+`StartCalendarInterval` entries since 8/29 — 23:11 / 23:15 / 23:20 / 23:25, the
+wake-window redundancy from #28. `ops/install.sh`, the script whose header says
+"换机器就跑这一条", only ever emitted **one** (23:15). Running the documented
+install command silently deletes three quarters of a fix.
+
+**Why non-obvious**: the installer is idempotent *with respect to itself*. Every
+check you would think to run after it passes — `plutil -lint` is clean,
+`launchctl print` shows the job loaded and enabled, the plist is valid, the
+23:15 trigger fires. Nothing anywhere compares the generated artifact to the one
+it replaced, because a generator has no memory of what it generated last time
+and the live file was the only place the extra three points existed. And the
+failure it re-arms does not surface at install time: it surfaces weeks later, on
+the one night the Mac happens to be asleep at 23:15, with no causal thread back
+to the day someone re-ran a setup script.
+
+This is the same asymmetry as #22 in a different medium. There, a parsed field
+had no consumer. Here, a hand-edit had no generator — and the direction of the
+silence is worse, because the artifact looks *more* correct than the source.
+
+**Defense**: `emit_plist` now takes a variadic `HH:MM` list plus an optional
+extra-env block, and the night job passes all four points; the summary line
+prints them so a wrong count is visible at install time. Verification was a
+sandboxed dry-run (`LA_DIR`/`APPSUP` redirected, `launchctl` stubbed) diffed
+against the live plist — identical except the redirected paths. `ops/README.md`
+now says the four points are deliberate and must not be trimmed.
+
+**General form**: the moment you hand-edit something a script generates, the
+script has become a loaded rollback. Fold the edit back into the generator in
+the same change, or you have written a time bomb whose fuse is the next person
+following your own setup instructions.
+
+---
+
+## 40. A script's error reporting cannot see the layer that builds the script
+
+**Symptom**: every morning `morning_collect.sh` printed two lines nobody chased:
+
+```
+morning_collect.sh:91: command not found: expiry
+morning_collect.sh:91: command not found: WHERE
+```
+
+**Why non-obvious**: that an unquoted heredoc runs command substitution is in the
+shell manual, and the author clearly knew expansion was live — `\$714` is escaped
+by hand a few lines away. The heredoc *has* to stay unquoted; it interpolates
+`$TODAY_ET` and `$SINCE_UTC`. What is not in any manual is the second half: this
+script had already been hardened on 9/5 to stop swallowing errors. It routes
+sqlite3's stderr to a separate file (`DIGEST_ERR`) precisely so that a bad column
+name cannot end up written into the digest and read by the review as "no records
+of that kind" — and it shouts into `ops.log` if that file is non-empty.
+
+These two errors bypass all of it. They are raised by zsh while **constructing**
+the heredoc, before `sqlite3` is executed, so they belong to no redirection the
+script set up for the command it was about to run. The mechanism built to catch
+exactly this class of failure cannot see it, because it lives inside the process
+whose own construction is failing.
+
+The backticks here happened to sit in SQL `--` comments, so the query was still
+correct and the digest was fine. That is luck, not design: the same 73 lines
+would have executed anything else in backticks just as willingly.
+
+**Defense**: both occurrences escaped as `` \` ``, matching the file's existing
+`\$714` idiom. Verified by extracting lines 91-164 into a standalone script and
+running the old and new versions side by side: errors gone, SQL output
+byte-identical, line count matching that morning's real digest.
+
+**General form**: an error channel you install inside a process cannot observe
+that process being built. When a script's diagnostics live in the same file as
+the thing being diagnosed, ask which layer they actually cover — and check the
+terminal, not just the log the script writes.
+
+---
+
+## 41. A new source's format is not vocabulary drift
+
+**Symptom**: the `ashley` channel was enabled and on its first live night lost
+**9 of 9** `:RedAlert:` open signals — 18 messages counting the bilingual twins,
+every one of them `[parser] no signal`.
+
+**Why non-obvious**: every previous parser miss in this repo was drift — a
+synonym, a punctuation change, a word order swap, a preposition, inside a channel
+that was already working (#21, #24, #25, #32, #37). The reflex those built is to
+widen a vocabulary. Nothing drifted here. A new channel writes a shape no pattern
+family ever covered: bare ticker (`SKHY - $195 CALLS ...`) where all six Pattern B
+variants anchor on `\$([A-Z]{1,5})`, while the families that *do* accept a bare
+ticker want `195c` glued together (A/C) or an `NDTE` (D).
+
+From the alert side the two are indistinguishable — both are `Parse failed` × N —
+but the fixes point in opposite directions, and the wrong one is actively
+dangerous. Widening means deleting the `$` anchor from six regexes, and that
+anchor is the only thing stopping `[A-Z]{1,5}` under `IGNORECASE` from eating
+ordinary English words; the A series already learned this on 7/8 when `but` in
+"taking AAPL again but 300p 7/17" became a ticker. Six loops would each need an
+`isupper()` check and a stopword table.
+
+The tell is in the numbers: drift is partial (one phrasing of many stops working),
+a shape gap is total. 100% loss on exactly one source, 0% on the others, starting
+the night that source was switched on.
+
+**Defense**: `_normalize_bare_ticker` rewrites the leading bare ticker to
+`$TICKER` at the entry, the same move already used for ZH direction words and
+inverted prices — every downstream pattern, guard and expiry rule is reused
+verbatim. The shape is pinned hard: start of message, optional `:emoji:`
+shortcode, 1-5 uppercase letters **matched without IGNORECASE**, optional dash,
+and a mandatory `$digit` lookahead. Stopwords are the second line; the third is
+that Pattern B still demands `calls/puts` and a second quoted price, which is
+what stops `TODAY - $195 was the pivot` (a corpus row).
+
+**General form**: before widening a matcher, ask whether the source is new. Drift
+degrades a working path; a new source arrives with a total outage on one channel
+and none anywhere else. Widening is the wrong tool for the second one, and it
+spends your false-positive budget to fix a problem you do not have.
+
+---
+
+## 42. The fallback that asks for nothing wins every race it is entered in
+
+**Symptom**: `:RedAlert: INTC - $110 CALLS 10/2 $4.70` parsed cleanly and
+produced expiry **9/11** — this Friday — instead of 10/2. No warning, no alert,
+no log line. A valid order for the wrong contract.
+
+**Why non-obvious**: Pattern B0 exists and is literally titled "含明确 MM/DD". It
+looks like it covers this. It does not: B0 requires the date to appear *before*
+the strike, and this channel writes it after `CALLS`. The variant that does cover
+it, B3, was last in the chain — and B2, which requires **no date at all**, sat in
+front of it.
+
+A pattern with fewer requirements matches a superset of the inputs of one with
+more. Put it earlier in an ordered chain and it wins every input they share, so
+in a chain like this the order is not a tiebreak between equals, it *is* the
+specificity policy. The docstring even listed B3 last, which reads like priority
+documentation and was in fact an accurate description of a bug.
+
+And the failure mode is the dangerous one: not a miss, a silent downgrade. The
+signal parses, the order fills, the position opens, and the only evidence is an
+expiry field nobody diffs against the message. The B0.5 comment in the same
+function records this exact shape — "英文月份日期被无视，expiry 悄悄退成 next
+Friday" — from a different entry point, months earlier.
+
+**Defense**: B3 moved ahead of B2; the docstring now states the rule ("带日期的
+一律排在无日期兜底前面") instead of describing the order. The corpus asserts
+`expiry_date` on both INTC rows in both languages, and a reverse invariant pins
+that the genuinely date-less message still falls back to this Friday.
+
+**General form**: in any ordered chain of matchers, sort by specificity and write
+the rule down next to the chain. The branch that requires nothing must be last —
+it is a default, and a default in front of a specific case is a silent downgrade
+generator.
+
+---
+
+## 43. One fact, two entrances — you guarded one
+
+**Symptom**: #38 shipped the entire declared-stop pipeline on 9/9: extraction
+from the caller's wording, `manual_stop` on the position, a watcher that ratchets
+the floor up to it. On 9/10 the new channel's opening messages said
+`STOP LOSS AT $4.20` in three of nine signals and **none of it fired**.
+
+**Why non-obvious**: #38 is not incomplete. Every layer it built works and is
+tested. What it is not is *entrance*-complete: `parse_stop_adjust` is called from
+exactly one place, `close_flow`, because on the channels that existed when it was
+written the stop always arrived in a **follow-up** message — "trimmed Tesla 2.95,
+stop is at 2.35 now". A new source puts the identical fact in the *opening*
+message, which is routed to OPEN and never passes the function that knows how to
+read it. The pipeline is not bypassed by a parsing failure; it is simply never
+called.
+
+Then it fails a second time, at a layer that also looks complete on its own. The
+contract carrying that stop expires 10/2 — DTE 23 — so `categorize` returns
+`swing`, `apply_sl=False`, and `sl_watcher`'s watch list never includes it. Even
+had the stop been recorded, nothing would read it. Two layers, each correct by
+its own contract, each silently dropping the same instruction.
+
+**Defense**: `open_flow._apply_declared_stop` records the stop after
+`on_order_filled` (the row has to exist first), and `sl_watcher` grows a third
+watch-list branch for any position carrying a `manual_stop`, entered at
+`pct=1.0` so it brings **no percentage floor of its own** — the threshold comes
+entirely from the number the caller stated. That distinction is the whole scope:
+this does not give swings a stop loss (still a money-path decision, ROADMAP P1
+§16 and the tail of #31), it executes a stop the caller declared and we dropped.
+Both layers have tests, plus the reverse invariant that a swing *without* a
+declared stop is still not watched at -99.8%.
+
+**General form**: #22 says a parsed field with no consumer is decoration. Its
+sibling: a consumer wired to one entrance is decoration for every other entrance.
+When you add a handler for a fact, enumerate the paths that fact can arrive on —
+message kinds, channels, sources — rather than the one in front of you, and write
+down which ones you are choosing not to cover.
+
+---
+
+## 44. Three gates against the query failing, none against a good answer missing a row
+
+**Symptom**: 01:47:39, the reconciler reported `drift db_only:
+US.AMZN260911C250000 db=2 broker=0` and auto-closed the position at
+`fill_price=0`. Two hours later, and every hour after that:
+
+```
+03:47:42  drift broker_only: US.AMZN260911C250000 db=0 broker=2
+04:47:43  （同上）
+05:47:43  （同上）
+06:47:43  （同上）
+```
+
+The position had never left. It expired that same day, and the auto-close had
+dropped it out of the SL / TP / EOD selection — a live contract with nothing
+watching it, plus a fabricated -100% row in `position_events`.
+
+**Why non-obvious**: the auto-close already had three gates, and **all three
+were correct, and all three passed.** A kill-switch env; "never write when the
+broker reports zero option positions" (can't distinguish a real flat account
+from an empty dataframe); "never close more than N in one round" (more than that
+looks like the query side is broken). Read them together and they sound
+exhaustive.
+
+They are not. Every one of them models the same failure — *the whole query went
+wrong*. None models the failure that actually happened: one otherwise-healthy
+response, listing the other positions correctly, missing a single row. Against
+that, gate 2 sees a non-empty result and waves it through, and gate 3 sees one
+diff and waves it through. The shape that defeats a set of gates is usually the
+one they all share an assumption about.
+
+The cost is doubled by the write itself: `fill_price=0` is not a price, it is the
+absence of one, and writing it as `0.0` turns "we no longer know where this
+position went" into "it was sold for nothing." The log line even said so —
+`（fill_price=0，非成交价；PnL 需人工核）` — which is an admission that the
+value being written is wrong, recorded next to the act of writing it.
+
+**Defense**: a fourth gate that does not model the query at all —
+`_split_by_confirmation` requires the **same** `option_code` to be `db_only` on
+two consecutive rounds. A vetoed round stores no evidence (a reading that failed
+the first three gates cannot be the first of two), and a clean round clears it.
+At the default 60-minute interval this costs one extra hour, and auto-close is a
+bookkeeping convenience, not a time-critical action. `fill_price` is now `None`;
+`record_close` takes `Optional[float]` and the column stores NULL.
+
+**General form**: when you write several guards against the same failure, you
+have one guard with three spellings. Ask what they all assume — here, that
+brokenness is visible at the level of the whole response — and write the guard
+that holds when it isn't. A guard that needs a second, independent observation is
+the cheapest form of that, because it stops modelling the failure entirely.
+
+---
+
+## 45. "Will retry" is a claim about your caller, not about you
+
+**Symptom**: 00:30:09, the caller said `LITE OUT 40%`. The sell hit a position
+the broker had not yet confirmed (the buy went in at 00:28:38; the fill came back
+at 00:31:38 — three minutes) and was refused with:
+
+```
+naked-short deferred: ... a submitted buy is still unconfirmed
+— treating as transient, will retry.
+```
+
+Nothing retried. That 40% exit was simply lost, and the Telegram alert about it
+ended in a promise that the system had no way to keep.
+
+**Why non-obvious**: the sentence was true when it was written. It was added on
+9/2 to split a genuine desync (retrying never helps — trip the breaker) from a
+buy still in flight (retrying works — back off), and for the caller it was
+written against, `tp_watcher`, "will retry" is a plain statement of fact: the
+watcher comes back in five seconds whether or not anyone tells it to.
+
+What changed is not the code but who calls it. `close_flow` handles a **message**
+— one Discord line, consumed once, with no loop behind it. Same function, same
+return value, same sentence, and now it is false. The broker layer cannot tell
+which caller it has, so the sentence describes a property the callee does not
+own.
+
+The bilingual twin, which exists precisely so a transient failure gets a second
+attempt, was suppressed as a duplicate 0.8s later — and would have failed anyway,
+since the buy stayed unconfirmed for another minute. Redundancy that expires
+faster than the condition it is meant to survive is not redundancy.
+
+**Defense**: the message now states what is true for each caller —
+watcher-driven sells retry on their next tick, a caller-driven close is one-shot
+and will not be retried, decide manually. No behaviour changed; the reader of the
+3am alert now knows whether it needs them. An invariant test pins that the
+reworded string is still classified transient rather than deterministic — moving
+it into the deterministic set would trip the breaker, which is the -$166 the 9/2
+change was written to avoid.
+
+**General form**: a message written at the callee describes the callee. The
+moment a second caller appears with different control flow, any sentence about
+what happens *next* is a guess about someone else's loop. Say what you did; let
+the caller say what it will do — or name the callers explicitly.
+
+---
+
+## 46. A comment saying "does not block startup" is not a mechanism
+
+**Symptom**: the OPRA quote probe hung for **16 minutes 45 seconds** at startup
+(23:11:13 → 23:27:59), ending only when OpenD gave up with `KeepAliveFail`. For
+that entire window the process was alive and doing nothing: no watchers, no
+Discord login. It ended 90 seconds before the US open, and the machine then slept
+for another 19m48s — first order 18 minutes after the bell.
+
+**Why non-obvious**: the code says what it intends, two lines above the call:
+
+```python
+# 期权行情订阅探测：决定 SL/TP/EOD watcher 真盘是否真能工作
+# 不阻塞启动，只 log；运营自己决定是否升级订阅
+```
+
+And the *result* is handled exactly as described — every branch only logs, none
+exits. The advisory intent is real and fully implemented on the answer side.
+Nothing implements it on the **waiting** side, because a synchronous SDK call
+with no timeout has no answer side until it returns. An advisory check silently
+becomes a hard dependency the moment its transport hangs, and no amount of
+correct handling downstream can undo that.
+
+What makes it expensive rather than merely slow is *when* it runs. Startup checks
+occupy the one stretch of the day that cannot be rescheduled or recovered: the
+minutes before the open. Every other slow path in this system costs a late
+message; this one costs the open.
+
+**Defense**: `_probe_quote_with_timeout` runs the probe on a daemon thread and
+gives up after `PREFLIGHT_QUOTE_TIMEOUT_SEC` (45s), recording `QUOTE_ERROR` with
+"继续启动" and moving on. A daemon thread specifically — `ThreadPoolExecutor`
+would defeat the timeout twice over, once when `__exit__` calls
+`shutdown(wait=True)` and again when the interpreter joins its non-daemon workers
+at exit. The regression asserts elapsed time, not the return value, because the
+thing that was broken was how long it waited.
+
+**General form**: "advisory", "best-effort" and "non-blocking" are properties of
+the call, not of what you do with its result. If you cannot point at the timeout,
+the retry budget, or the cancellation, the comment is a wish. Check the ones on
+the startup path first — that is where a hang is charged at the highest rate.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -1934,6 +2269,14 @@ downside is priced in dollars.
 | 36 | 解析器因缺信息而拒绝时，要改的不是它，是持有那条信息的那一层 | `test_symbolless_close_binding.py::test_last_nights_out_half_now_sells`（端到端重放 9/2 原文，断言下了一张卖单）、`::test_binds_to_the_lone_fresh_position_in_that_channel`、`::test_does_not_touch_the_old_swing_of_the_same_symbol`（同 symbol 的陈年 swing 不许被碰——钉合约不是钉 symbol，见 #11）。**四道闸门各一条**：`::test_refuses_when_two_positions_opened_today_in_the_channel`、`::test_refuses_across_channels`、`::test_refuses_when_the_quoted_price_is_a_different_order_of_magnitude`（含正向对照，证明拦下的是价格）、`::test_kill_switch_reproduces_todays_silence`。**不变量**：`::test_parse_close_contract_is_untouched`（主解析器仍返回 None）、`::test_these_must_stay_none`（9 条，含「有 ticker 但不在持仓 = 无仓可平」这条最该防的）|
 | 37 | 尾空格不是词边界；而该抓住它的同步测试永远在动词后面打了个空格 | `test_overnight_0909.py::test_last_nights_trim_now_parses`（契约翻转：当晚原文逐字，含 @everyone 前缀与 emoji）、`::test_bare_verb_followed_by_punctuation`（5 个形状：逗号/句号/感叹号/换行/原本就能的祈使式 —— 前四个是空格模板结构上造不出来的）。**反向护栏**：`::test_word_boundary_does_not_widen_into_other_words`（scout / circuit，`"cut "` 加空格的原始理由不许丢）、`::test_the_zh_twin_is_no_longer_collateral_damage`（EN 误判经 zh-twin guard 传染中文这条链）。同族前案：#21 #25 #32 |
 | 38 | 为了不误读而抹掉的文本，仍然需要有人去读它 | `test_overnight_0909.py::test_declared_stops_are_extracted`（7 条，含 9/2 与 9/9 的六条双语原文）、`::test_dell_replay_records_breakeven_against_our_own_entry`（端到端重放，保本锚在**我们**的成交均价上）、`::test_sl_uses_the_declared_stop_instead_of_entry_times_half`（消费端：底从 1.60 抬到 3.48，缺了它前两层全是空转，见 #22）。**不变量**：`::test_manual_stop_only_ever_ratchets_up`、`::test_declared_stop_never_loosens_a_tighter_threshold`（同棘轮 #31 的"只抬不放"）。**反向护栏**：`::test_these_carry_no_stop`（4 条，含 `stopped out` 是平仓动词不是设止损）|
+| 39 | 生成器与它生成的东西漂移之后，重跑生成器就是回滚 | 无自动回归（launchd/plist 是宿主状态，测不了）。防御在 `ops/install.sh::emit_plist` 的可变触发点列表 + 安装时打印全部点位（数量不对当场看得见）。**验证方法**：`LA_DIR`/`APPSUP` 重定向到沙盒、`launchctl` 打桩跑一遍 install.sh，`plutil -convert xml1` 后与线上 plist diff —— 除重定向的三条路径外必须逐字节相同。`ops/README.md` 记着那 4 个点位是刻意的 |
+| 40 | 脚本自己装的错误上报，看不见构造这个脚本的那一层 | 无自动回归（zsh heredoc 构造期行为）。防御是 `ops/morning_collect.sh` 里两处 `` \` `` 转义（与同文件 `\$714` 同一写法）。**验证方法**：把 91-164 行抽成独立脚本，新旧两版对跑 —— 旧版必然打出 `command not found: expiry` / `WHERE`，新版无报错且 SQL 输出逐字节一致 |
+| 41 | 新来源的格式不是词表漂移（总丢 vs 部分丢是指纹） | `test_overnight_0910.py::test_dollar_prefixed_shapes_are_untouched`（不变量：老形状一个字不许变）。语料 `tests/corpus/2026-09-09.jsonl` 的 12 条当晚原文（6 信号 × 中英）逐字段断言。**反向护栏**：`bare_uppercase_word_is_not_a_ticker`（`TODAY - $195 …` 会被补成 `$TODAY`，靠 B 系列仍要求 calls/puts + 第二个喊价挡住）、`stopword_head_is_not_a_ticker`、`normalized_bare_ticker_still_needs_a_direction_word`（补 $ 不等于放宽方向词） |
+| 42 | 无日期兜底排在带日期的前面 = 静默降级（顺序即语义） | `test_overnight_0910.py::test_explicit_mmdd_after_calls_beats_the_no_date_fallback`（契约翻转：前身返回 9/11）、`::test_next_week_is_a_week_past_this_friday`（同类，另一个入口）。**反向不变量**：`::test_no_date_still_falls_back_to_this_friday`（B3 前移不许把无日期那条带走）、`::test_bare_next_week_does_not_shift_the_expiry`（2 个形状，"持有到下周" 不是 "下周到期"）。语料 4 条 INTC/ARM 中英断 `expiry_date` |
+| 43 | 同一个事实有两个入口，你只接了一个（#22 的兄弟命题） | 抽取侧：`test_overnight_0910.py::test_declared_stop_in_the_open_message_is_recorded`、`::test_an_open_message_without_a_stop_records_nothing`（反向：不许凭空造）。**消费端**（缺了它抽取就是空转）：`::test_a_swing_with_a_declared_stop_enters_the_watch_list`。**反向不变量**：`::test_a_swing_without_a_declared_stop_is_still_not_watched`（-99.8% 也不许动 —— 本条改的不是"给 swing 加止损"）|
+| 44 | 三道闸门防的是同一种失败：整个查询坏掉。防不住"一次良好响应里少了一行" | `test_overnight_0911.py::test_last_nights_amzn_is_not_closed_by_one_reading`（契约翻转：当晚这个序列第一轮就落账）、`::test_split_by_confirmation_matrix`（纯函数）、`::test_auto_close_records_no_fill_price`（NULL 不是 0）。**反向不变量**：`::test_two_consecutive_db_only_still_closes`（缺了它闸门 4 等于把 0018 整个关掉，8/13 夜 1918 次拒单的止血就没了）、`::test_a_vetoed_round_is_not_evidence`（坏读数 + 好读数不许凑满两轮）。既有契约同批更新：`test_0016_reconciler.py::test_auto_close_writes_db_and_drops_position_from_watchers`、`::test_auto_close_breaks_signature_throttle` 现在都跑两轮 |
+| 45 | "会重试"是对调用方控制流的断言，而被调用方不拥有它 | `test_overnight_0911.py::test_deferred_says_a_caller_close_will_not_be_retried`（契约翻转：当晚结尾是 "will retry."）。**不变量**：`::test_deferred_is_still_transient_not_deterministic`（改措辞不许把 deferred 推进确定性组 —— 那是 9/2 TSLA -$166 要避免的熔断）|
+| 46 | "不阻塞启动"写在注释里不等于有机制；启动路径上的挂起按最高价计费 | `test_overnight_0911.py::test_a_hung_quote_probe_no_longer_blocks_startup`（断的是**耗时**不是返回值 —— 坏掉的是"等多久"）、`::test_a_fast_probe_is_passed_through_untouched`（正常路径逐字不变）|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |

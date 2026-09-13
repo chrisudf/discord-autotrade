@@ -1,14 +1,19 @@
 # 夜间自动运行 + 早间复盘
 
 launchd 用本机时区。作者机器是 Australia/Brisbane（UTC+10，无夏令时），
-23:15 → 07:00 正好盖住完整美股时段（US 9:30–16:00 ET = Brisbane 23:30–06:00）。
+23:11 → 07:00 正好盖住完整美股时段（US 9:30–16:00 ET = Brisbane 23:30–06:00）。
 换到别的时区要重新想这两个点位，改 `install.sh` 里 `emit_plist` 的时分参数。
+
+夜间有 **4 个触发点**（23:11 / 23:15 / 23:20 / 23:25）—— 这是 lesson #28 的唤醒
+窗口冗余，不是重复配置，别删。真正的去重靠两道 `pgrep` 守卫：`launch_in_terminal.sh`
+里那道（env `SKIP_IF_RUNNING`，命中就连 Terminal 窗口都不开）和 `night_run.sh`
+里那道（手动启动不经过垫片，仍然需要它）。
 
 ## 每天发生什么
 
 | 时间 | 谁 | 做什么 |
 |---|---|---|
-| 23:15 | launchd → `night_run.sh` | 开新 Terminal 窗口跑 `caffeinate -i make run`，输出 tee 到 `logs/session_YYYY-MM-DD.log` |
+| 23:11 | launchd → `night_run.sh` | 开新 Terminal 窗口跑 `caffeinate -i make run`，输出 tee 到 `logs/session_YYYY-MM-DD.log` |
 | 07:00 | launchd → `morning_collect.sh` | SIGTERM 停 listener → 整晚日志存到桌面 → 从 `trades.db` 抽摘要 |
 
 **早上只取证，不自动复盘**（2026-08-17 起）：`morning_collect.sh` 全是纯 shell，

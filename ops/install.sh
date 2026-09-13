@@ -46,8 +46,17 @@ chmod +x "$APPSUP/launch_in_terminal.sh"
 # Terminal 里跑，那边是登录 shell 的完整环境。
 LAUNCHD_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
+# [9/10] 本函数以前只吃一个 hour/minute，而线上 night.plist 早在 8/29 就被手改成
+# 4 个触发点了（lesson #28 的唤醒窗口冗余）。也就是说：**重跑一次 install.sh 会把
+# 那 3 个兜底触发点静默抹掉**，而且抹掉之后一切看起来都正常，直到某晚 Mac 在 23:15
+# 恰好没醒。现在触发点改成可变参列表，线上什么样这里就写什么样，漂移消失。
 emit_plist() {
-  local label=$1 script=$2 hour=$3 minute=$4 short=${1##*.}
+  local label=$1 script=$2 extra_env=$3 short=${1##*.}
+  shift 3
+  local intervals="" t
+  for t in "$@"; do
+    intervals+="		<dict><key>Hour</key><integer>$((10#${t%%:*}))</integer><key>Minute</key><integer>$((10#${t##*:}))</integer></dict>\n"
+  done
   cat > "$LA_DIR/$label.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -64,12 +73,8 @@ emit_plist() {
 	</array>
 
 	<key>StartCalendarInterval</key>
-	<dict>
-		<key>Hour</key>
-		<integer>$hour</integer>
-		<key>Minute</key>
-		<integer>$minute</integer>
-	</dict>
+	<array>
+$(printf "$intervals")	</array>
 
 	<key>RunAtLoad</key>
 	<false/>
@@ -78,7 +83,7 @@ emit_plist() {
 	<dict>
 		<key>PATH</key>
 		<string>$LAUNCHD_PATH</string>
-	</dict>
+$extra_env	</dict>
 
 	<!-- 注意：日志路径也必须在非 TCC 保护目录，否则 launchd 写不进去 -->
 	<key>StandardOutPath</key>
@@ -92,11 +97,15 @@ EOF
   unload "$label"
   launchctl bootstrap "$GUI" "$LA_DIR/$label.plist"
   launchctl enable "$GUI/$label"
-  echo "已安装 $label  →  每天 $(printf '%02d:%02d' "$hour" "$minute")  ops/$script"
+  echo "已安装 $label  →  每天 $*  ops/$script"
 }
 
-emit_plist "$NIGHT_LABEL"   night_run.sh      23 15
-emit_plist "$MORNING_LABEL" morning_collect.sh  7  0
+# 守卫前移到垫片：4 个触发点里只有第一个真开窗口，其余 3 个 pgrep 命中就直接退出
+# （见 launch_in_terminal.sh 的注释）。模式与 night_run.sh 里那道守卫必须逐字一致。
+NIGHT_ENV=$'\t\t<key>SKIP_IF_RUNNING</key>\n\t\t<string>bin/python -m autotrade\\.app\\.main</string>\n'
+
+emit_plist "$NIGHT_LABEL"   night_run.sh       "$NIGHT_ENV" 23:11 23:15 23:20 23:25
+emit_plist "$MORNING_LABEL" morning_collect.sh ""            7:00
 
 cat <<TIP
 

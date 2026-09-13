@@ -5,6 +5,7 @@
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from loguru import logger
@@ -19,6 +20,7 @@ from autotrade.broker.quote import (
 from autotrade.broker.trade import probe_broker
 from autotrade.config.channel_loader import registry
 from autotrade.risk import get_daily_stats
+from autotrade.utils.envcfg import env_int
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -61,6 +63,32 @@ def build_identity() -> str:
         parts.append(f"({when})")
     parts.append(f"工作区{dirty}")
     return " ".join(parts)
+
+
+def _probe_quote_with_timeout(timeout_sec: int) -> tuple[str, str]:
+    """跑 probe_quote_access，超时就放弃并让启动继续。
+
+    用裸 daemon 线程而不是 ThreadPoolExecutor：executor 的 __exit__ 会
+    shutdown(wait=True) 去 join 那个挂住的 worker，超时就白设了；而
+    concurrent.futures 的 worker 线程是非 daemon，进程退出时还会再 join 一次。
+    daemon 线程两头都不拦 —— SDK 自己会超时收场（9/10 夜是 16m45s 后
+    以 KeepAliveFail 结束）。
+
+    探测失败/超时都不改变启动结果：调用方只 log，不 sys.exit。
+    """
+    result: list = []
+    t = threading.Thread(
+        target=lambda: result.append(probe_quote_access()),
+        name="quote-probe", daemon=True,
+    )
+    t.start()
+    t.join(timeout=timeout_sec)
+    if result:
+        return result[0]
+    return QUOTE_ERROR, (
+        f"探测超过 {timeout_sec}s 未返回，按未知处理并继续启动"
+        "（OPRA 是否可用以盘中 watcher 实际取价为准）"
+    )
 
 
 def preflight() -> str:
@@ -146,8 +174,19 @@ def preflight() -> str:
 
     # 期权行情订阅探测：决定 SL/TP/EOD watcher 真盘是否真能工作
     # 不阻塞启动，只 log；运营自己决定是否升级订阅
+    #
+    # [9/10 实锤] "不阻塞启动"过去只是注释，没有任何东西在兑现它：
+    # probe_quote_access 是同步 SDK 调用，那一晚它挂了 **16 分 45 秒**
+    # （23:11:13 → 23:27:59），最后以 OpenD `KeepAliveFail` 收场。这段时间
+    # watcher 没起、Discord 没登录 —— 而它吃掉的恰好是开盘前唯一不可压缩的
+    # 那段时间（当晚紧接着又睡了 19 分钟，两段加起来横跨 09:30 ET 开盘，
+    # 首单落在开盘后 18 分钟）。
+    # 探测本身只是"看看行情拿不拿得到"，拿不到也应该把启动走完。丢进线程
+    # 加超时：超时就按 QUOTE_ERROR 记一条，继续启动。挂住的那个线程是
+    # daemon，SDK 自己会超时退出，不拦进程。
     logger.info("🔍 OPRA 行情订阅探测...")
-    quote_status, quote_msg = probe_quote_access()
+    quote_status, quote_msg = _probe_quote_with_timeout(
+        env_int("PREFLIGHT_QUOTE_TIMEOUT_SEC", 45, minimum=1))
     if quote_status == QUOTE_OK:
         logger.info(f"  ✅ {quote_msg}")
     elif quote_status == QUOTE_DELAYED:

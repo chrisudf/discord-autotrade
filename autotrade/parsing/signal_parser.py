@@ -207,6 +207,64 @@ CHINESE_MARKERS = ["美股会员网rich", "美股会员网机器人"]
 # 上限 8 个纯属够用即可；enrich 实测最多五个。
 _STRIKE_SIDE_GAP = r"(?:[a-z0-9]+\*{0,8}\s+){0,3}?"
 
+# [9/10 实锤丢单] ashley 频道上线第一晚，9 条 :RedAlert: 开仓信号 100% 全丢：
+# "SKHY - $195 CALLS EXPIRATION THIS WEEK $2.90" —— ticker **裸写不带 $**，而
+# B 系列六个变体（B0/B0.5/B1/B1b/B2/B3）的第一个 token 一律是 `\$([A-Z]{1,5})\b`。
+# 能吃裸 ticker 的 A/C 要求 strike 紧贴单字符 c/p（"195c"），D 要求 NDTE ——
+# ashley 的三种形状一个都不沾。这不是词表漂移，是一个从没被覆盖过的新形状。
+#
+# **没有**去松那六条正则的 `\$`：去掉之后 `[A-Z]{1,5}` 在 IGNORECASE 下会开始吃
+# 普通英文单词（A 系列 7/8 "taking AAPL again but 300p" 里的 "but" 被当成 ticker
+# 就是这个坑），要在六个 finditer 循环里各补一遍 isupper()+停用词，改面大得多。
+# 改成入口做一次归一化，与 ZH 方向词、倒序喊价同一套路子：只把**开头**那个裸
+# ticker 补上 $，后面所有 pattern / 护栏 / 到期日逻辑逐字复用。
+#
+# 形状卡死（9/9 那批 9 条全部符合）：消息开头 → 可选 :RedAlert: 这类 emoji 短码
+# → 全大写 1-5 位 ticker → 可选破折号 → `$数字`。**右邻必须是 `$数字`** 是最硬的
+# 一道护栏：普通英文句子开头的大写词后面不会紧跟一个 $行权价。停用词表兜第二道。
+_BARE_TICKER_STOPWORDS = {
+    "SL", "PT", "TP", "BE", "ITM", "OTM", "DTE", "BUY", "SELL", "OUT",
+    "ADD", "RISK", "EOD", "AM", "PM", "ET", "NEW", "ALL", "UP", "DOWN",
+}
+_BARE_TICKER_RE = re.compile(
+    r"^(\s*(?::[A-Za-z0-9_]+:\s*)*)"   # 可选 emoji 短码前缀（:RedAlert: 等）
+    r"([A-Z]{1,5})\b"                   # 裸 ticker —— 不给 IGNORECASE，原文必须全大写
+    r"(?=\s*[-\u2013\u2014]?\s*\$\d)"   # 右邻：可选破折号（含中文全角）+ $数字
+)
+
+
+def _normalize_bare_ticker(text: str) -> str:
+    """把开头的裸 ticker 补成 `$TICKER`（规范序）。不命中原样返回。"""
+    m = _BARE_TICKER_RE.match(text)
+    if not m or m.group(2) in _BARE_TICKER_STOPWORDS:
+        return text
+    return f"{m.group(1)}${m.group(2)}{text[m.end():]}"
+
+
+# [9/10] "EXPIRATION NEXT WEEK" 全仓库零逻辑（改这一批之前 grep 只有两处注释）。
+# 后果不是丢单而是**静默买错合约**：ARM "$300 CALLS EXPIRATION NEXT WEEK $4.90"
+# 落到 B2 的"无日期 → 本周五"分支，9/9 那天会买成 9/11 而不是 9/18，日志和 TG
+# 都不会提一个字。这比丢单危险 —— 丢单至少有 Parse failed 告警。
+#
+# 要求 next/this week 紧跟在到期词后面，不认裸的 "next week"：后者在行情评论里
+# 太常见（"我明天也会关注 $PLTR 下行"那条同夜就出现过 "next week" 语境），
+# 裸词会把"持有到下周"的评论也当成到期日声明。ZH 侧只认完整的"下周到期"。
+_NEXT_WEEK_RE = re.compile(
+    r"(?:expiration|expiring|expires|exp\.?)\s+next\s+week"
+    r"|\u4e0b\s*(?:\u4e2a)?\s*\u5468\s*\u5230\u671f",
+    re.IGNORECASE,
+)
+
+
+def _weekly_expiry(text: str, today: date) -> "tuple[date, str]":
+    """B2 无日期分支的到期日：默认本周五，"下周到期" 则再推一周。"""
+    if _NEXT_WEEK_RE.search(text):
+        return _adjust_expiry(
+            _next_friday(today) + timedelta(days=7), context="B2 next week"
+        ), "next-week"
+    return _adjust_expiry(_next_friday(today), context="B2 weekly"), "weekly"
+
+
 _INVERTED_PRICE_STRIKE_RE = re.compile(
     r"\$(\.\d+|\d+\.\d+)"                             # $PRICE（必须带小数点）
     r"[\s\-–—]+"                                      # 空白 / 字段分隔破折号（含中文全角）
@@ -302,6 +360,11 @@ def parse_signal(text: str, msg_ts: date = None):
     # 指纹 dedup 自然吸收。只认完整词"看涨期权/看跌期权"——裸"看涨/看跌"
     # 在行情评论里太常见（"我看涨大盘"），不碰。
     text = text.replace("看涨期权", " calls ").replace("看跌期权", " puts ")
+
+    # 裸 ticker → $TICKER（见 _BARE_TICKER_RE）。必须在 ZH 方向词归一化**之后**：
+    # ZH 版 ":RedAlert: SKHY - $195 看涨期权本周到期 $2.90" 要先变出 calls，
+    # 才能和 EN 孪生走同一条 B 阶梯（否则又是"只修了一侧"，见 lesson #21/#24）。
+    text = _normalize_bare_ticker(text)
 
     # 语序归一化：喊价前置 → 规范序（见 _INVERTED_PRICE_STRIKE_RE）。
     # 必须在 ZH 方向词归一化之后——ZH 版 "$.70 $98 看涨期权" 要先变出 "calls"
@@ -546,12 +609,13 @@ def _b_match(pattern, text: str, price_group: int):
 def _try_pattern_b(text: str, today: date):
     """Pattern B: 多种 $SYMBOL 形态。
 
-    优先级：
+    优先级（顺序即语义：**带日期的一律排在无日期兜底前面**）：
     B0:    含明确 MM/DD（最准确）
     B0.5:  含英文月份 (June 26 / Jan 15)
     B1:    含 NDTE
-    B2:    weekly 无日期 → 默认本周五
-    B3:    $STRIKE 在 calls 前的倒序写法
+    B1b:   $STRIKE calls 在前、NDTE 在后
+    B3:    MM/DD 写在 calls/puts 后面
+    B2:    无日期兜底 → 本周五（"下周到期" 则再推一周，见 _weekly_expiry）
 
     全系列的喊价段用 _B_PRICE_GAP（可跨行）并经 _b_match 过限定价护栏，
     见该常量注释里的 8/5 RKLB 实锤。
@@ -673,31 +737,11 @@ def _try_pattern_b(text: str, today: date):
             "tags": _extract_tags(text),
         }
 
-    # ----- B2: $SYMBOL [weekly] $STRIKE calls/puts $PRICE （无日期） -----
-    p_weekly = re.compile(
-        r"\$([A-Z]{1,5})\b"
-        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*" + _STRIKE_SIDE_GAP + r"(calls?|puts?)"
-        + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
-        re.IGNORECASE,
-    )
-    m = _b_match(p_weekly, text, 4)
-    if m:
-        symbol, strike, side, price = m.groups()
-        return {
-            "raw": text,
-            "matched": m.group(0).strip(),
-            "symbol": symbol.upper(),
-            "side": "CALL" if side.lower().startswith("call") else "PUT",
-            "strike": float(strike),
-            "expiry": "weekly",
-            "expiry_date": _adjust_expiry(
-                _next_friday(today), context="B2 weekly"
-            ),
-            "price": float(price),
-            "tags": _extract_tags(text),
-        }
-
     # ----- B3: $SYMBOL $STRIKE weekly calls MM/DD $PRICE -----
+    # [9/10] **必须排在 B2 前面**。B2 不要求日期，谁在前谁赢：ashley 的
+    # "$INTC - $110 CALLS 10/2 $4.70" 里 MM/DD 写在 calls **后面**（B0 要求它在
+    # $STRIKE 前面，够不着），本该由 B3 接住，却被 B2 抢走 → expiry 悄悄退成本周五。
+    # 与 B0.5 注释里记的失效模式是同一个坑的另一个入口，两处都会**静默买错到期日**。
     p_alt = re.compile(
         r"\$([A-Z]{1,5})\b"
         r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*"
@@ -722,6 +766,29 @@ def _try_pattern_b(text: str, today: date):
             "price": float(price),
             "tags": _extract_tags(text),
         }
+    # ----- B2: $SYMBOL [weekly] $STRIKE calls/puts $PRICE （无日期） -----
+    p_weekly = re.compile(
+        r"\$([A-Z]{1,5})\b"
+        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*" + _STRIKE_SIDE_GAP + r"(calls?|puts?)"
+        + _B_PRICE_GAP + r"\$(\.?\d+(?:\.\d+)?)",
+        re.IGNORECASE,
+    )
+    m = _b_match(p_weekly, text, 4)
+    if m:
+        symbol, strike, side, price = m.groups()
+        expiry_date, expiry_str = _weekly_expiry(text, today)
+        return {
+            "raw": text,
+            "matched": m.group(0).strip(),
+            "symbol": symbol.upper(),
+            "side": "CALL" if side.lower().startswith("call") else "PUT",
+            "strike": float(strike),
+            "expiry": expiry_str,
+            "expiry_date": expiry_date,
+            "price": float(price),
+            "tags": _extract_tags(text),
+        }
+
 
     return None
 

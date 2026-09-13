@@ -38,15 +38,51 @@ from autotrade.notify.messages import (
     format_signal_alert,
 )
 from autotrade.notify.transport import _safe_notify, notify_bg
+from autotrade.parsing.close_parser import STOP_AT_BREAKEVEN, parse_stop_adjust
 from autotrade.parsing.signal_parser import parse_signal
 from autotrade.policy.guards import _suspicious_long_dte
 from autotrade.policy.pricing import breakeven_exit_price, calc_limit_price
 from autotrade.position import fill_checker
 from autotrade.position import manager as position_mgr
 from autotrade.risk import check_order, record_order
+from autotrade.storage import positions_db
 from autotrade.storage.logger_db import log_order
 from autotrade.utils.envcfg import env_float
 from autotrade.utils.logger import logger
+
+def _apply_declared_stop(raw: str, option_code: str, entry: float) -> None:
+    """开仓喊话里**自带**的止损价 → positions.manual_stop。任何情况下都不抛。
+
+    [9/10 实锤] ashley 的 :RedAlert: 模板把止损写在开仓那一条消息里
+    （"INTC - $110 CALLS 10/2 $4.70, STOP LOSS AT $4.20"，9/9 夜 9 条里 3 条
+    这样写）。lesson #38 落的 manual_stop 只有 close_flow 一个写入口，读的是
+    **后续那条独立的**止损喊话 —— 开仓自带的这一路从来没人读。于是喊单员明说
+    了 $4.20，系统一个字都没接住，是 #38 那句话在开仓侧的原样重演。
+
+    更糟的是这类合约按 DTE 常常归 swing（10/2 = DTE 23 → apply_sl=False），
+    连 SL watcher 都不进 —— 所以本函数必须和 sl_watcher 的看护名单分支一起改，
+    只落库不看护等于没改（lesson #22 的形状）。
+
+    只落库不下单：抬底仍在 sl_watcher，与棘轮同一条"只取更高者、永不放松"。
+    保本档锚在**我们自己**的成交均价上（同 close_flow._apply_stop_adjust）。
+    """
+    try:
+        adj = parse_stop_adjust(raw)
+        if not adj or not option_code:
+            return
+        stop = adj["stop"]
+        target = entry if stop == STOP_AT_BREAKEVEN else float(stop)
+        if target <= 0:
+            return
+        if positions_db.set_manual_stop(option_code, target):
+            logger.info(
+                f"[OPEN] 开仓喊话自带止损已记录 {option_code}: "
+                f"{'保本' if stop == STOP_AT_BREAKEVEN else stop} → {target:.2f} "
+                f"(entry={entry:.2f}, lang={adj['lang']})"
+            )
+    except Exception:
+        logger.exception("[OPEN] _apply_declared_stop failed（不影响开仓主链路）")
+
 
 # OPEN 链路串行锁：check_order → place_order → record_order 必须原子，
 # 否则两条几乎同时到达的信号都会用"旧配额"通过风控（见 handle_message 内注释）
@@ -336,6 +372,14 @@ async def process_open(message, raw, cfg, cid, t0, msg_date_et):
         )
     except Exception as e:
         logger.error(f"position_mgr.on_order_filled failed: {e}")
+
+    # 开仓喊话自带的止损（必须排在 on_order_filled 之后：set_manual_stop 更新的是
+    # 已存在的那一行）。见 _apply_declared_stop。
+    _apply_declared_stop(
+        raw,
+        order_result.get("code") or "",
+        order_result.get("price", signal.get("price", 0)) or 0.0,
+    )
 
     # ---- 成交确认（fire-and-forget）----
     # broker success 只是"已提交"；确认成交后回填真实 avg_entry，

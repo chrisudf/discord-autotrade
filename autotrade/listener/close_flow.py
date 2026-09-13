@@ -33,7 +33,7 @@ from autotrade.parsing.close_parser import (
     parse_stop_adjust,
     parse_symbolless_close,
 )
-from autotrade.policy.positions import strategy_b_decision
+from autotrade.policy.positions import last_spare_trim_decision, strategy_b_decision
 from autotrade.utils.envcfg import env_float, env_int
 from autotrade.utils.timeutil import ET_TZ, today_et
 from autotrade.policy.pricing import calc_sell_limit
@@ -309,6 +309,10 @@ async def handle_close_signal(
     # 循环外合并 TG 时附在对应仓位后面。默认关时恒为空 dict → 文案分支
     # 走老路，与今天逐字一致。
     strategy_b_reasons: dict[str, str] = {}
+    # [9/10] 最后一张备用合约被浮盈闸门拦下的原因（label → reason）。
+    # 与 strategy_b_reasons 分开：两者文案不同（"各剩 1 张" vs "还剩 N 张"），
+    # 合在一起就会像 RUNNER_PRESERVED 那样把话说错（见 lesson #13 的如实上报）。
+    spare_reasons: dict[str, str] = {}
 
     hint_strike = parsed.get("hint_strike")
     hint_side = parsed.get("hint_side")
@@ -424,6 +428,7 @@ async def handle_close_signal(
             # quote-fallback 决策留在本模块（_kc_sell 的 plan 闭包，锁内执行）。
             outcome, _ = await _kc_sell(
                 pos, pos_label, pct, parsed, raw, msg_id, strategy_b_reasons,
+                spare_reasons,
             )
             outcomes.append((outcome, pos_label))
 
@@ -471,6 +476,32 @@ async def handle_close_signal(
                 f"(window 内已提醒过): {runner_preserved} pct={pct}"
             )
 
+    # [9/10] 最后一张备用合约被浮盈闸门拦下 —— 自己一条文案，**不复用**上面那条。
+    # 上面写死了"各剩 1 张"，而这里的仓位还剩 ≥2 张，混用就是把话说错
+    # （lesson #13：runner-preserve 的上层报告口径必须如实）。节流复用同一个
+    # 窗口函数：拦的是同一个仓位、同一夜连环 trim，刷屏形状一模一样。
+    spare_preserved = [
+        label for o, label in outcomes if o is Outcome.SPARE_PRESERVED
+    ]
+    if spare_preserved:
+        fresh_spare = [p for p in spare_preserved if runner_preserve_should_alert(p)]
+        if fresh_spare:
+            detail = "、".join(
+                f"{p}（{spare_reasons[p]}）" if p in spare_reasons else p
+                for p in fresh_spare
+            )
+            await _safe_notify(format_close_skipped(
+                f"last-spare 保留：{detail}，跳过 {pct}% trim"
+                f"（减完只剩 1 张且浮盈未达阈值，留住备用合约给 TP 阶梯；"
+                f"窗口期内不重复提醒）",
+                raw,
+            ))
+        else:
+            logger.info(
+                f"[CLOSE] last-spare TG throttled "
+                f"(window 内已提醒过): {spare_preserved} pct={pct}"
+            )
+
     if any_broker_failure and not any_success:
         # 指纹已在 _is_duplicate_close 查重时登记（原子，堵双发竞态）。
         # 零成交且出现过 broker 失败（异常/拒单）→ 回滚指纹，
@@ -489,6 +520,7 @@ async def handle_close_signal(
 async def _kc_sell(
     pos: dict, pos_label: str, pct: int, parsed: dict, raw: str,
     msg_id: int, strategy_b_reasons: dict[str, str],
+    spare_reasons: dict[str, str],
 ) -> "tuple[Outcome, dict | None]":
     """单仓位 KC close 卖出（sell_executor 骨架 + KC 专属 plan/钩子）。
 
@@ -563,6 +595,29 @@ async def _kc_sell(
                     return SkipSell(Outcome.RUNNER_PRESERVED)
             else:
                 return SkipSell(Outcome.RUNNER_PRESERVED)
+        # [9/10] 最后一张备用合约的浮盈闸门。**默认关**：阈值 <=0 时整段跳过，
+        # 连报价都不取，行为与本次改动之前逐字一致。
+        #
+        # 拦的是"再减一次就只剩 1 张"这一步 —— 9/9 夜 TSLA/DELL 的账就是在这
+        # 一步算出来的（喊单员在 +6.3% / +12.8% 各拿走一张，剩下的单张 runner
+        # 让 T1/T2 两档全部空转，最后按棘轮底出在 +50%）。已有的 strategy_b
+        # 闸门开在 remaining==1，那时子弹已经打光了。见 last_spare_trim_decision。
+        if qty_to_sell > 0 and fresh["qty_remaining"] - qty_to_sell == 1:
+            spare_min_pnl = env_float("LAST_SPARE_TRIM_MIN_PNL_PCT", 0.0, minimum=0.0)
+            if spare_min_pnl > 0:
+                stratb_quote_ref = await asyncio.to_thread(get_sell_ref_price, code)
+                decision, reason = last_spare_trim_decision(
+                    fresh["avg_entry_price"], stratb_quote_ref,
+                    parsed.get("signal_pnl_pct"), spare_min_pnl,
+                )
+                if decision == "PRESERVE":
+                    logger.info(
+                        f"[CLOSE] last-spare PRESERVE: {code} "
+                        f"qty_remaining={fresh['qty_remaining']}（{reason}）"
+                    )
+                    spare_reasons[pos_label] = reason
+                    return SkipSell(Outcome.SPARE_PRESERVED)
+                logger.info(f"[CLOSE] last-spare TRIM: {code}（{reason}）")
         limit = calc_sell_limit(
             fresh["avg_entry_price"], parsed.get("signal_price"),
         )
