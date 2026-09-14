@@ -49,7 +49,7 @@ def _trading_now_et():
 @pytest.mark.asyncio
 async def test_eod_no_quote_retries_every_tick_but_tg_throttled():
     """no-quote 不再吃掉整个强平窗口:连续 tick 每次都重新取价,
-    TG 只发一次(30min 节流)。报价恢复后第三 tick 卖出成功。"""
+    报价恢复后第三 tick 卖出成功。TG 的节流口径见下方 9/14 那段注释。"""
     now_et = _trading_now_et()
     today_et = now_et.date()
     code = "US.EODRT260724C100000"
@@ -61,6 +61,7 @@ async def test_eod_no_quote_retries_every_tick_but_tg_throttled():
     )
     eod_watcher._skip_until.pop(code, None)
     eod_watcher._alerted_until.pop(code, None)
+    eod_watcher._expiry_alert_stage.clear()
 
     quotes = [None, None, 0.50]  # 前两 tick 无报价,第三 tick 恢复
     def fake_quote(_code):
@@ -79,16 +80,24 @@ async def test_eod_no_quote_retries_every_tick_but_tg_throttled():
 
     assert q.call_count == 3          # 每 tick 都重试(老代码 tick2/3 直接被 backoff 跳过)
     sell.assert_called_once()         # 报价恢复当刻立即强平
-    # 本仓位 expiry == today(0dte) → **到期日不节流**,两个 no-quote tick 各喊一次。
-    # [8/22 AMD 520C -$540] 到期日的强平窗口一天只有一次机会,30min 节流意味着
-    # 整个窗口只喊一声,而那声发在本地凌晨。非到期日的节流见下一条用例。
+
+    # [9/14 契约翻转] 本用例前身断言 **2** 条（到期日每个 no-quote tick 各喊一次）。
+    # 那条规则来自 8/22 AMD 520C -$540：到期日的强平窗口一天只有一次机会，
+    # 30min 节流等于整个窗口只喊一声，而那声发在本地凌晨。
+    # 每 tick 喊解决了"喊得太晚"，代价是喊得太多 —— 9/12 周五 80 条、9/5 90 条，
+    # 而 9/5 那 90 条一条都没送出去。现在改成"首次 + 收盘前最后一次"：
+    # 两条都在窗口内，第二条正好压在 deadline 前，两个方向都不吃亏。
+    # 这里 now_et=15:51，离 final-call(15:57) 还早，所以只该有第一条。
+    # final 那条的覆盖见 test_overnight_0914.py::test_final_call_fires_before_the_bell。
     noquote_calls = [c for c in tg.await_args_list if "无报价" in str(c)]
-    assert len(noquote_calls) == 2
-    assert all("到期日" in str(c) for c in noquote_calls)
+    assert len(noquote_calls) == 1
+    assert "到期日" in str(noquote_calls[0])
+    # **不变量**：重试频率一个字没动（上面 q.call_count == 3），改的只是 TG。
 
     assert positions_db.get(code)["status"] == "CLOSED"
     eod_watcher._skip_until.pop(code, None)
     eod_watcher._alerted_until.pop(code, None)
+    eod_watcher._expiry_alert_stage.clear()
 
 
 # ============================================================

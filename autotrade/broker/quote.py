@@ -255,6 +255,62 @@ def get_sell_ref_price(option_code: str) -> "float | None":
     return None
 
 
+def describe_quote(option_code: str) -> dict:
+    """诊断：这个 code 为什么取不到价。只读，不改任何状态，不参与交易决策。
+
+    [9/14] 存在的理由是一个反复出现的空白：8/22 AMD、9/5 三张、9/12 LITE/HOOD
+    每次复盘到"EOD 无报价"都只能靠推理 —— 日志里那行
+    `[eod] no quote for {code}` **什么都没记**：snapshot 到底返回了什么、
+    有没有这一行、bid 是多少、last 是多少、报价多久没更新了，一个都没有。
+    于是"换成 bid 兜底能不能救回来"这个问题，问了三次都没法用数据回答。
+
+    最关键的一个区分（也是发给人的告警该说什么的依据）：
+      - ret != RET_OK        → **行情通路**的问题（9/5 那晚 107 次连接错误，
+                               全盘 0 次成功强平）。换字段没用，要去看 OpenD。
+      - ret == RET_OK 但无可用字段 → **这张合约**没有市场（9/12 周五：同一 tick
+                               里 BE 拿到 0.64，LITE 拿不到）。大概率已归零。
+
+    Returns:
+        {"transport_ok": bool, "row": bool, "bid": float|None,
+         "last": float|None, "age_sec": float|None, "detail": str}
+    """
+    if _is_dry_run():
+        return {"transport_ok": True, "row": False, "bid": None, "last": None,
+                "age_sec": None, "detail": "DRY_RUN，未查真实行情"}
+    ret, df = _snapshot([option_code])
+    if ret != RET_OK:
+        return {"transport_ok": False, "row": False, "bid": None, "last": None,
+                "age_sec": None, "detail": f"snapshot 失败: {str(df)[:120]}"}
+    if df is None or not hasattr(df, "iterrows") or len(df) == 0:
+        return {"transport_ok": True, "row": False, "bid": None, "last": None,
+                "age_sec": None, "detail": "snapshot 正常但没有这个 code 的行"}
+
+    import pandas as pd  # 仅 SDK 路径需要，pandas 是 moomoo 必装依赖
+    now_ts = time.time()
+
+    def _num(v):
+        return None if (v is None or pd.isna(v)) else float(v)
+
+    for _, row in df.iterrows():
+        if row.get("code") != option_code:
+            continue
+        bid, last = _num(row.get("bid_price")), _num(row.get("last_price"))
+        age = None
+        try:
+            age = round(now_ts - _quote_epoch(row["update_time"]), 1)
+        except Exception:
+            pass
+        bits = [f"bid={bid}", f"last={last}", f"age={age}s"]
+        if age is not None and age > QUOTE_FRESHNESS_SEC:
+            bits.append(f"**超过 {QUOTE_FRESHNESS_SEC}s 新鲜度门**")
+        if (bid is None or bid <= 0) and (last is None or last <= 0):
+            bits.append("**买卖两侧都没有可用价 —— 这张合约没有市场**")
+        return {"transport_ok": True, "row": True, "bid": bid, "last": last,
+                "age_sec": age, "detail": " ".join(bits)}
+    return {"transport_ok": True, "row": False, "bid": None, "last": None,
+            "age_sec": None, "detail": "snapshot 有数据但不含该 code"}
+
+
 def _validate_one(code: str) -> bool:
     """单 code 校验。返回 True=可下单（含权限不足/瞬时失败时的"未知放行"），
     False=**确认**不存在。"""

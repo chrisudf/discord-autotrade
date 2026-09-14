@@ -72,6 +72,20 @@ def format_error(scope: str, error: str) -> str:
     )
 
 
+def format_eod_no_quote(title: str, body: str) -> str:
+    """EOD 无报价的汇总告知。**不套 format_error**，两个原因：
+
+    1. 它多数时候不是错误。"这几张合约没有买卖盘、大概率已归零、你不用做
+       任何事" 挂在 ❌ *系统错误* 底下，就是在训练人忽略这个通道（lesson #33）。
+       标题自己说清是哪一类（🔌 通路挂了 / ⚠️ 没有市场 / ⚠️ 待确认）。
+    2. format_error 截在 500 字符，而这条消息的价值恰好在**逐条探测结果**，
+       几张合约就会把它挤掉。这里放宽到 1200。
+    """
+    return (
+        f"{escape_md(title)}\n```\n{escape_md((body or '')[:1200])}\n```"
+    )
+
+
 def format_close_filled(symbol: str, strike: float, side: str, expiry: str,
                         qty_sold: int, fill_price: float, pct: int,
                         trigger: str, order_id: str) -> str:
