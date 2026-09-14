@@ -230,3 +230,31 @@ def test_unrealized_charges_only_the_remaining_sell_leg():
 def test_closed_positions_never_appear_in_mark_open():
     pos = {"US.DONE": _pos("US.DONE", 1.00, qty_rem=0)}
     assert pnl.mark_open(pos, {"US.DONE": 9.99}) == []
+
+
+# ============================================================
+# 取价路径：不许把"没查"伪装成"查了没有"
+# ============================================================
+
+def test_dry_run_says_so_instead_of_returning_empty_quotes(capsys, monkeypatch):
+    """[9/14 实锤] 第一版 fetch_marks 漏了 load_dotenv，于是 DRY_RUN 未设
+    → _is_dry_run() 默认 True → 取价走 mock 分支全返 None → 报表整整齐齐打出
+    四行"（无报价）"。
+
+    我当场把它解释成"新鲜度门挡掉了盘前陈旧报价"——听起来完全合理，而真相是
+    **根本没去查**（同一时刻直接 _snapshot 拿到的是 TSLA last=2.78 bid=2.75）。
+    "查了但没有"和"压根没查"输出一模一样，是这类脚本最坏的失败形态。
+    """
+    monkeypatch.setenv("DRY_RUN", "true")
+    assert pnl.fetch_marks(["US.X260918C380000"]) == {}
+    assert "DRY_RUN" in capsys.readouterr().err, "必须说出来，不能静默返回空"
+
+
+def test_stale_marks_carry_their_age():
+    """陈旧价必须带年龄：不标年龄的收盘价和实时价长得一模一样。"""
+    pos = {"US.T": _pos("US.T", 5.30, qty_rem=1, expiry="2026-09-18")}
+    rows = pnl.mark_open(pos, {"US.T": 2.75}, per_contract=0.95)
+    assert rows[0]["unrealized"] == -255.0
+    # 年龄由 fetch_marks_stale 单独回传，format_report 负责打出来；
+    # 这里钉的是 mark_open 不会因为价格陈旧就拒绝计算（那是看盘不是下单）
+    assert rows[0]["net"] == -255.95

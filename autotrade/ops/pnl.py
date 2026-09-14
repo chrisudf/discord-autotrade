@@ -229,12 +229,92 @@ def group_sum(legs: list, key: str) -> list:
     return sorted(rows, key=lambda r: r[key])
 
 
+def fetch_marks_stale(codes: list) -> dict:
+    """看盘用的取价：**绕过 60s 新鲜度门**，返回 {code: (price, age_sec)}。
+
+    为什么要有第二条路：QUOTE_FRESHNESS_SEC 那道门是保护**下单定价**的
+    （按几分钟前的 bid 挂单等于白送，见 get_sell_ref_price 的注释），
+    而"我这两张现在什么价"是**看盘**不是下单 —— 盘前/周末跑的时候，
+    上一个收盘价是完全有意义的信息，被门挡掉只会逼人去写临时脚本。
+
+    所以这条路只在报表里用，**永远不进任何下单路径**，且输出必须带上
+    报价年龄：一个不标年龄的陈旧价，和一个实时价长得一模一样。
+    bid 优先（卖出参照），无 bid 退 last —— 与 get_sell_ref_price 同序。
+    """
+    if not codes:
+        return {}
+    _load_env()
+    out = {}
+    try:
+        import time as _t
+        from autotrade.broker import quote as q
+        if q._is_dry_run():
+            print("（DRY_RUN 生效，不取真实报价）", file=sys.stderr)
+            return {}
+        # **一次批量**，不是逐个 describe_quote：后者是 N 次单 code snapshot，
+        # 4 个 code 就撞上了限频退避（实测挂住 >100s）。既有代码对 snapshot
+        # 配额很在意（见 get_sell_ref_price 的"不开第二条 snapshot 路径"），
+        # 这里同样只打一次。
+        ret, df = q._snapshot(list(codes))
+        if ret != q.RET_OK or df is None or not hasattr(df, "iterrows"):
+            print(f"（snapshot 失败: {str(df)[:120]}）", file=sys.stderr)
+            return {}
+        import pandas as pd
+        now = _t.time()
+        for _, row in df.iterrows():
+            code = row.get("code")
+            if code not in codes:
+                continue
+            def _n(v):
+                return None if (v is None or pd.isna(v)) else float(v)
+            bid, last = _n(row.get("bid_price")), _n(row.get("last_price"))
+            ref = bid if (bid and bid > 0) else last
+            if not ref or ref <= 0:
+                continue
+            age = None
+            try:
+                age = now - q._quote_epoch(row["update_time"])
+            except Exception:
+                pass
+            out[code] = (ref, age)
+    except Exception as e:
+        print(f"（取价失败: {type(e).__name__}: {e}）", file=sys.stderr)
+    return out
+
+
+def _load_env() -> None:
+    """取价前必须先加载 config/.env。
+
+    [9/14 实锤] 第一版漏了这一步，后果不是报错而是**静默说谎**：
+    quote._is_dry_run() 在 DRY_RUN 未设时默认 True（对下单是安全默认），
+    于是 get_last_prices 走 mock 分支、对每个 code 返回 None，报表整整齐齐
+    打出四行"（无报价）"。我当场把它解释成"新鲜度门挡掉了盘前陈旧报价"——
+    听起来完全合理，而真相是**根本没去查**。同一时刻直接调 _snapshot 拿到的是
+    TSLA last=2.78 bid=2.75、AVGO last=0.04 bid=0.02。
+    一个"查了但没有"和"压根没查"长得一模一样的输出，是这类脚本最坏的失败形态。
+    其它 ops 脚本（generate_report / reset_daily_limit / backtest_parser）
+    都在 main() 里 load_dotenv，这里对齐它们。
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).resolve().parents[2] / "config" / ".env",
+                    override=False)
+    except Exception:
+        pass      # 没装 dotenv / 没有 .env 都不该炸掉账本的只读部分
+
+
 def fetch_marks(codes: list) -> dict:
     """给未了结仓位取实时报价。**只在 --mark 时调用** —— 见口径 5。"""
     if not codes:
         return {}
+    _load_env()
     try:
-        from autotrade.broker.quote import get_last_prices
+        from autotrade.broker.quote import _is_dry_run, get_last_prices
+        if _is_dry_run():
+            # 不许把"没查"伪装成"查了没有"——见 _load_env 的注释
+            print("（DRY_RUN 生效，不取真实报价；未实现盈亏留空）",
+                  file=sys.stderr)
+            return {}
         return get_last_prices(codes)
     except Exception as e:      # OpenD 不在 / 无权限 / 收盘 —— 都不该炸掉账本
         print(f"（取价失败，未实现盈亏留空: {type(e).__name__}: {e}）",
@@ -259,7 +339,7 @@ def load(db_path=DB_PATH, since=None, until=None):
 
 
 def format_report(legs: list, positions: dict, show_legs=True,
-                  marks: "dict | None" = None) -> str:
+                  marks: "dict | None" = None, ages: "dict | None" = None) -> str:
     per = fee_per_contract()
     good = [l for l in legs if not l["fabricated"]]
     bad = [l for l in legs if l["fabricated"]]
@@ -304,8 +384,14 @@ def format_report(legs: list, positions: dict, show_legs=True,
                 mk = "     —        —        —   " + (
                     "（无报价）" if marks is not None else "")
             else:
+                age = (ages or {}).get(r["option_code"])
+                # 不标年龄的陈旧价和实时价长得一模一样 —— 必须标
+                age_s = ""
+                if age is not None and age > 60:
+                    age_s = (f"  ⏳{age/3600:.1f}h前" if age < 86400
+                             else f"  ⏳{age/86400:.1f}天前")
                 mk = (f"{r['mark']:>7.2f}{r['unrealized']:>+9.0f}"
-                      f"{r['net']:>+9.0f}")
+                      f"{r['net']:>+9.0f}{age_s}")
             out.append(f"  {r['option_code']:<24}{r['channel']:<15}"
                        f"{r['qty']:>2}张 @{r['entry']:>6.2f}  到期 {r['expiry']}"
                        f"  {mk}")
@@ -341,6 +427,21 @@ def format_report(legs: list, positions: dict, show_legs=True,
     return "\n".join(out)
 
 
+def _release_quote_ctx() -> None:
+    """取完价把 quote 链路关掉。
+
+    [9/14 实锤] 不关的后果不是报错：报表整整 66 行**全都打完了**，然后进程
+    挂在那儿退不出去（OpenQuoteContext 起了非 daemon 线程），最后被 timeout
+    以 exit=124 杀掉。放在 morning_collect 那种脚本里就是每天早上挂一个僵尸
+    进程 —— 而且因为输出是完整的，看起来完全正常。
+    """
+    try:
+        from autotrade.broker.quote import _reset_quote_ctx
+        _reset_quote_ctx()
+    except Exception:
+        pass
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="已实现 + 未实现盈亏账本")
     ap.add_argument("--since", help="ET 起始日 YYYY-MM-DD")
@@ -348,6 +449,9 @@ def main(argv=None):
     ap.add_argument("--et-date", help="只看这一个 ET 交易日")
     ap.add_argument("--mark", action="store_true",
                     help="给未了结仓位取实时报价，算未实现盈亏（需要 OpenD）")
+    ap.add_argument("--stale-ok", action="store_true",
+                    help="配合 --mark：绕过 60s 新鲜度门，用上次收盘价看盘"
+                         "（盘前/周末唯一能看到数字的方式，输出会标报价年龄）")
     ap.add_argument("--csv", help="逐腿账本写到 CSV")
     ap.add_argument("--no-legs", action="store_true", help="只看汇总")
     ap.add_argument("--db", default=str(DB_PATH))
@@ -355,10 +459,16 @@ def main(argv=None):
     since, until = (a.et_date, a.et_date) if a.et_date else (a.since, a.until)
 
     legs, positions = load(a.db, since, until)
-    marks = None
+    marks, ages = None, {}
     if a.mark:
-        marks = fetch_marks([c for c, p in positions.items()
-                             if (p.get("qty_remaining") or 0) > 0])
+        codes = [c for c, p in positions.items()
+                 if (p.get("qty_remaining") or 0) > 0]
+        if a.stale_ok:
+            raw = fetch_marks_stale(codes)
+            marks = {c: v[0] for c, v in raw.items()}
+            ages = {c: v[1] for c, v in raw.items()}
+        else:
+            marks = fetch_marks(codes)
     if a.csv and legs:
         with open(a.csv, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=list(legs[0].keys()))
@@ -368,7 +478,9 @@ def main(argv=None):
     if not legs:
         print("（该区间没有平仓腿）")
     print(format_report(legs, positions, show_legs=not a.no_legs and bool(legs),
-                        marks=marks))
+                        marks=marks, ages=ages))
+    if a.mark:
+        _release_quote_ctx()
     return 0
 
 
