@@ -153,3 +153,80 @@ def test_open_exposure_is_reported_separately_not_as_pnl():
     assert ex[0]["cost"] == 530.0
     # 没有任何卖出腿 → 已实现为 0，而不是把在途成本记成亏损
     assert pnl.exit_legs([], pos) == []
+
+
+# ============================================================
+# 佣金：按张按腿，过期只收一次
+# ============================================================
+
+def test_fee_is_per_contract_per_leg():
+    """买卖各一次。2 张普通平仓 = 4 腿次。"""
+    assert pnl.leg_fee(2, "CLOSE", 0.95) == 3.80
+    assert pnl.leg_fee(1, "TRIM", 0.95) == 1.90
+
+
+def test_expired_contracts_pay_only_the_entry_leg():
+    """**过期没有卖出腿，只收买入那一次。**
+
+    这条不是细节：一张最后卖在 $0.01 的合约，卖出腿的费用就和它的成交额
+    同一个量级（见 lesson #48）。把过期也收两次费会把"卖在 0.01 到底值不值"
+    这个结论算反。
+    """
+    assert pnl.leg_fee(1, "EXPIRE", 0.95) == 0.95
+    assert pnl.leg_fee(2, "EXPIRE", 0.95) == 1.90
+
+
+def test_net_subtracts_the_fee_from_gross():
+    pos = {"US.X": _pos("US.X", 3.20)}
+    legs = pnl.exit_legs(
+        [_evt("US.X", "CLOSE", -1, 4.80, "2026-09-09T15:22:42Z")],
+        pos, per_contract=0.95)
+    assert legs[0]["realized"] == 160.0
+    assert legs[0]["fee"] == 1.90 and legs[0]["net"] == 158.10
+
+
+def test_penny_fill_is_economically_a_wash_at_this_rate():
+    """便士单的账：2 张卖在 0.01 收回 $2，卖出腿费用 $1.90 → 净 +$0.10。
+
+    钉住它是因为这个结论**对费率极其敏感**：$0.95/张时勉强为正，
+    ≥$1.00/张就翻负。lesson #48 的论点（便士单在经济上无意义）两种情况
+    都成立，但"无意义"和"倒贴"是两句话，不许含糊。
+    """
+    per = 0.95
+    proceeds = 0.01 * 2 * pnl.CONTRACT_MULTIPLIER          # $2.00
+    sell_fee = 2 * per                                      # $1.90
+    assert round(proceeds - sell_fee, 2) == 0.10
+    # 费率抬到 1.00 就翻负 —— 所以报表必须把费率打在抬头上
+    assert round(proceeds - 2 * 1.00, 2) == 0.0
+    assert proceeds - 2 * 1.10 < 0
+
+
+# ============================================================
+# 未实现：取不到价就留空，绝不猜
+# ============================================================
+
+def test_mark_open_leaves_unpriced_positions_empty():
+    """取不到价**不猜**：一个编出来的浮盈比没有数字更糟。
+
+    与 CLOSE 无价拒卖同一哲学 —— 这四张在途仓里有三张是 swing 裸奔仓，
+    白天跑 --mark 时 OpenD 多半不在，全空是常态。
+    """
+    pos = {"US.A": _pos("US.A", 5.30, qty_rem=1, expiry="2026-09-18"),
+           "US.B": _pos("US.B", 1.36, qty_rem=1, expiry="2026-10-16")}
+    rows = pnl.mark_open(pos, {"US.A": 7.00}, per_contract=0.95)
+    by = {r["option_code"]: r for r in rows}
+    assert by["US.A"]["unrealized"] == 170.0
+    assert by["US.B"]["mark"] is None and by["US.B"]["unrealized"] is None
+
+
+def test_unrealized_charges_only_the_remaining_sell_leg():
+    """未实现盈亏的语义是"现在平掉能拿回多少" —— 买入那次费已经付过了。"""
+    pos = {"US.A": _pos("US.A", 5.30, qty_rem=2, expiry="2026-09-18")}
+    r = pnl.mark_open(pos, {"US.A": 7.00}, per_contract=0.95)[0]
+    assert r["unrealized"] == 340.0
+    assert r["net"] == 340.0 - 2 * 0.95      # 只扣卖出那一腿
+
+
+def test_closed_positions_never_appear_in_mark_open():
+    pos = {"US.DONE": _pos("US.DONE", 1.00, qty_rem=0)}
+    assert pnl.mark_open(pos, {"US.DONE": 9.99}) == []
