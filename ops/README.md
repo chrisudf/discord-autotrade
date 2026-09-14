@@ -5,9 +5,18 @@ launchd 用本机时区。作者机器是 Australia/Brisbane（UTC+10，无夏�
 换到别的时区要重新想这两个点位，改 `install.sh` 里 `emit_plist` 的时分参数。
 
 夜间有 **4 个触发点**（23:11 / 23:15 / 23:20 / 23:25）—— 这是 lesson #28 的唤醒
-窗口冗余，不是重复配置，别删。真正的去重靠两道 `pgrep` 守卫：`launch_in_terminal.sh`
-里那道（env `SKIP_IF_RUNNING`，命中就连 Terminal 窗口都不开）和 `night_run.sh`
-里那道（手动启动不经过垫片，仍然需要它）。
+窗口冗余，不是重复配置，别删。去重是**三层**，各管各的：
+
+| 层 | 位置 | 管什么 | 管不了什么 |
+|---|---|---|---|
+| 互斥锁 | `night_run.sh` 的 `logs/.night.lock`（`mkdir` 原子占坑 + PID + 陈旧锁清理）| **唯一可靠的一层**：同一秒并发也只有一个能进 | 不经过本脚本的手动 `make run` |
+| pgrep | `night_run.sh` | 手动启动过之后 launchd 又来一次 | 同一秒并发（进程还没起来，查不到）|
+| pgrep | `launch_in_terminal.sh`（env `SKIP_IF_RUNNING`）| 机器醒着时的重复触发，命中就连窗口都不开 | 同上 |
+
+**为什么锁是必须的**（9/11 实锤 -$338）：机器在四个触发点时都睡着，launchd 把
+错过的任务攒到唤醒后**同一秒**一起放，两道 pgrep 查的都是一个还没被拉起来的
+进程 —— 同一秒里谁都看不见谁，两个 listener 一起跑了一整晚，同一个信号下了两单。
+检查（pgrep）和占坑（mkdir）不是一回事，只有后者是原子的。见 lesson #47。
 
 ## 每天发生什么
 

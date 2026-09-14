@@ -1754,6 +1754,66 @@ the startup path first — that is where a hang is charged at the highest rate.
 
 ---
 
+## 47. Checking whether someone is there is not the same as taking the seat
+
+**Symptom**: two listeners ran the whole night of 9/11 — `ops.log` carries two
+`night_run: starting` lines with the identical timestamp `23:27:25`, and the
+morning stop reports `SIGTERM -> 30739 30740`. Deduplication of signals is
+per-process (`_seen`), so the two processes could not see each other's work:
+
+```
+23:37:49.220 | [broker] Order: US.BE260911C275000 x 2 @ 2.27
+23:37:49.220 | [broker] Order: US.BE260911C275000 x 2 @ 2.27   ← the other process
+23:37:50.050 | [positions] add-on: +2 → qty_rem=4
+```
+
+A 0DTE lotto bought at twice the intended size — four contracts instead of two,
+turning a -$338 loss into -$676. Three `Not enough positions` sell rejections
+followed, each landing immediately after the other process had sold the same
+contract.
+
+**Why non-obvious**: there were **two** guards against exactly this, and both had
+been reviewed and both are correct at what they check. One in `night_run.sh`
+(there since the beginning), one added in `launch_in_terminal.sh` on 9/10
+specifically to stop duplicate launches — the night before, it had demonstrably
+worked, collapsing four Terminal windows into one.
+
+Both call `pgrep -f 'bin/python -m autotrade.app.main'`. That question — *is the
+listener running?* — has a correct answer at every instant, and both guards got
+it right: at 23:27:25 the answer was genuinely **no**, for both of them, because
+neither had reached the line that starts Python yet. The guards were not stale or
+buggy. They were asking about a state that their own caller was about to create.
+
+What made it fire that night rather than any other was the wake burst. launchd
+defers missed `StartCalendarInterval` entries and releases them together on wake,
+so four triggers that are normally minutes apart arrived in the same second —
+and the redundancy from #28, which exists precisely for a sleeping Mac, is what
+supplied the concurrency. The guard had been tested against the sequential case
+and the case it was written for was the simultaneous one.
+
+launchd's own one-instance-per-label guarantee does not cover it either: the shim
+`exec open -a Terminal` and exits immediately, so launchd considers that run
+finished and releases the next; the process that matters is over in Terminal,
+outside its bookkeeping.
+
+**Defense**: `mkdir` on `logs/.night.lock` — atomic under POSIX, so success *is*
+the claim, with no window between deciding and owning. The PID goes inside; the
+trap covers `EXIT INT TERM HUP` (closing a Terminal window is a SIGHUP, and
+missing it leaves the lock behind). Staleness needs **two** conditions — the PID
+alive *and* its command line still naming `night_run` — because PIDs are reused
+across reboots and a false "someone holds it" means the listener never starts
+that night, silently, which is the more expensive direction. Both `pgrep` guards
+stay: they cover the manual `make run` that never touches the lock.
+
+**General form**: a check answers a question about now; a lock changes the world.
+Any guard of the form "look, then act" is only as good as the gap between the two,
+and concurrency you did not design is usually supplied by something that retries
+or defers on your behalf — a scheduler, a queue, a wake-up. When the redundancy
+that protects you also generates the concurrency that breaks you, the fix is never
+a better check.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -2277,6 +2337,7 @@ downside is priced in dollars.
 | 44 | 三道闸门防的是同一种失败：整个查询坏掉。防不住"一次良好响应里少了一行" | `test_overnight_0911.py::test_last_nights_amzn_is_not_closed_by_one_reading`（契约翻转：当晚这个序列第一轮就落账）、`::test_split_by_confirmation_matrix`（纯函数）、`::test_auto_close_records_no_fill_price`（NULL 不是 0）。**反向不变量**：`::test_two_consecutive_db_only_still_closes`（缺了它闸门 4 等于把 0018 整个关掉，8/13 夜 1918 次拒单的止血就没了）、`::test_a_vetoed_round_is_not_evidence`（坏读数 + 好读数不许凑满两轮）。既有契约同批更新：`test_0016_reconciler.py::test_auto_close_writes_db_and_drops_position_from_watchers`、`::test_auto_close_breaks_signature_throttle` 现在都跑两轮 |
 | 45 | "会重试"是对调用方控制流的断言，而被调用方不拥有它 | `test_overnight_0911.py::test_deferred_says_a_caller_close_will_not_be_retried`（契约翻转：当晚结尾是 "will retry."）。**不变量**：`::test_deferred_is_still_transient_not_deterministic`（改措辞不许把 deferred 推进确定性组 —— 那是 9/2 TSLA -$166 要避免的熔断）|
 | 46 | "不阻塞启动"写在注释里不等于有机制；启动路径上的挂起按最高价计费 | `test_overnight_0911.py::test_a_hung_quote_probe_no_longer_blocks_startup`（断的是**耗时**不是返回值 —— 坏掉的是"等多久"）、`::test_a_fast_probe_is_passed_through_untouched`（正常路径逐字不变）|
+| 47 | 检查"有没有人在"和"占住座位"不是一回事（look-then-act 的间隙就是 TOCTOU）| 无自动回归（launchd 唤醒投放是宿主行为，测不了）。防御在 `ops/night_run.sh` 的 `mkdir` 原子锁（PID + 双条件陈旧判定 + `trap EXIT INT TERM HUP`）。**验证方法**（改这段必跑）：把脚本里 `caffeinate -is make run` 换成 `sleep`，然后 ① 并发 4 个 → `ops.log` 恰好 1 条 starting、3 条 skip；② 塞一个死 PID 的锁 → 判 stale 并重抢；③ 塞一个**活着但不是 night_run** 的 PID → 同样判 stale（只看 `kill -0` 会误判成"有人在跑"，当晚永远不交易）；④ 分别 TERM/HUP/INT 杀掉 → 锁必须释放 |
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |
