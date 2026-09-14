@@ -41,7 +41,7 @@ from datetime import datetime, timezone, date as date_cls
 from zoneinfo import ZoneInfo
 
 from autotrade.broker.trade import place_sell_order
-from autotrade.broker.quote import get_last_price
+from autotrade.broker.quote import describe_quote, get_last_price
 from autotrade.parsing.holidays import is_early_close
 from autotrade.position import manager as position_mgr
 from autotrade.position import fill_checker
@@ -49,7 +49,7 @@ from autotrade.position import retry_guard
 from autotrade.position.sell_executor import Outcome, SellPlan, SkipSell, execute_sell
 from autotrade.notify.transport import send_telegram
 # format_close_filled 已随成交 TG 收进 sell_executor（0015），此处只剩错误文案
-from autotrade.notify.messages import format_error
+from autotrade.notify.messages import format_eod_no_quote, format_error
 from autotrade.notify.watchdog import notify_tick_error, notify_tick_ok
 from autotrade.utils.logger import logger
 
@@ -154,6 +154,25 @@ _skip_until_date: date_cls = None  # 跨日清空
 # 只有 TG 按 30min/code 节流。broker 异常/拒单仍走 60s _skip_until。
 _alerted_until: dict[str, float] = {}
 
+# [9/14] 无报价告警改成"每轮汇总一条"，不再每个仓位各发各的。
+# 周五 9/12 一晚 80 条（LITE 58 + HOOD 22，双进程翻倍），9/5 那晚 90 条 ——
+# 而 9/5 那 90 条一条都没送出去（101 次 ConnectError）。噪音大到把真正
+# 要命的那条埋掉，正是 lesson #33 的形状。
+#
+# 本轮累计：拒卖的仓位 + 成功取到价的仓位数。后者是**模式判据**——
+# 同一轮里只要有别的合约取到价，就说明行情通路是好的（9/12 周五 BE 在
+# 05:50:02 拿到 0.64，LITE 在 05:50:04 无报价，隔两秒）。
+_tick_noquote: list = []
+_tick_priced: int = 0
+
+# 到期日告警的阶段标记：{code: {"first", "final"}}。到期日不能按 30min 节流
+# （整个窗口只有 15 分钟），但也不该每 tick 一条 —— 改成"首次 + 收盘前最后
+# 一次"两条。跨日与 _skip_until 一起清。
+_expiry_alert_stage: dict = {}
+
+# 收盘前多少分钟发"最后一次"提醒。半日市由 _close_hour 折算，不写死 16:00。
+_FINAL_CALL_LEAD_MIN = int(os.getenv("EOD_NOQUOTE_FINAL_LEAD_MIN", "3"))
+
 
 def _gc_skip(today_et: date_cls):
     """跨日清空 skip/alert set，避免昨天的失败影响今天。"""
@@ -163,6 +182,7 @@ def _gc_skip(today_et: date_cls):
         _alerted_until.clear()
         # 熔断同理跨日清空：昨天那张仓的确定性拒单不该挡住今天的强平
         retry_guard.clear_prefix("eod:")
+        _expiry_alert_stage.clear()
         _skip_until_date = today_et
 
 
@@ -204,29 +224,27 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float, today_iso: st
             # 当晚同批的 ASTS 重试 3.5 分钟后拿到 0.01 卖掉了，AMD 一直没有。
             # 拒绝 entry-fallback 本身是对的（7/25 事故），缺的是升级路径：
             # 到期日**不节流**（每 tick 都喊）+ 文案写清后果。
+            # [9/14] 日志**仍然每 tick 一条**（0016 起的有意设计：半夜 TG 被节流
+            # 时复盘还有日志可查）。变的只是 TG —— 不再每个仓位各发各的，
+            # 改由 _report_no_quote 在本轮结束后汇总成一条，带上模式判定。
             is_expiry_today = fresh.get("expiry") == today_iso
-            if is_expiry_today or _alerted_until.get(code, 0) <= ts_now:
-                if not is_expiry_today:
-                    _alerted_until[code] = ts_now + 1800
-                logger.warning(
-                    f"[eod] no quote for {code}, refusing entry-fallback sell, "
-                    f"manual close required ("
-                    + ("**今天到期**,每 tick 重试并告警" if is_expiry_today
-                       else "每 tick 重试中,TG 30min 一次") + ")"
-                )
-                ok = await send_telegram(format_error(
-                    "⚠️ 到期日强平跳过：无报价" if is_expiry_today else "EOD 强平跳过：无报价",
-                    f"{code} qty={qty} entry=${fresh['avg_entry_price']:.2f}\n"
-                    + ("**今天到期 —— 不处理就是归零**（8/22 AMD 520C 这么丢了 $540）\n"
-                       if is_expiry_today else "")
-                    + f"原因：OPRA 不可用，避免 entry × 0.9 自残卖\n"
-                    f"收盘前每 30s 继续重试；若一直无报价请在 moomoo 手动平仓"
-                ))
-                # 裸 send_telegram 成功只记 debug,出过"告警到底发没发"说不清的账
-                # (7/24 夜这条告警在日志里完全隐形)——安全关键路径把结果提到 INFO
-                logger.info(f"[eod] no-quote TG {'sent' if ok else 'FAILED'} for {code}")
-                return SkipSell(Outcome.SKIPPED_NOTIFIED)
-            return SkipSell(Outcome.SKIPPED_SILENT)
+            logger.warning(
+                f"[eod] no quote for {code}, refusing entry-fallback sell, "
+                f"manual close required ("
+                + ("**今天到期**,每 tick 重试" if is_expiry_today
+                   else "每 tick 重试中") + ")"
+            )
+            _tick_noquote.append({
+                "code": code, "qty": qty,
+                "entry": fresh["avg_entry_price"],
+                "expiry_today": is_expiry_today,
+            })
+            return SkipSell(Outcome.SKIPPED_NOTIFIED)
+
+        # 本轮有仓位取到价 = 行情通路是好的。这是 _report_no_quote 区分
+        # "通路挂了" 和 "这张合约没市场" 的第一手判据，比事后再查一次便宜。
+        global _tick_priced
+        _tick_priced += 1
 
         limit = max(0.01, round(last * (1 - sell_slip), 2))
         logger.warning(
@@ -317,6 +335,109 @@ async def sweep_expired_and_notify() -> list[dict]:
     return swept
 
 
+def _is_final_call(now_et: datetime, cfg: dict) -> bool:
+    """是不是"收盘前最后一次"？半日市跟着 cutoff 一起前移，不写死 16:00。"""
+    # 默认 cutoff 15:50、收盘 16:00 —— 相差 10 分钟。半日市 cutoff 被整体前移
+    # （见 _WINDOW_END 那段），这里跟着 cutoff 走就自动对，不写死 16:00。
+    close_total = cfg["hour"] * 60 + cfg["minute"] + 10
+    return now_et.hour * 60 + now_et.minute >= close_total - _FINAL_CALL_LEAD_MIN
+
+
+async def _report_no_quote(now_et: datetime, cfg: dict) -> None:
+    """本轮的无报价汇总成一条 TG。**不做任何交易决策**，纯告知。
+
+    [9/14] 三件事一起解决：
+      1. 降噪：一轮一条，不是一个仓位一条（9/12 周五 80 条、9/5 90 条）；
+      2. 到期日的节流从"每 tick 都喊"改成"首次 + 收盘前最后一次"——
+         整个到期窗口只有 15 分钟，30min 节流等于只喊一次，每 tick 又太吵；
+      3. **说清是哪一种故障**。以前两种情况发的是同一句"请手动平仓"，
+         而它们要人做的事完全相反：
+           - 行情通路挂了 → 爬起来看 OpenD，所有到期仓都在裸奔；
+           - 这张合约没市场 → 它大概率已经归零，翻个身接着睡。
+    """
+    if not _tick_noquote:
+        return
+
+    # 判据一（免费）：本轮有别的仓位取到价 → 通路一定是好的。
+    # 判据二（一次 snapshot）：向 broker 问清这个 code 到底缺什么。
+    # 只查要报告的前 3 个，够判模式，也不让配额被一堆归零合约吃掉。
+    probes = [(d, describe_quote(d["code"])) for d in _tick_noquote[:3]]
+    transport_bad = _tick_priced == 0 and any(
+        not q["transport_ok"] for _, q in probes)
+
+    expiry_rows = [d for d in _tick_noquote if d["expiry_today"]]
+    final_call = _is_final_call(now_et, cfg)
+
+    # 到期日：首次 + 收盘前最后一次。非到期日：沿用 30min/code。
+    stage = None
+    if expiry_rows:
+        codes = tuple(sorted(d["code"] for d in expiry_rows))
+        sent = _expiry_alert_stage.setdefault(codes, set())
+        if "first" not in sent:
+            stage = "first"
+        elif final_call and "final" not in sent:
+            stage = "final"
+        if stage:
+            sent.add(stage)
+    else:
+        ts_now = now_et.timestamp()
+        due = [d for d in _tick_noquote if _alerted_until.get(d["code"], 0) <= ts_now]
+        if due:
+            for d in due:
+                _alerted_until[d["code"]] = ts_now + 1800
+            stage = "throttled"
+
+    if stage is None:
+        logger.info(
+            f"[eod] no-quote TG 已节流（stage 已发过）: "
+            f"{[d['code'] for d in _tick_noquote]}")
+        return
+
+    # 三种结论，证据强度不同，文案不许含糊 —— 半夜看到它的人要据此决定
+    # 是爬起来还是翻身睡。
+    if transport_bad:
+        title = "🔌 EOD 无报价：行情通路挂了"
+        head = ("本轮**没有任何**仓位取到报价，且 snapshot 调用本身失败 ——\n"
+                "这不是某张合约没人要，是取价通路断了（9/5 那晚 107 次连接错误、"
+                "全盘 0 次强平成功）。\n"
+                "**去看 OpenD**；在它恢复之前所有当日到期仓都在裸奔。\n")
+    elif _tick_priced > 0:
+        # 最强的一种证据：同一轮里别的合约拿到了价（9/12 周五 BE 0.64 / LITE 无价）
+        title = ("⚠️ 到期日无报价：这些合约没有市场" if expiry_rows
+                 else "EOD 无报价：这些合约没有市场")
+        head = (f"本轮另有 {_tick_priced} 个仓位正常取到价，说明**通路是好的**，"
+                "是这几张合约没有买卖盘。\n"
+                "历史上这种合约最终都归零或卖在 $0.01（8/22 ASTS、8/21 MSFT、"
+                "9/12 HOOD 都是 0.01）—— **多数情况下不需要你做任何事**。\n")
+    else:
+        # 本轮所有仓位都没价，但 snapshot 调用是通的 —— 说不出"通路好"（没有
+        # 成功样本），也说不出"通路坏"（调用没失败）。如实标成待确认，别替人下结论。
+        title = ("⚠️ 到期日无报价：原因待确认" if expiry_rows
+                 else "EOD 无报价：原因待确认")
+        head = ("本轮**所有**待强平仓位都没取到价，但 snapshot 调用本身是通的。\n"
+                "缺少「取到价的对照样本」，无法区分「这几张都恰好没市场」和"
+                "「行情源在返回空数据」—— 下面的逐条探测结果是判据。\n")
+
+    lines = []
+    for d, q in probes:
+        lines.append(f"• {d['code']} qty={d['qty']} entry=${d['entry']:.2f}\n    {q['detail']}")
+    if len(_tick_noquote) > len(probes):
+        lines.append(f"• …另有 {len(_tick_noquote) - len(probes)} 张未逐一探测")
+
+    tail = ""
+    if stage == "final":
+        tail = "\n⏰ **收盘前最后一次提醒** —— 过了这个点就是过期归零。"
+    elif expiry_rows:
+        tail = "\n收盘前每轮继续重试；下一条提醒在收盘前。"
+
+    ok = await send_telegram(format_eod_no_quote(title, head + "\n".join(lines) + tail))
+    # 裸 send_telegram 成功只记 debug,出过"告警到底发没发"说不清的账
+    # (7/24 夜这条告警在日志里完全隐形)——安全关键路径把结果提到 INFO
+    logger.info(
+        f"[eod] no-quote TG {'sent' if ok else 'FAILED'} "
+        f"(stage={stage}, transport_bad={transport_bad}, n={len(_tick_noquote)})")
+
+
 async def _eod_tick(now_et: datetime):
     """单轮：判断是否在 EOD 时窗、找待平仓位、依次强平。"""
     cfg = _cfg()
@@ -356,8 +477,14 @@ async def _eod_tick(now_et: datetime):
         f"[eod] in window @ {now_et.strftime('%H:%M')} ET, "
         f"closing {len(positions)} position(s)"
     )
+    global _tick_priced
+    _tick_noquote.clear()
+    _tick_priced = 0
     for pos in positions:
         await _force_close(pos, cfg["sell_slip"], ts_now, today_iso)
+    # 汇总告警放在**所有仓位处理完之后**：模式判定要看"本轮有没有别的
+    # 仓位取到价"，那个数字在循环结束前是不完整的。
+    await _report_no_quote(now_et, cfg)
 
 
 async def run_eod_watcher():

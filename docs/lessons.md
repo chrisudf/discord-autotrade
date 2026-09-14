@@ -1814,6 +1814,70 @@ a better check.
 
 ---
 
+## 48. The loss you are looking at and the loss you could have prevented are different numbers
+
+**Symptom**: a review proposed three fixes for "EOD can't get a quote on expiry
+day," with the justification that the first two "能真正省下 LITE 这 $460 和
+8/22 AMD 那 $540." Both figures are real losses. Neither was recoverable.
+
+Checking every historical instance of *no quote, then a quote finally arrives*:
+
+```
+8/22 ASTS 80C   → sold at 0.01
+8/21 MSFT 490C  → sold at 0.01
+9/12 HOOD 120C  → sold at 0.01      （22 次告警之后）
+8/22 AMD 520C   → never priced, expired
+9/12 LITE 1030C → never priced, expired
+```
+
+Against contracts that *did* price at the same moment: 0.64, 1.17, 1.63, 1.71,
+1.74, 1.88, 1.96, 2.55, 19.02. **No quote at 15:50 on expiry day is a near-perfect
+predictor of worthless.** HOOD's successful retry recovered **$2** on a $194
+position. The $460 and the $540 were lost by being wrong about direction, days
+earlier; the EOD refusal recovered none of it because there was none left to
+recover.
+
+**Why non-obvious**: the loss is right there in the postmortem, attached to the
+failure, in the same sentence. "EOD couldn't sell it → it expired → -$460" is a
+true causal chain, and every step of it is correct. What it hides is the
+counterfactual: had the sell gone through, the fill would have been a penny. The
+number that belongs next to a proposed fix is not the loss you observed, it is
+**the difference between what happened and what the fix would have produced** —
+and nothing in a postmortem computes that for you.
+
+Getting this wrong is not neutral, because it sets the price you are willing to
+pay in risk. The rejected option here — widen the limit on expiry day, sell at
+the last known price × 0.7 when no quote is available — only ever fires when you
+*cannot tell* whether the contract is worth $0.01 or $19.02 (MU 900C really did
+close at 19.02). Upside a few dollars, downside hundreds, and it is the same
+shape as the 7/25 self-harm-sell incident. It looked worth the risk only because
+the payoff had been overstated by two orders of magnitude.
+
+The second option dissolved the same way: "switch the quote source, use
+`get_sell_ref_price`'s bid path instead of `get_last_prices`" describes two
+function names, not two sources. Both call the same `_snapshot`, sharing quota,
+backoff and freshness gate — the docstring says so in as many words
+（「不开第二条 snapshot 路径」）. The only real difference is one preferred field.
+Whether that field ever holds a non-penny value where the other does not is an
+empirical question, and the logs could not answer it, because the refusal line
+`[eod] no quote for {code}` records nothing: not the return code, not the bid,
+not the age. Three postmortems had asked the same question and none could answer
+it. So the fix shipped was the instrument, not the guess.
+
+**Defense**: `describe_quote` records what the snapshot actually returned at the
+moment of refusal, which doubles as the classifier the alert needed anyway
+(transport failure vs contract with no market — 9/5 was 107 connection errors and
+zero successful closes; 9/12 was 4 and 4). The alert now says which one it is,
+because those two need opposite things from a human at 3am.
+
+**General form**: before building the fix, price it — not the incident, the
+*delta*. If you cannot find the number in the logs, that absence is itself the
+first thing to fix; an instrument you can ship today beats a remedy premised on a
+number nobody has measured. And when an alternative is described by its function
+name, read down to what it actually calls before counting it as an alternative.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -2338,6 +2402,7 @@ downside is priced in dollars.
 | 45 | "会重试"是对调用方控制流的断言，而被调用方不拥有它 | `test_overnight_0911.py::test_deferred_says_a_caller_close_will_not_be_retried`（契约翻转：当晚结尾是 "will retry."）。**不变量**：`::test_deferred_is_still_transient_not_deterministic`（改措辞不许把 deferred 推进确定性组 —— 那是 9/2 TSLA -$166 要避免的熔断）|
 | 46 | "不阻塞启动"写在注释里不等于有机制；启动路径上的挂起按最高价计费 | `test_overnight_0911.py::test_a_hung_quote_probe_no_longer_blocks_startup`（断的是**耗时**不是返回值 —— 坏掉的是"等多久"）、`::test_a_fast_probe_is_passed_through_untouched`（正常路径逐字不变）|
 | 47 | 检查"有没有人在"和"占住座位"不是一回事（look-then-act 的间隙就是 TOCTOU）| 无自动回归（launchd 唤醒投放是宿主行为，测不了）。防御在 `ops/night_run.sh` 的 `mkdir` 原子锁（PID + 双条件陈旧判定 + `trap EXIT INT TERM HUP`）。**验证方法**（改这段必跑）：把脚本里 `caffeinate -is make run` 换成 `sleep`，然后 ① 并发 4 个 → `ops.log` 恰好 1 条 starting、3 条 skip；② 塞一个死 PID 的锁 → 判 stale 并重抢；③ 塞一个**活着但不是 night_run** 的 PID → 同样判 stale（只看 `kill -0` 会误判成"有人在跑"，当晚永远不交易）；④ 分别 TERM/HUP/INT 杀掉 → 锁必须释放 |
+| 48 | 事故的损失额 ≠ 修复能挽回的额度；先量 delta 再决定付多少风险去换 | `test_overnight_0914.py::test_still_refuses_to_sell_without_a_quote`（被否决的 ① —— entry-fallback 自残卖永远不许回来，7/25 事故本体）。诊断即分类器：`::test_describe_quote_separates_the_two_modes`、`::test_other_positions_priced_means_the_contract_is_dead_not_the_feed`（9/12 形状）、`::test_nothing_priced_plus_transport_failure_means_the_feed_is_down`（9/5 形状）。**反向护栏**：`::test_transport_failure_alone_is_not_enough_when_others_priced`（一次探测失败不等于通路挂了）、`::test_all_positions_unpriced_says_unknown_not_healthy`（零个成功样本时不许自称"通路是好的" —— 写用例时抓出来的真 bug）|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |
