@@ -174,6 +174,29 @@ if [[ -s "$DIGEST_ERR" ]]; then
 fi
 rm -f "$DIGEST_ERR"
 
+# ---------- 2b. 已实现盈亏（ET 交易日口径）----------
+# [9/14] 摘要里以前只有事件流和价格，**没有盈亏**——9/10、9/11、9/12 三份复盘的
+# 日结全是人手算的。手算意味着每次口径可能不一样、没人能复现，也没法回答
+# "三个频道哪个在赚钱"。ops/pnl.py 把口径固化下来（成本锚 avg_entry_price、
+# 过期按合约到期日归日、reconciler 捏造的 0 价不计入），这里把它接进摘要。
+#
+# 本脚本的契约是"纯 shell、几秒钟结束"（见文件头），这里是唯一的例外：
+# 一次只读 sqlite 查询。所以三道保险——超时、失败不中断、输出为空就不追加。
+# 复盘缺一节盈亏是可惜，取证脚本挂掉是事故，两者不能换。
+PNL_ERR=$(mktemp)
+if PNL_OUT=$(cd "$PROJ" && timeout 60 .venv311/bin/python -m autotrade.ops.pnl \
+      --et-date "$TODAY_ET" --no-legs 2>"$PNL_ERR"); then
+  if [[ -n "$PNL_OUT" ]]; then
+    { echo; echo "## 已实现盈亏（ET $TODAY_ET）"; echo "$PNL_OUT"; } >> "$DIGEST"
+    log_ops "pnl section appended (ET $TODAY_ET)"
+  fi
+else
+  log_ops "⚠️ pnl 生成失败(不影响取证): $(tr '\n' ' ' < "$PNL_ERR" | tail -c 200)"
+  { echo; echo "## 已实现盈亏（ET $TODAY_ET）";
+    echo "（生成失败，手动跑：python -m autotrade.ops.pnl --et-date $TODAY_ET）"; } >> "$DIGEST"
+fi
+rm -f "$PNL_ERR"
+
 # ---------- 3a. 昨晚没送出去的 TG 告警 ----------
 # [9/5 实锤 -$714] 断网那晚 TG 101 次 ConnectError，其中 90 条是 EOD 的
 # "当日到期 + 拿不到报价 + 需要人工"。那些告警只存在于日志里，而日志没人当晚读。

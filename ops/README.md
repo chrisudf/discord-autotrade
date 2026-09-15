@@ -23,7 +23,7 @@ launchd 用本机时区。作者机器是 Australia/Brisbane（UTC+10，无夏�
 | 时间 | 谁 | 做什么 |
 |---|---|---|
 | 23:11 | launchd → `night_run.sh` | 开新 Terminal 窗口跑 `caffeinate -i make run`，输出 tee 到 `logs/session_YYYY-MM-DD.log` |
-| 07:00 | launchd → `morning_collect.sh` | SIGTERM 停 listener → 整晚日志存到桌面 → 从 `trades.db` 抽摘要 |
+| 07:00 | launchd → `morning_collect.sh` | SIGTERM 停 listener → 整晚日志存到桌面 → 从 `trades.db` 抽摘要（含 `ops/pnl.py` 生成的已实现盈亏一节）|
 
 **早上只取证，不自动复盘**（2026-08-17 起）：`morning_collect.sh` 全是纯 shell，
 几秒钟结束，只产出 txt。复盘按需手动跑 `zsh ops/opus_review.sh $(date +%F)`。
