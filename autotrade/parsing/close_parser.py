@@ -943,7 +943,8 @@ def _extract_strike_hint(scope: str, symbols: list, full_text: str = "") -> tupl
     return (strike, side)
 
 
-def _extract_symbols(text: str, open_symbols: set[str]) -> list[str]:
+def _extract_symbols(text: str, open_symbols: set[str],
+                     known_symbols: "set | None" = None) -> list[str]:
     """抽 symbol。优先 $SYMBOL；只有完全没有 $ 标记时才 fallback 到裸 SYMBOL。
 
     设计原因：enrich 长消息里"$HOOD - NOW ITM"，NOW 在持仓白名单也会被误匹配。
@@ -971,6 +972,27 @@ def _extract_symbols(text: str, open_symbols: set[str]) -> list[str]:
         kept = _keep(found)
         if kept:
             return kept
+        # [9/17] **主语不在持仓时，不许改派给持仓标的。**
+        #
+        # 下面这段原本只做一件事：用 open_symbols 白名单把"NOW 这个副词"和
+        # "NOW 这个 ticker"分开。但它顺带做了第二件没人选择的事 —— 候选不在
+        # 持仓就**静默跳过、继续往后扫**，于是一条关于我们没有的标的的指令
+        # 会落到后面某个我们**有**的标的上。
+        #
+        # 9/16 夜实锤：`closed the rest of SPY 2.62, flat trade and boring.
+        # I almost took TSLA calls too but didn't...` → 平掉了 66 字外的
+        # TSLA 380C，而那句话明说他**没买** TSLA；喊价 2.62 是 SPY 的，
+        # 还被拿去给 TSLA 的卖单定限价。中文孪生同一条消息报的是
+        # `symbols=['SPY'] 不在当前持仓 —— 无仓可平，跳过`，行为正确。
+        #
+        # 判据不能只看"最近的候选是不是持仓" —— BARE_SYM_PATTERN 是裸
+        # `[A-Z]{2,5}`，"NVDA BOOM, OUT 80%" 里的 BOOM 比 NVDA 更靠近动词，
+        # 那样会把真指令也拒掉。所以要第三方证据：known_symbols =
+        # 我们历史上交易过的 symbol（positions_db.traded_symbols）。
+        # SPY 在里面，BOOM / FOMC / ITM 不在。
+        #
+        # 规则：扫描顺序里**先**遇到一个"是真 ticker 但不在持仓"的候选，
+        # 就认定它是主语 → 整条按"无仓可平"处理，不再往后找。
         for m in BARE_SYM_PATTERN.finditer(scope):
             s = m.group(1)
             if s in seen:
@@ -978,6 +1000,12 @@ def _extract_symbols(text: str, open_symbols: set[str]) -> list[str]:
             if s in open_symbols:
                 found.append(s)
                 seen.add(s)
+            elif known_symbols and s in known_symbols and not found:
+                # 主语是真 ticker 但我们没持有 —— 停在这里，别改派
+                logger.info(
+                    f"[close_parser] 指令主语 {s} 是已知 ticker 但不在持仓 "
+                    f"({sorted(open_symbols)}) —— 无仓可平，**不改派**给后面的持仓标的")
+                return []
         kept = _keep(found)
         if kept:
             return kept
@@ -1157,7 +1185,7 @@ def _normalize_zh(text: str) -> str:
     return text
 
 
-def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
+def _parse_close_en(text: str, open_symbols: set[str], known_symbols: "set | None" = None) -> Optional[dict]:
     """英文路径（原 parse_close 逻辑）。"""
     text_lower = text.lower()
     if _has_recap_marker(text_lower):
@@ -1188,7 +1216,7 @@ def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
                 "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
                 "matched": text[:120], "lang": "en"}
 
-    symbols = _extract_symbols(text, open_symbols)
+    symbols = _extract_symbols(text, open_symbols, known_symbols)
     if not symbols:
         return None
     pct = _extract_pct(text, text_lower)
@@ -1473,7 +1501,7 @@ def verb_symbol_distance(text: str, symbols: list) -> dict:
     return out
 
 
-def parse_close(text: str, open_symbols: set[str]) -> Optional[dict]:
+def parse_close(text: str, open_symbols: set[str], known_symbols: "set | None" = None) -> Optional[dict]:
     """CLOSE 信号解析（顶层 dispatcher）。
 
     流程：
@@ -1491,7 +1519,8 @@ def parse_close(text: str, open_symbols: set[str]) -> Optional[dict]:
     # 将来加第三条路径也自动继承。
     text = strip_relay_prefix(text)
 
-    return _parse_close_en(text, open_symbols) or _parse_close_zh(text, open_symbols)
+    return (_parse_close_en(text, open_symbols, known_symbols)
+            or _parse_close_zh(text, open_symbols))
 
 
 # $ 后面跟 1-5 个字母 = 喊单员在标注标的，不管大小写。

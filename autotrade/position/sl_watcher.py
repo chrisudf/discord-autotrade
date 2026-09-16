@@ -36,8 +36,10 @@ TODO（实测调整）：
 - watcher 启动时要不要先打一次完整状态到 TG（"开始监控 N 个仓位"）
 """
 import asyncio
+import json
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -72,6 +74,30 @@ from autotrade.utils.logger import logger
 # 0 = 关（完全退回旧行为，连报价都不取）。
 ET_TZ = ZoneInfo("America/New_York")   # 观测告警按 ET 自然日节流
 SL_OBSERVE_SWING_ENV = "SL_OBSERVE_SWING"
+
+
+def _observe_path() -> "Path":
+    """观测序列落盘位置：logs/observe_YYYY-MM-DD.jsonl（ET 自然日）。
+
+    与 undelivered_alerts 同一个口径认 LOG_DIR —— 写死 logs/ 会让任何设了
+    LOG_DIR 的部署把数据写到别处（见 morning_collect 里那段同样的教训）。
+    """
+    d = Path(os.getenv("LOG_DIR") or (Path(__file__).resolve().parents[2] / "logs"))
+    d.mkdir(parents=True, exist_ok=True)
+    day = datetime.now(timezone.utc).astimezone(ET_TZ).date().isoformat()
+    return d / f"observe_{day}.jsonl"
+
+
+def _append_observe_row(row: dict) -> None:
+    """一行一条，append 即可。**任何情况下都不抛** —— 观测是副产物，
+    不该因为磁盘/权限问题拖垮 SL watcher 这条钱路。"""
+    try:
+        with open(_observe_path(), "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        logdedup.log_throttled("observe-write-fail",
+                               "[sl-observe] 写观测文件失败（不影响 SL）",
+                               level="WARNING")
 
 
 def _observe_swing_enabled() -> bool:
@@ -292,6 +318,16 @@ async def _sl_tick():
     for p in position_mgr.get_open_positions():
         if p["qty_remaining"] <= 0:
             continue
+        # [9/17] 成本未知 → 一切按成本的判定都停手（阈值、棘轮、声明止损的折算）。
+        # 9/16 夜 NVDA 215C：闸门拒绝回填后 avg_entry 停在**限价** 2.70，
+        # 真实成交 1.01，SL 5 秒后按 2.70 算出 -63% 把 4 张全平在 0.91。
+        # EOD 与喊单员指令不依赖成本，不受此影响。
+        if p.get("entry_unconfirmed"):
+            logdedup.log_throttled(
+                f"sl-unconfirmed:{p['option_code']}",
+                f"[sl] 跳过 {p['option_code']}：成本未知（fill 闸门拒绝回填），"
+                f"等人工核对后清除标记", level="WARNING")
+            continue
         if p.get("apply_sl"):
             watch.append((p, cfg["sl_pct"]))
         elif cfg["lotto_pct"] > 0 and p.get("category") in LOTTO_CATEGORIES:
@@ -361,12 +397,20 @@ async def _sl_tick():
         entry = pos["avg_entry_price"]
         threshold = entry * (1 - pct)
         pnl_pct = (last - entry) / entry * 100 if entry else 0.0
-        # 每 tick 都记：这条日志就是将来回测 WEEKLY_MAX_DTE / max_loss 的原始序列
-        logger.info(
-            f"[sl-observe] {code} cat={pos.get('category')} last={last:.2f} "
-            f"entry={entry:.2f} pnl={pnl_pct:+.1f}% 假想阈值={threshold:.2f}"
-            + ("  ⬅️ 本会平仓（未下单）" if last <= threshold else "")
-        )
+        # [9/17] 价格序列写**独立 jsonl**，不进操作日志。
+        # 上线第一夜（9/16）这条 logger.info 打了 15,332 行 = 整个夜间日志的 92%，
+        # 原始日志 2.17 MB —— 仪器有效，但把有动作的记录淹了（lesson #33 的形状，
+        # 也是 8/13 那次 1.09 MB 日志的同一条线）。
+        # 而且它的产物本来就是**数据**不是日志：写成一行一条 JSON，回测时直接读，
+        # 不用去 grep 日志行。操作日志里只留下面那条"本会平仓"。
+        _append_observe_row({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "code": code, "category": pos.get("category"),
+            "qty": pos["qty_remaining"], "entry": round(entry, 4),
+            "last": round(last, 4), "threshold": round(threshold, 4),
+            "pnl_pct": round(pnl_pct, 2),
+            "would_stop": bool(last <= threshold),
+        })
         if last > threshold or _observed_alerted.get(code) == today_et:
             continue
         _observed_alerted[code] = today_et

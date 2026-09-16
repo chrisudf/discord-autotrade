@@ -121,14 +121,21 @@ async def confirm_buy_fill(order_id: str, option_code: str, qty: int, limit_pric
                         f"{limit_price:.2f} 超出闸门 [{lo:.2f}, {hi:.2f}] —— "
                         f"拒绝回填 avg_entry，order={order_id}"
                     )
+                    # [9/17] 拒绝回填 ≠ 限价就是成本。打标记让 SL/TP 停手，
+                    # 否则会拿一个我们没付过的价去算止损（9/16 夜 NVDA 215C）。
+                    positions_db.mark_entry_unconfirmed(
+                        option_code, why=f"dealt={dealt:.2f} vs limit={limit_price:.2f}")
                     await send_telegram(format_error(
-                        "成交价异常，拒绝回填成本",
+                        "成交价异常，拒绝回填成本 —— 该仓位已停用 SL/TP",
                         f"{option_code} order={order_id}\n"
                         f"限价 ${limit_price:.2f} → broker 回报成交 ${dealt:.2f}"
                         f"（偏离 {abs(dealt - limit_price) / limit_price * 100:.0f}%）\n"
-                        f"avg_entry 保持 ${limit_price:.2f} 未动。"
-                        f"该合约很可能取不到报价 —— 请核对 moomoo 成交明细，"
-                        f"并确认 SL/TP/EOD 还能不能给它取到价"
+                        f"**成本未知** —— avg_entry 仍显示 ${limit_price:.2f}（限价），"
+                        f"但那不是我们付的价。\n"
+                        f"该仓位已标记 entry_unconfirmed，**SL / TP 会跳过它**"
+                        f"（避免拿限价当成本算出幻觉止损，9/16 夜 NVDA 215C -$680 幻觉亏损）。\n"
+                        f"EOD 强平与喊单员的平仓指令不受影响。\n"
+                        f"请核对 moomoo 成交明细后手工修正 avg_entry 并清除该标记"
                     ))
                     return
                 if positions_db.adjust_entry_price(

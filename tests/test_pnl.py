@@ -258,3 +258,35 @@ def test_stale_marks_carry_their_age():
     # 年龄由 fetch_marks_stale 单独回传，format_report 负责打出来；
     # 这里钉的是 mark_open 不会因为价格陈旧就拒绝计算（那是看盘不是下单）
     assert rows[0]["net"] == -255.95
+
+
+def test_reopened_contract_uses_each_legs_own_cost():
+    """[9/17 契约翻转] 同一合约平掉再开时，早先那条腿不许按后来的成本计价。
+
+    9/16 夜 NVDA 217.5C 开了两次（实成 2.43 / 2.54）。前身读
+    `positions.avg_entry_price`——那是**当前值**快照——于是第一条腿也按 2.54 算，
+    少记 $44。正确做法是顺着事件流滚动重建，qty 归零即重置。
+    """
+    pos = {"US.N": _pos("US.N", 2.54, qty_total=4)}   # 快照只剩最后一次的成本
+    legs = pnl.exit_legs([
+        _evt("US.N", "OPEN", 4, 2.59, "2026-09-16T16:48:21Z"),
+        _evt("US.N", "FILL_ADJUST", 0, 2.43, "2026-09-16T16:48:36Z"),
+        _evt("US.N", "CLOSE", -4, 1.98, "2026-09-16T17:07:18Z"),
+        _evt("US.N", "OPEN", 4, 2.59, "2026-09-16T18:08:17Z"),
+        _evt("US.N", "FILL_ADJUST", 0, 2.54, "2026-09-16T18:08:32Z"),
+        _evt("US.N", "CLOSE", -4, 2.00, "2026-09-16T18:10:44Z"),
+    ], pos)
+    assert [l["entry"] for l in legs] == [2.43, 2.54], "每条腿用自己那次的成本"
+    assert [l["realized"] for l in legs] == [-180.0, -216.0]
+
+
+def test_addon_blends_the_average_not_replaces_it():
+    """反向不变量：加仓是**加权平均**，不是覆盖 —— 与 reopen 重置区分开。"""
+    pos = {"US.A": _pos("US.A", 3.00, qty_total=4)}
+    legs = pnl.exit_legs([
+        _evt("US.A", "OPEN", 2, 2.00, "2026-09-16T14:00:00Z"),
+        _evt("US.A", "ADD_ON", 2, 4.00, "2026-09-16T15:00:00Z"),
+        _evt("US.A", "CLOSE", -4, 5.00, "2026-09-16T16:00:00Z"),
+    ], pos)
+    assert legs[0]["entry"] == 3.0, "(2.00×2 + 4.00×2)/4 = 3.00"
+    assert legs[0]["realized"] == 800.0
