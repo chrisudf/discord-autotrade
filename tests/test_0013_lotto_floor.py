@@ -24,6 +24,20 @@ from autotrade.position import sl_watcher
 from autotrade.storage import positions_db
 
 
+@pytest.fixture(autouse=True)
+def _observe_off(monkeypatch):
+    """[9/16] 0013 的不变量是「不动作的仓位连报价都不取，不占 snapshot 配额」。
+    观测模式（SL_OBSERVE_SWING，默认开）存在的意义**恰恰相反** —— 给不动作的
+    仓位取价，好攒「加了止损会怎样」的对照数据（lesson #50）。
+
+    两者不冲突，但表述要精确：0013 那条不变量现在的准确说法是
+    **「观测关闭时」不取**。本文件统一关掉观测，逐字保住原契约；
+    观测打开后的行为见 test_sl_observe_swing.py。
+    """
+    monkeypatch.setenv("SL_OBSERVE_SWING", "0")
+    yield
+
+
 def _uniq_code(prefix: str) -> str:
     return f"US.{prefix}{datetime.now().strftime('%H%M%S%f')}C001000"
 

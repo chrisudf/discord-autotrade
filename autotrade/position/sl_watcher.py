@@ -37,7 +37,9 @@ TODO（实测调整）：
 """
 import asyncio
 import os
+from datetime import datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from autotrade.broker.trade import place_sell_order
 from autotrade.broker.quote import get_last_prices
@@ -46,6 +48,7 @@ from autotrade.position import fill_checker
 from autotrade.position import retry_guard
 from autotrade.position.sell_executor import Outcome, SellPlan, execute_sell
 from autotrade.policy.positions import sl_ratchet_enabled, sl_ratchet_floor
+
 from autotrade.notify.transport import send_telegram
 # format_close_filled 已随成交 TG 收进 sell_executor（0015），此处只剩错误文案
 from autotrade.notify.messages import format_error
@@ -53,6 +56,30 @@ from autotrade.notify.watchdog import notify_tick_error, notify_tick_ok
 from autotrade.utils import logdedup
 from autotrade.utils.envcfg import env_int
 from autotrade.utils.logger import logger
+
+# [9/16 观测模式] swing 类目 apply_sl=False，**压根不进 watcher，连报价都没取过**。
+# 于是「WEEKLY_MAX_DTE=10 该不该是 10」「swing 要不要 max_loss 硬底」这两个问题
+# 从 8/22（-$976）问到现在都答不了 —— 不是没人想改，是**没有数据可回测**。
+#
+# 9/15 夜的量化：10 个仓位 8 个裸奔，$4,810 / $5,272 = **91% 的在途资金无保护**，
+# 而有保护的那两个之所以有，只因为喊单员碰巧在喊话里写了止损价（lesson #50）。
+#
+# 直接给 swing 加止损会**永久失去对照**：喊单员的 weekly 常常先跌后拉，止损可能
+# 是割在地板上，也可能像 8/22 AMD 那样救命 —— 现在这两种分不清。
+# 所以先只观测：照常取价、照常算阈值、跌破就**记日志 + 发一次 TG 说"本会平仓"**，
+# 但**绝不下单**。两三周后两条曲线都有了，再用数据定，而不是拍板。
+#
+# 0 = 关（完全退回旧行为，连报价都不取）。
+ET_TZ = ZoneInfo("America/New_York")   # 观测告警按 ET 自然日节流
+SL_OBSERVE_SWING_ENV = "SL_OBSERVE_SWING"
+
+
+def _observe_swing_enabled() -> bool:
+    return env_int(SL_OBSERVE_SWING_ENV, 1, minimum=0) > 0
+
+
+# 观测命中只发一次 TG：{option_code: 已告警的 ET 日期}
+_observed_alerted: dict = {}
 
 
 def _cfg() -> dict:
@@ -259,6 +286,9 @@ async def _sl_tick():
     # env<=0 时 lotto 仓位完全不进 watch 列表——连报价都不取，不占
     # moomoo snapshot 配额（见下方 7/8 批量取价注释）。
     watch: list[tuple[dict, float]] = []
+    # [9/16] 观测名单：只取价、只记账，**永远不下单**（见文件头 SL_OBSERVE_SWING）
+    observe: list[tuple[dict, float]] = []
+    observe_on = _observe_swing_enabled()
     for p in position_mgr.get_open_positions():
         if p["qty_remaining"] <= 0:
             continue
@@ -279,10 +309,16 @@ async def _sl_tick():
             # 所以这不是"给 swing 加止损"（那是钱路决定，见 ROADMAP P1 §16 与
             # lesson #31 结尾）—— 作用域严格限定在"有绝对价声明"这一种。
             watch.append((p, 1.0))
-    if not watch:
+        elif observe_on:
+            # 剩下的就是真正裸奔的那批（swing / lotto 且 lotto_floor 关）。
+            # 进来只为拿到价格序列；用全局 sl_pct 算"本会在哪触发"。
+            observe.append((p, cfg["sl_pct"]))
+    if not watch and not observe:
         return
 
-    codes = [p["option_code"] for p, _ in watch]
+    # 取价合并成一次批量：观测名单不能多开一条 snapshot 路径去吃配额
+    # （同 get_sell_ref_price 的"不开第二条 snapshot 路径"）。
+    codes = [p["option_code"] for p, _ in watch + observe]
     prices = await asyncio.to_thread(get_last_prices, codes)
 
     for pos, pct in watch:
@@ -314,6 +350,36 @@ async def _sl_tick():
                 reason = f"喊单员声明止损 {float(manual):.2f}"
         if last <= threshold:
             await _trigger_sl(pos, last, threshold, cfg["sell_slip"], reason)
+
+    # ---- 观测名单：算同样的阈值，但**只说不做** ----
+    today_et = datetime.now(timezone.utc).astimezone(ET_TZ).date().isoformat()
+    for pos, pct in observe:
+        code = pos["option_code"]
+        last = prices.get(code)
+        if last is None:
+            continue
+        entry = pos["avg_entry_price"]
+        threshold = entry * (1 - pct)
+        pnl_pct = (last - entry) / entry * 100 if entry else 0.0
+        # 每 tick 都记：这条日志就是将来回测 WEEKLY_MAX_DTE / max_loss 的原始序列
+        logger.info(
+            f"[sl-observe] {code} cat={pos.get('category')} last={last:.2f} "
+            f"entry={entry:.2f} pnl={pnl_pct:+.1f}% 假想阈值={threshold:.2f}"
+            + ("  ⬅️ 本会平仓（未下单）" if last <= threshold else "")
+        )
+        if last > threshold or _observed_alerted.get(code) == today_et:
+            continue
+        _observed_alerted[code] = today_et
+        # 一天一条：这是"如果 swing 有止损会怎样"的记账点，不是要人现在动手
+        await send_telegram(format_error(
+            "👁️ 观测：裸奔仓位本会触发止损（**未下单**）",
+            f"{code} cat={pos.get('category')} qty={pos['qty_remaining']}\n"
+            f"entry=${entry:.2f} last=${last:.2f}（{pnl_pct:+.1f}%）"
+            f" 假想阈值=${threshold:.2f}\n"
+            f"swing 类目 apply_sl=False 是**未决的钱路**，不是缺陷 —— "
+            f"这条只为攒「加了止损会怎样」的对照数据（lesson #50）。\n"
+            f"要现在动手请到 moomoo 手动平仓。"
+        ))
 
 
 async def run_sl_watcher():
