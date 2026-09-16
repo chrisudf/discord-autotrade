@@ -1878,6 +1878,147 @@ name, read down to what it actually calls before counting it as an alternative.
 
 ---
 
+## 49. Commentary and instruction differ by distance, not by vocabulary
+
+**Symptom**: two false closes on two consecutive nights, from messages that were
+not instructions at all.
+
+```
+9/14  「现在：缩小规模…看到盈利时锁定利润。…明天只做 $IREN。」
+      → CLOSE ['IREN'] 33%  → sold 1 contract. The caller was saying he KEEPS IREN.
+
+9/15  「All plays paid today, only HPE hit SL. IBM we closed at entry.
+       Not much to do in this chop market tbh, SPY looks like it can go for $754…」
+      → CLOSE ['IBM','SPY'] 100%  → sold the entire SPY 758P position.
+```
+
+Each survived halfway on luck: the 9/14 English twin was safe but arrived two
+seconds late and was deduplicated; on 9/15 the IBM half was skipped only because
+no quote came back, and the SPY half happened to be profitable.
+
+**Why non-obvious**: after the first one, the fix looked obvious — `锁定` was in
+`ZH_ACTION_VERBS`, the advisory form is `…时锁定…`, and `ZH_RECAP_MARKERS`
+already carried `时卖出 / 时减仓 / 时清 / 时砍 / 时抛` for exactly that
+conditional shape. Adding `时锁定` is one word, zero risk, and it does fix the
+message in front of you.
+
+It fixes **only** the message in front of you. Replayed against every historical
+message containing `锁定` — 16 of them across 14 nights, recovered by
+reassembling multi-line message blocks, because grepping the `📩` line misses
+continuation lines — exactly one verdict changes: that night's. And the very next
+night's false close shares neither the verb (`closed` / `平仓`), nor the language
+asymmetry (both twins parsed as CLOSE), nor the conditional construction.
+
+What the two do share is geometry. Measured on real corpus, the character
+distance from the close verb to the ticker it binds:
+
+```
+real instructions   3 · 6 · 11 · 14
+9/14 false close    37
+9/15 false close    ~60   (SPY sits three paragraphs from "closed")
+```
+
+A vocabulary fix cannot express this, because both messages use verbs that are
+genuinely close verbs — in a recap of a close that already happened, or in a
+sentence about where a stock might go. The verb is right; the binding is wrong.
+
+A patch shaped by one sample is worse than no patch, because afterwards the class
+looks defended. The next occurrence gets read as a new, unrelated bug.
+
+**Defense**: deliberately **not** the one-word fix. Distance is recorded at every
+CLOSE verdict and alerted on beyond a threshold, while execution is unchanged —
+n=8 is the same evidence strength as `WEEKLY_MAX_DTE=10`, which this file already
+labels a judgement call rather than a backtested value. Same move as #48: ship the
+instrument, let two weeks of real verdicts set the threshold.
+
+**General form**: when a parser binds a value to a target, the bug is as likely to
+be in the binding as in the recognition. Before extending a word list, measure the
+span between the verb and what it grabbed — and when a proposed fix is validated
+against exactly one message, replay it over the whole corpus before believing it.
+
+---
+
+## 50. Protection that depends on the caller's phrasing is not a policy
+
+**Symptom**: on 9/15, `HPE 58C` opened at 01:06 and was stopped out at 01:11 —
+five minutes, -$76, tracking the caller's own stop. The same night, three `FTNT`
+positions totalling $1,743 sat with no stop at all, and by morning 8 of 10 open
+positions — **$4,810 of $5,272, 91% of deployed capital** — had no downside
+protection of any kind.
+
+The difference between them is not category, size, or conviction. It is that
+`:RedAlert: HPE - $58 CALLS ... ` was followed by `STOP LOSS AT $1.00` and the
+FTNT alerts were not.
+
+**Why non-obvious**: every individual piece behaves correctly. `categorize` puts
+DTE > 10 into `swing` with `apply_sl=False` — a deliberate decision. Capturing a
+declared stop from the opening message and honouring it for a swing is a
+deliberate fix (#43). Each is defensible; nobody chose their **product**, which is
+that a position's protection is decided by whether the caller happened to type a
+number into a Discord message.
+
+It stays invisible because it only shows up in aggregate. Any single position
+looks explainable — this one had a stop, that one is a swing. The 91% only appears
+if someone computes it, and nothing did until the P&L ledger started splitting
+open exposure by protection.
+
+The channel mix is what turned a latent gap into the dominant one: this caller
+writes "EXPIRATION NEXT WEEK", which lands on DTE 11-17, which is `swing`. A
+threshold picked for one kind of message meets a source that lives just past it.
+
+**Defense**: nothing yet — deliberately. The blocker has never been implementation,
+it is that `WEEKLY_MAX_DTE` and `apply_sl=False` for swing have never been
+backtested (this file says so under #22's constant and in ROADMAP P2), and the
+data to settle it does not exist because swing positions are not priced at all:
+they never enter the SL watcher, so no series is recorded. Adding a stop now would
+foreclose learning whether it helps — the cheaper first move is to poll them
+observe-only and record what a stop *would* have done.
+
+**General form**: when two positions get different safety treatment, ask what
+actually decided it. If the answer is a property of the *message* rather than a
+property of the *risk*, there is no policy — there is a coin flip with extra
+steps. And a per-item explanation that always works is how an aggregate problem
+stays invisible; compute the ratio.
+
+---
+
+## 51. A budget running out is not an anomaly, but the breaker treats it as one
+
+**Symptom**: `MAX_DAILY_COST` is hit nearly every night now, and hitting it stops
+trading for the rest of the night:
+
+```
+9/10  6th order,  $3,940 spent → rest of night blocked
+9/14  6th order,  $3,644 spent → rest of night blocked
+9/15  8th order,  $3,898 spent → 4 further signals blocked, two of them
+                                 carrying explicit stop prices
+```
+
+`risk.py` returns `block_rest_of_day=True` and trips a circuit breaker whose
+message reads `当日剩余全停`.
+
+**Why non-obvious**: the two caps in that function look like siblings and are
+written as siblings, but they describe opposite situations. Passing
+`MAX_DAILY_ORDERS` means something is probably wrong — a retry storm, a duplicate
+process, a parser suddenly matching everything — and halting is the right
+response. Passing `MAX_DAILY_COST` means the day's budget is spent, which is the
+system working exactly as designed. One is a smoke alarm; the other is a fuel
+gauge. Sharing `block_rest_of_day` gives them the same consequence.
+
+The cost of conflating them scales with how good the channel is. When the cap was
+rarely reached it was invisible. Once a third channel went live, the breaker
+started firing mid-session every night, and the signals it silently discards are
+not the worst ones — they are simply the later ones. Note also that the trip time
+keeps moving *later* (02:35 ET on 9/15), which says the budget is being consumed
+steadily rather than eaten by a few outliers: a fuel gauge, not a fault.
+
+**General form**: before a guard halts everything, ask whether the condition means
+"something is wrong" or "we are finished for now." Exhaustion is a schedule, not a
+fault, and the correct response to it is to decline one item, not to stop. Two
+guards sharing a return type will quietly acquire each other's semantics.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -2403,6 +2544,9 @@ downside is priced in dollars.
 | 46 | "不阻塞启动"写在注释里不等于有机制；启动路径上的挂起按最高价计费 | `test_overnight_0911.py::test_a_hung_quote_probe_no_longer_blocks_startup`（断的是**耗时**不是返回值 —— 坏掉的是"等多久"）、`::test_a_fast_probe_is_passed_through_untouched`（正常路径逐字不变）|
 | 47 | 检查"有没有人在"和"占住座位"不是一回事（look-then-act 的间隙就是 TOCTOU）| 无自动回归（launchd 唤醒投放是宿主行为，测不了）。防御在 `ops/night_run.sh` 的 `mkdir` 原子锁（PID + 双条件陈旧判定 + `trap EXIT INT TERM HUP`）。**验证方法**（改这段必跑）：把脚本里 `caffeinate -is make run` 换成 `sleep`，然后 ① 并发 4 个 → `ops.log` 恰好 1 条 starting、3 条 skip；② 塞一个死 PID 的锁 → 判 stale 并重抢；③ 塞一个**活着但不是 night_run** 的 PID → 同样判 stale（只看 `kill -0` 会误判成"有人在跑"，当晚永远不交易）；④ 分别 TERM/HUP/INT 杀掉 → 锁必须释放 |
 | 48 | 事故的损失额 ≠ 修复能挽回的额度；先量 delta 再决定付多少风险去换 | `test_overnight_0914.py::test_still_refuses_to_sell_without_a_quote`（被否决的 ① —— entry-fallback 自残卖永远不许回来，7/25 事故本体）。诊断即分类器：`::test_describe_quote_separates_the_two_modes`、`::test_other_positions_priced_means_the_contract_is_dead_not_the_feed`（9/12 形状）、`::test_nothing_priced_plus_transport_failure_means_the_feed_is_down`（9/5 形状）。**反向护栏**：`::test_transport_failure_alone_is_not_enough_when_others_priced`（一次探测失败不等于通路挂了）、`::test_all_positions_unpriced_says_unknown_not_healthy`（零个成功样本时不许自称"通路是好的" —— 写用例时抓出来的真 bug）|
+| 49 | 评论与指令的差别在**距离**不在词表；照着唯一样本打的补丁比不打更糟 | 尚无自动回归 —— 刻意的：本条的结论是"先装仪器再定阈值"（同 #48），阈值定下来之前没有可断言的行为。**证据**：9/14 IREN + 9/15 SPY 两条误平原文；16 条含「锁定」的历史语料全量重放（只有 1 条判定变化，证明单词补丁过窄）；真指令动词↔ticker 距离 3/6/11/14 字 vs 误平 37/~60 字。**落地时必须先加语料行再改行为**（corpus 铁律 2）|
+| 50 | 保护与否取决于喊单员那句话写没写止损价 —— 那不是策略 | 无自动回归（这是**未决的钱路**，不是缺陷）。防御现状：`policy/positions.py::categorize` 的 `apply_sl=False` for swing + `open_flow::_apply_declared_stop`（#43）。**量化口径**：`ops/pnl.py` 的「未了结」一节按 `apply_sl / manual_stop / eod_force` 三者之一拆有保护/裸奔 —— 9/15 夜是 2 个 $462 有保护 vs 8 个 $4,810 裸奔（91%）。数据缺口：swing 根本不进 SL watcher，没有价格序列可回测 |
+| 51 | 预算耗尽不是异常，而熔断把它和"出事了"共用同一个返回值 | 无自动回归（改它等于改风控口径，需拍板）。现状在 `risk.py` 的两处 `block_rest_of_day=True`：`MAX_DAILY_ORDERS`（异常，该停）与 `MAX_DAILY_COST`（预算用完，不该停）。**证据**：9/10 / 9/14 / 9/15 连续三晚触发，撞线时间逐日变晚（02:35 ET），说明是稳定消耗而非少数离群单 |
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |
