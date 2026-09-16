@@ -135,6 +135,10 @@ def _init_db():
                 "ALTER TABLE positions ADD COLUMN tp_hits INTEGER NOT NULL DEFAULT 0"
             )
             logger.info("[positions] migrated: added tp_hits column")
+        if "entry_unconfirmed" not in cols:
+            conn.execute(
+                "ALTER TABLE positions ADD COLUMN entry_unconfirmed INTEGER DEFAULT 0")
+            logger.info("[positions] migrated: added entry_unconfirmed column")
         if "manual_stop" not in cols:
             # [9/9] 喊单员自己声明的止损（"stop at entry now" / "止损设置为保本"）。
             # NULL = 没声明过，行为与本列不存在时逐字一致。
@@ -355,6 +359,33 @@ def record_close(
 
 # ============ 查询 ============
 
+def mark_entry_unconfirmed(option_code: str, why: str = "") -> bool:
+    """标记"这个仓位的成本我们并不知道"。
+
+    [9/17 实锤] fill_checker 的成交价闸门（lesson #26）拒绝回填之后，
+    `avg_entry` 留着的是**限价**，而下游把它当成本用。9/16 夜 NVDA 215C：
+    限价 2.70、真实成交 1.01，闸门判 1.01 越界拒绝回填 → 5 秒后 SL 拿 2.70
+    当成本、看到 last=0.99 算出 -63%，4 张全平在 0.91。真实亏约 -$40，
+    账上记 -$724。**那笔止损本不该发生。**
+
+    闸门本身没错（它就是为"broker 回来的价可能从未存在"建的）。错在下游把
+    "拒绝回填"读成了"维持限价当成本"，而正确语义是"**成本未知**"——
+    成本未知时，一切按成本算的判定都该停手（SL 阈值、TP 阶梯、棘轮），
+    不按成本的路径（EOD 强平、喊单员的平仓指令）不受影响。
+    """
+    now = _utc_iso()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "UPDATE positions SET entry_unconfirmed = 1, last_action_at = ? "
+            "WHERE option_code = ?", (now, option_code))
+        ok = cur.rowcount > 0
+    if ok:
+        logger.warning(
+            f"[positions] {option_code} 标记为**成本未知**（{why}）—— "
+            f"SL/TP 将跳过它，直到人工核对")
+    return ok
+
+
 def set_manual_stop(option_code: str, stop_price: float) -> bool:
     """记下喊单员声明的止损价。返回是否真的写进去了。
 
@@ -413,6 +444,24 @@ def get_open_positions() -> list[dict]:
             ORDER BY opened_at DESC
         """).fetchall()
     return [_row_to_dict(r) for r in rows]
+
+
+def traded_symbols() -> set:
+    """本表出现过的全部 symbol（任何状态）。
+
+    [9/17] 给 close_parser 分辨"指令的主语是不是一个真 ticker"用。
+    背景：EN 的 bare-ticker 抽取靠 open_symbols 白名单消歧（"NOW" 既是副词也是
+    ServiceNow），但那张表同时在做第二件没人选择的事 —— 主语**不在持仓**时
+    静默跳过、继续往后找一个持仓标的，等于把指令**改派**了。
+    9/16 夜实锤：`closed the rest of SPY 2.62 … I almost took TSLA calls too`
+    平掉了 66 字外的 TSLA，而那句话明说他没买 TSLA。
+
+    光靠 open_symbols 分不出"SPY 是真 ticker 但我们没持"和"BOOM 只是个词"。
+    这张表能：SPY 交易过、BOOM/FOMC/ITM 没有。
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        return {r[0] for r in conn.execute(
+            "SELECT DISTINCT symbol FROM positions WHERE symbol IS NOT NULL")}
 
 
 def known_option_codes(codes: list[str]) -> set[str]:
