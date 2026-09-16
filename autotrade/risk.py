@@ -274,6 +274,8 @@ def check_order(price: float, qty: int,
     stats = get_daily_stats(trading_date)
     
     # 次数检查
+    # 次数撞线**仍然**熔断全天：这一条的语义是"出事了"，不是"预算花完了"
+    # （见下方成本检查里 9/16 那段注释）。8/13 夜 1918 次拒单就是这条该管的形状。
     if stats["order_count"] >= MAX_DAILY_ORDERS:
         _trigger_circuit_breaker(f"当日下单次数达上限 ({MAX_DAILY_ORDERS})")
         return RiskCheckResult(
@@ -284,15 +286,32 @@ def check_order(price: float, qty: int,
         )
     
     # 累计成本检查（本笔会导致超限）
+    #
+    # [9/16] **不再触发当日熔断，只拒这一笔。** 上面那条次数上限和这条写法并列、
+    # 曾经共用同一个 block_rest_of_day，但它们描述的是相反的情形：
+    #   - 次数撞线 → 多半是**出事了**（重试风暴、双进程、解析器突然什么都匹配），
+    #     停掉整天是对的；
+    #   - 成本撞线 → **预算花完了**，系统正按设计工作。
+    # 一个是烟雾报警器，一个是油量表，共用一个开关等于让油量表去拉总闸。
+    #
+    # 代价是可量化的：9/10 / 9/14 / 9/15 连续三晚触发，9/15 那晚 02:35 熔断后
+    # 连挡 4 条信号（其中两条自带止损价）。而撞线时间逐日变晚（02:35 已是
+    # ET 12:35），说明预算是被前半程**稳定消耗**掉的，不是被少数离群单吃光——
+    # 那正是"油量表"的形状，不是"故障"的形状。
+    #
+    # 拒单本身不变：贵到超预算的那一笔照样不下。变的只是它**不再株连后面**
+    # 每一笔更便宜的信号。真出事时仍有次数上限那条总闸兜着。
     if stats["total_cost"] + cost > MAX_DAILY_COST:
-        _trigger_circuit_breaker(
-            f"当日累计成本将达上限 (${stats['total_cost']:.0f} + ${cost:.0f} > ${MAX_DAILY_COST:.0f})"
+        logger.warning(
+            f"[Risk] 💰 当日预算不足，拒本笔（不停全天）: "
+            f"已花 ${stats['total_cost']:.0f} + 本笔 ${cost:.0f} > ${MAX_DAILY_COST:.0f}"
         )
         return RiskCheckResult(
             passed=False,
-            reason="当日累计成本达上限",
-            detail=f"已花 ${stats['total_cost']:.0f}，本笔 ${cost:.0f}，上限 ${MAX_DAILY_COST:.0f}，当日剩余全停",
-            block_rest_of_day=True
+            reason="当日预算不足",
+            detail=f"已花 ${stats['total_cost']:.0f}，本笔 ${cost:.0f}，上限 ${MAX_DAILY_COST:.0f}；"
+                   f"**只拒这一笔**，更便宜的信号仍会正常下单",
+            block_rest_of_day=False
         )
     
     # ---------- 全部通过 ----------

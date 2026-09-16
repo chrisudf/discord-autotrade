@@ -33,6 +33,7 @@ from autotrade.parsing.close_parser import (
     parse_stop_adjust,
     parse_symbolless_close,
 )
+from autotrade.parsing.close_parser import verb_symbol_distance
 from autotrade.policy.positions import last_spare_trim_decision, strategy_b_decision
 from autotrade.utils.envcfg import env_float, env_int
 from autotrade.utils.timeutil import ET_TZ, today_et
@@ -236,6 +237,10 @@ def _apply_stop_adjust(raw: str, positions: list) -> None:
 # ============================================================
 # CLOSE 信号处理
 # ============================================================
+# 远距离绑定的观察阈值（**不是闸门**）。20 字：真指令实测最大 16 字，留一点余量。
+_FAR_BIND_CHARS = int(os.getenv("CLOSE_FAR_BIND_CHARS", "20"))
+
+
 async def handle_close_signal(
     raw: str, msg_id: int, channel_name: str = None, channel_id: int = None,
 ):
@@ -308,6 +313,27 @@ async def handle_close_signal(
     # [0011] 策略B（STRATEGY_B=true 才有内容）：label → 保留原因，
     # 循环外合并 TG 时附在对应仓位后面。默认关时恒为空 dict → 文案分支
     # 走老路，与今天逐字一致。
+    # [9/16 仪器] 平仓动词↔被平 ticker 的距离。**只记录、不改变任何行为。**
+    # 两晚两条误平（9/14 IREN / 9/15 SPY）用的都是真平仓动词，错在绑定不在识别；
+    # 真指令实测 3-16 字、那两条是 37 / 71 字。但 n 太小，且 9/15 的 IBM 那半
+    # 距离只有 7 字（过去时复述「IBM we closed at entry」）——**距离判据抓不到它**，
+    # 所以现在还不配当闸门。攒两周真实判定再谈阈值。见 lesson #49。
+    try:
+        dists = verb_symbol_distance(raw, targets)
+        far = {k: v for k, v in dists.items()
+               if v is not None and v > _FAR_BIND_CHARS}
+        logger.info(f"[CLOSE] 动词↔ticker 距离: {dists}"
+                    + ("  ⚠️ 超阈值（仅记录，照常执行）" if far else ""))
+        if far:
+            await _safe_notify(format_close_skipped(
+                f"⚠️ 远距离绑定（**已照常执行**，仅供观察）：{far}\n"
+                f"真指令实测 3-16 字；9/14 IREN 误平 37 字、9/15 SPY 误平 71 字。\n"
+                f"若这条确实不是平仓指令，请留着这条 TG —— 它是将来定阈值的语料。",
+                raw,
+            ))
+    except Exception:
+        logger.exception("[CLOSE] 距离仪器失败（不影响平仓主链路）")
+
     strategy_b_reasons: dict[str, str] = {}
     # [9/10] 最后一张备用合约被浮盈闸门拦下的原因（label → reason）。
     # 与 strategy_b_reasons 分开：两者文案不同（"各剩 1 张" vs "还剩 N 张"），

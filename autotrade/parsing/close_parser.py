@@ -1414,6 +1414,65 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
             "matched": text[:120], "lang": "zh"}
 
 
+# ============================================================
+# [9/16 仪器] 平仓动词 ↔ 被平 ticker 的字符距离
+# ============================================================
+# 两晚两条误平（9/14 IREN 鸡汤、9/15 SPY「复盘 + 行情评论」）都不是词表问题：
+# 用的都是**真的**平仓动词，一个在复述已经发生的平仓、一个在谈股价会去哪。
+# 动词是对的，**绑定**是错的。第一条出来时按词表补 `时锁定` 看起来显然正确，
+# 把 16 条含「锁定」的历史语料全量重放才发现只有眼前那一条判定会变，而第二晚
+# 那条既不含该词也不是单侧漂移。见 lesson #49。
+#
+# 真指令与误平在几何上分得很开（实测语料）：
+#     真指令   3 · 6 · 11 · 14 字
+#     9/14     37 字
+#     9/15    ~60 字（SPY 在第三段）
+#
+# **但 n=8 不足以定阈值**（与 WEEKLY_MAX_DTE=10 同一个证据水平，那个数本文件
+# 已经写明是拍板值不是回测值）。所以本函数**只测量、不判决** —— 调用方
+# 记日志、超阈值发 TG，执行路径一个字不动。攒够真实判定再谈闸门。
+_DIST_TICKER_RE = re.compile(r"\$?\b([A-Z]{1,5})\b")
+
+
+def verb_symbol_distance(text: str, symbols: list) -> dict:
+    """每个被平 symbol 到最近平仓动词的字符距离。纯函数，不做任何判决。
+
+    Returns:
+        {symbol: 距离} —— 找不到动词或找不到该 symbol 时为 None。
+    """
+    if not text or not symbols:
+        return {}
+    verb_pos = []
+    # EN 走词边界正则，不用裸 find：`out` 会命中 about / without，
+    # `cut` 会命中 scout / circuit（后者正是 _BARE_ACTION_VERB_RE 存在的理由）。
+    # `out` 不在 ACTION_VERBS 里（它由 _OUT_PCT_PATTERN 一族处理），但它是本
+    # 频道最常用的平仓动词，测距离时必须算上，否则 "JPM OUT 60%" 测不到动词。
+    en = {v.strip().lower() for v in (ACTION_VERBS + FULL_CLOSE_VERBS) if v.strip()}
+    en |= {"out", "close", "closed", "closing", "sell", "sold", "exit", "exited"}
+    en_re = re.compile(r"\b(?:" + "|".join(sorted(map(re.escape, en), key=len,
+                                                   reverse=True)) + r")\b", re.I)
+    verb_pos += [m.start() for m in en_re.finditer(text)]
+    # ZH 无词边界概念（Python re 把汉字当 \w），裸 find 即可
+    for v in (ZH_ACTION_VERBS + ZH_FULL_CLOSE_VERBS):
+        start = 0
+        while (i := text.find(v, start)) != -1:
+            verb_pos.append(i)
+            start = i + 1
+    if not verb_pos:
+        return {s: None for s in symbols}
+
+    out = {}
+    for sym in symbols:
+        best = None
+        for m in _DIST_TICKER_RE.finditer(text):
+            if m.group(1) != sym:
+                continue
+            d = min(abs(m.start() - p) for p in verb_pos)
+            best = d if best is None else min(best, d)
+        out[sym] = best
+    return out
+
+
 def parse_close(text: str, open_symbols: set[str]) -> Optional[dict]:
     """CLOSE 信号解析（顶层 dispatcher）。
 

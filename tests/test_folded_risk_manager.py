@@ -73,20 +73,51 @@ def test_daily_order_count():
     assert r2.reason == "当日已熔断"
 
 
-def test_daily_cost_limit():
-    """Test 5: 当日累计成本达上限"""
-    manual_reset_today()
+def test_daily_cost_limit(monkeypatch):
+    """Test 5: 当日累计成本达上限 → **只拒这一笔，不停全天**。
 
-    # 下 4 笔 $500，累计 $2000
-    for i in range(4):
+    [9/16 契约翻转] 本用例前身断言 `block_rest_of_day is True`。那让成本上限
+    和次数上限共用同一个总闸，而两者描述的是相反情形：次数撞线多半是出事了
+    （8/13 夜 1918 次拒单），成本撞线只是预算花完了。
+    连续三晚（9/10 / 9/14 / 9/15）的代价：9/15 那晚 02:35 撞线后连挡 4 条信号，
+    其中两条自带止损价。见 lesson #51。
+    """
+    manual_reset_today()
+    # 上限设 1800 而不是 2000：预算要**留出一点空间**，否则"贵的被拒、便宜的
+    # 仍能过"这个契约根本构造不出来（花满 $2000 时连 $10 的单都过不了，
+    # 那样的绿是假绿 —— 第一版就这么写错过）。
+    monkeypatch.setattr(rm, "MAX_DAILY_COST", 1800.0)
+
+    # 下 3 笔 $500，累计 $1500，剩余预算 $300
+    for i in range(3):
         r = check_order(price=5.0, qty=1, symbol=f"BIG{i}")
         assert r.passed, f"第 {i+1} 笔 ($500) 应该通过"
         record_order(price=5.0, qty=1, symbol=f"BIG{i}")
 
-    # 第 5 笔会让累计超过 $2000
+    # 再来一笔 $500 会超（1500+500 > 1800）→ 拒，但**不熔断**
     r = check_order(price=5.0, qty=1, symbol="OVERFLOW")
-    assert not r.passed
-    assert r.block_rest_of_day
+    assert not r.passed, "超预算那一笔照样不下"
+    assert not r.block_rest_of_day, "预算耗尽不是异常，不该停全天"
+    assert not is_circuit_broken(), "不许写熔断记录"
+
+    # **本条是这次改动的全部意义**：预算还够的更便宜信号仍然下得出去
+    # （1500+100 ≤ 1800）。改之前它会被上一笔株连，整晚再也下不了单。
+    r = check_order(price=1.0, qty=1, symbol="CHEAP")
+    assert r.passed, "预算还够的更便宜信号必须照常通过"
+
+
+def test_daily_order_count_still_halts_the_day():
+    """反向不变量：次数上限**仍然**熔断全天 —— 它的语义是"出事了"。
+
+    9/16 只拆开了成本那一条，这条一个字都不许动（8/13 夜的 1918 次拒单
+    正是它该管的形状）。
+    """
+    manual_reset_today()
+    for i in range(10):
+        record_order(price=0.10, qty=1, symbol=f"TINY{i}")
+    r = check_order(price=0.10, qty=1, symbol="ELEVENTH")
+    assert not r.passed and r.block_rest_of_day
+    assert is_circuit_broken()
 
 
 def test_reset():
