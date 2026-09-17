@@ -22,6 +22,7 @@ launchd 用本机时区。作者机器是 Australia/Brisbane（UTC+10，无夏�
 
 | 时间 | 谁 | 做什么 |
 |---|---|---|
+| 23:05 | launchd → `caffeinate -imsu -t 2400` | 拿住 sleep assertion 撑到 23:45，把机器顶在 FullWake，别让它在触发点之间睡回去 |
 | 23:11 | launchd → `night_run.sh` | 开新 Terminal 窗口跑 `caffeinate -i make run`，输出 tee 到 `logs/session_YYYY-MM-DD.log` |
 | 07:00 | launchd → `morning_collect.sh` | SIGTERM 停 listener → 整晚日志存到桌面 → 从 `trades.db` 抽摘要（含 `ops/pnl.py` 生成的已实现盈亏一节）|
 
@@ -97,14 +98,16 @@ app 有自己一份偏好覆盖 `settings.json`：
 zsh ops/install.sh
 ```
 
-幂等，可重复跑。卸载 `zsh ops/install.sh --uninstall`（只卸 launchd 那两个；
+幂等，可重复跑。卸载 `zsh ops/install.sh --uninstall`（只卸 launchd 那三个；
 Claude 定时任务已停用，彻底不要就在侧边栏 "Scheduled" 里删）。
 
 装完还差一步（要密码，脚本不代跑）：
 
 ```bash
-sudo pmset repeat wakeorpoweron MTWRFSU 23:10:00
+sudo pmset repeat wakeorpoweron MTWRFSU 23:05:00
 ```
+
+[9/18] 从 23:10 提到 23:05。定时唤醒只负责**醒一下**，不保证醒着 —— 见下面第 4 条。
 
 ## 结构
 
@@ -181,7 +184,18 @@ grep 的 shell，而真正的 listener 反倒停不掉。
 
 - **起跑前**：launchd 会把错过的时点推迟到唤醒后才执行。ops.log 实测 8/4 是
   23:25:42、8/5 是 23:28:52 才起来，晚了 10-14 分钟，距 23:30 开盘只剩一分多钟。
-  这个只能靠上面那条 `pmset repeat wakeorpoweron` 定时唤醒。
+  这个靠上面那条 `pmset repeat wakeorpoweron` 定时唤醒 —— **但只有它不够**，
+  见下一条。
+- **醒了之后、起跑之前**（9/17 实锤，整夜零交易且零告警）：定时唤醒确实把机器
+  唤到 23:10 了，可没有任何人拿着 sleep assertion，**87 秒后**（23:11:27）就
+  `Idle Sleep` 睡回去 —— 正压在第一个触发点上。4 个触发点全落空，launchd 攒到
+  23:27 一个**只有 2 秒**的 DarkWake 里一起放；DarkWake 下 LaunchServices 起不了
+  GUI app，`open -a Terminal` 返回 0、`.command` 也写了，但窗口从没出现。
+  这个失败**完全静默**：launchd 记 `last exit code = 0`，ops.log 一行都没有，
+  TG 也不会响（listener 压根没起来，没人发告警）。第二天早上才发现。
+  治法两层：`com.chengqiu.autotrade.caffeinate` 这个 agent 在 23:05 就拿住
+  `-imsu` 撑 40 分钟（`-u` 把 DarkWake 提到 FullWake，GUI 才起得来），是主防线；
+  垫片 `launch_in_terminal.sh` 开窗口前再 `caffeinate -u -t 3` 兜一道。
 - **跑起来之后**：`caffeinate -i` 只挡"空闲睡眠"。8/5 夜实测进程照样被睡进去
   8 分 44 秒（alive 心跳报「挂钟跳变 524s」），**正好横跨 09:30 ET 开盘钟**，
   那段时间 SL/TP/EOD watcher 全停、Discord 消息不收（靠重连回补捞回来）。

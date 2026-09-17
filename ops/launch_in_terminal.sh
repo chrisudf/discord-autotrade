@@ -39,4 +39,13 @@ CMD="$CMD_DIR/$(basename "${TARGET%.sh}").command"
 } > "$CMD"
 chmod +x "$CMD"
 
+# [9/18 实锤] 整夜没起来：机器 23:10 被 pmset 唤醒，87 秒后就 'Idle Sleep' 睡回去，
+# 4 个触发点全落空，launchd 攒到 23:27 一个**只有 2 秒**的 DarkWake 里一起放。
+# DarkWake 下 LaunchServices 起不了 GUI app —— open 返回 0（launchd 记 exit 0），
+# .command 也确实写了，但 Terminal 窗口从没出现，ops.log 一行都没有。
+# 所以开窗口前先声明"用户活跃"把机器提到 FullWake；-u 会顺带点亮屏幕，这正是
+# 判断已经 FullWake 的依据。3 秒够走完唤醒转换，且短于 launchd 的 exit timeout。
+# 真正的防线是 caffeinate 那个 agent（install.sh），这里只是最后一道兜底。
+/usr/bin/caffeinate -u -t 3
+
 exec /usr/bin/open -a Terminal "$CMD"

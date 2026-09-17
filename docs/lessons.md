@@ -2153,6 +2153,58 @@ scrolls at 7am.
 
 ---
 
+## 55. A scheduled wake buys you a moment awake, not a window
+
+**Symptom**: the night of 9/17 traded nothing. No listener, no session log, no
+line in `ops.log`, and no Telegram alert — the first anyone knew was the next
+morning. The scheduled wake was configured and it fired: `pmset repeat
+wakeorpoweron ... 23:10:00` woke the machine on time.
+
+**Why non-obvious**: waking is not staying awake. Nothing held a sleep assertion,
+so **87 seconds later** — 23:11:27 — the Mac entered `Idle Sleep`, landing right
+on top of the first of the four launchd triggers. With the machine asleep, the
+remaining three (23:15/20/25) were missed too, and launchd did what it always
+does with missed calendar intervals: it coalesced them and fired once on the next
+wake. That wake, at 23:27:22, was a **DarkWake lasting 2 seconds**.
+
+DarkWake is where this gets expensive. LaunchServices will not bring up a GUI app
+in DarkWake, so `open -a Terminal` could not start the window — but it still
+**returned 0**. The shim wrote its `.command` file, exec'd `open`, and exited
+clean; launchd recorded `last exit code = 0`. Every observable signal said the
+job ran.
+
+The failure was therefore **completely silent in both directions**. Nothing
+errored, and the component that would have alerted — the listener — is the thing
+that never started, so there was no process left alive to notice its own absence.
+The existing defenses all assumed the opposite failure: the mutex (#47) and the
+two pgrep guards exist to stop *two* listeners from running. Nothing watched for
+*zero*.
+
+Redundant triggers do not help here either. The four trigger points were added
+precisely for wake-window redundancy, but redundancy across time only pays off if
+the machine is awake at *some* point in that spread. Four triggers inside one
+sleep collapse to one delayed firing, not four chances.
+
+**Defense**: split the two jobs. The scheduled wake moves to 23:05 and keeps its
+one job — get the machine up. Holding it up is a separate agent,
+`com.chengqiu.autotrade.caffeinate`, firing at 23:05/23:08 with `caffeinate
+-imsu -t 2400`: `-i` blocks the `Idle Sleep` path that actually fired, and `-u`
+promotes DarkWake to FullWake so a GUI app can launch at all. It runs 40 minutes
+and hands off to the `caffeinate -is` that `night_run.sh` already holds for the
+rest of the night. `caffeinate` lives in `/usr/bin` and touches no TCC-protected
+directory, so launchd can exec it directly without the Terminal shim. The shim
+keeps a last-resort `caffeinate -u -t 3` before `open`, for the case where only a
+DarkWake is ever available.
+
+**General form**: a wake schedule and a sleep assertion are different mechanisms
+solving different halves of the problem, and having one makes it easy to believe
+you have both. More generally: when a launcher's success is measured by its own
+exit code, it is measuring whether it *asked*, not whether anything *started*.
+The check that would have caught this is not on the launch path at all — it is a
+separate observer asking, after the window closes, whether the thing is running.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
