@@ -323,7 +323,11 @@ async def _tp_tick():
     global _triggered_this_tick
     _triggered_this_tick = set()  # tick 边界重置（每轮独立判断）
 
-    active = [p for p in position_mgr.get_open_positions() if p["qty_remaining"] > 0]
+    # [9/17] 成本未知的仓位不进止盈阶梯：LADDER 的每一档都是 entry × (1+pct)，
+    # 而 fill 闸门拒绝回填后 avg_entry 是**限价**不是成本（9/16 夜 NVDA 215C）。
+    # 拿限价当成本会让 T1/T2 在错误的价位触发 —— 方向与 SL 那次相反但同样错。
+    active = [p for p in position_mgr.get_open_positions()
+              if p["qty_remaining"] > 0 and not p.get("entry_unconfirmed")]
     positions = [p for p in active if p["category"] in LADDER]
     # 无阶梯仓位（lotto / 0dte）只提醒不卖，见 _alert_no_ladder_winners
     no_ladder = [p for p in active if p["category"] not in LADDER]

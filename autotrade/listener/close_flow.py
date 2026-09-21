@@ -264,7 +264,16 @@ async def handle_close_signal(
         logger.info("[CLOSE] no open positions, ignoring close signal")
         return
 
-    parsed = parse_close(raw, open_symbols)
+    # [9/17] known_symbols = 我们历史上交易过的 symbol。用来分辨"主语是真 ticker
+    # 但我们没持有"（→ 无仓可平）与"只是个大写词"（→ 继续找）。缺了它，
+    # 9/16 夜那条 `closed the rest of SPY … I almost took TSLA calls too`
+    # 会把指令改派给 66 字外的 TSLA。查询失败不拦平仓主链路，退回旧行为。
+    try:
+        known_symbols = positions_db.traded_symbols()
+    except Exception:
+        logger.exception("[CLOSE] traded_symbols 查询失败，退回旧的改派行为")
+        known_symbols = None
+    parsed = parse_close(raw, open_symbols, known_symbols=known_symbols)
     if parsed is None:
         # [9/2] 没写标的的跟进指令（"out half 2.82"）在这里还有一次机会：
         # 同频道当日唯一新开仓 + 喊价对得上 → 绑定后按普通 CLOSE 走完全程。

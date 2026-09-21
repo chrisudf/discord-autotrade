@@ -13,7 +13,13 @@
 
 口径（每一条都是刻意的，改之前先读完）：
 
-1. **成本锚在 `positions.avg_entry_price`，不是 OPEN 事件的 price。**
+0. **成本锚按事件流滚动重建，不读 `positions.avg_entry_price` 快照。**
+   那个字段是**当前值**：同一合约平掉再开（9/16 夜 NVDA 217.5C 开了两次，
+   实成 2.43 / 2.54），早先那条腿会被按后来的成本重新计价 —— 当晚少记 $44。
+   正确做法是顺着 position_events 走：OPEN/ADD_ON 按张数加权，FILL_ADJUST
+   覆盖平均，qty 归零时**重置**（下一次 OPEN 是新的一笔）。
+
+1. **成本锚在成交价，不是 OPEN 事件的挂单限价。**
    OPEN 记的是**挂单限价**，真实成交价由 fill_checker 事后回填成 FILL_ADJUST
    （61 条），avg_entry_price 是被它维护的那个数。拿 OPEN.price 算会系统性
    高估成本（9/10 夜 MSTR：OPEN 2.86 是限价，实成 2.78）。加仓（ADD_ON）
@@ -132,14 +138,34 @@ def exit_legs(events: list, positions: dict,
     """
     per_contract = fee_per_contract() if per_contract is None else per_contract
     out = []
+    # {code: (已持张数, 平均成本)}；qty 归零即重置 —— 下一次 OPEN 是新的一笔。
+    # 读 positions 快照会让 reopen 的早期腿用错成本（见口径 0）。
+    book: dict = {}
     for e in events:
-        if e["event_type"] not in EXIT_TYPES or e["qty_delta"] >= 0:
+        code = e["option_code"]
+        et = e["event_type"]
+        q = e.get("qty_delta") or 0
+        if et in ("OPEN", "ADD_ON") and q > 0:
+            held, avg = book.get(code, (0, 0.0))
+            tot = held + q
+            book[code] = (tot, ((avg * held) + float(e["price"] or 0.0) * q) / tot
+                          if tot else 0.0)
             continue
-        pos = positions.get(e["option_code"])
+        if et == "FILL_ADJUST":
+            held, _ = book.get(code, (0, 0.0))
+            book[code] = (held, float(e["price"] or 0.0))   # 回填的是**平均成本**
+            continue
+        if et not in EXIT_TYPES or q >= 0:
+            continue
+        pos = positions.get(code)
         if not pos:
             continue
-        qty = -e["qty_delta"]
-        entry = float(pos["avg_entry_price"] or 0.0)
+        qty = -q
+        held, avg = book.get(code, (0, 0.0))
+        # 回放不到开仓（查询区间起点晚于开仓）时退回快照，总比没有强
+        entry = float(avg if avg else (pos["avg_entry_price"] or 0.0))
+        left = max(0, held - qty)
+        book[code] = (left, avg if left else 0.0)
         price = float(e["price"] or 0.0)          # EXPIRE 的 NULL → 0，真归零
         cost = entry * qty * CONTRACT_MULTIPLIER
         # 归日：过期用**合约到期日**，其余用成交时间戳（见口径 2 / 3）

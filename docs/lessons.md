@@ -2019,6 +2019,192 @@ guards sharing a return type will quietly acquire each other's semantics.
 
 ---
 
+## 52. A whitelist that disambiguates will also quietly reassign
+
+**Symptom**: the caller wrote
+
+```
+closed the rest of SPY 2.62, flat trade and boring.
+I almost took TSLA calls too but didn't want to be too crazy before FOMC 😂
+```
+
+and the system sold TSLA — a position the sentence explicitly says he did **not**
+take. The quoted 2.62 was SPY's exit price, and it was used to price the TSLA
+sell order. The Chinese twin of the same message behaved correctly, reporting
+`symbols=['SPY'] 不在当前持仓 —— 无仓可平，跳过`.
+
+**Why non-obvious**: `_extract_symbols` filters bare `[A-Z]{2,5}` candidates
+through `open_symbols`, and that filter exists for one clearly-stated reason —
+disambiguation. `BARE_SYM_PATTERN` matches any uppercase word, so "NOW" is both
+an adverb and ServiceNow, and holding the position is what tells them apart. That
+reasoning is sound and is written down next to the code.
+
+What is not written down is the second behaviour the same line produces. A
+candidate that fails the filter is *skipped*, and the scan **continues**. So when
+the sentence's actual subject is a ticker we do not hold, the loop walks past it
+and binds the instruction to the next ticker that we do — and "we hold it" is
+exactly the property that makes the mistake expensive. The filter cannot tell
+"SPY is a real ticker we happen to be flat" from "BOOM is just a word": both are
+simply *not in the set*, and both get skipped identically.
+
+The distance instrument from #49 flagged this one on its first night
+(`{'TSLA': 66}`, the only verdict over threshold out of eight), which is what
+made it findable — but distance is the symptom. Two verdicts share it for
+different reasons, and the same night's `NVDA BOOM, OUT 80%` shows why distance
+alone cannot be the rule: `BOOM` sits closer to the verb than `NVDA` does.
+
+**Defense**: a third input, `known_symbols` — every symbol we have ever traded,
+passed in from the caller exactly like `open_symbols`, keeping the parser free of
+DB access. It separates the two cases the old filter could not: SPY is in it,
+BOOM and FOMC are not. The rule is then simply stated: **if the scan reaches a
+real ticker we do not hold before it reaches one we do, the instruction is about
+that ticker, and the answer is "no position to close"** — never "find another
+ticker." Omitting `known_symbols` reproduces the old behaviour verbatim, so
+replay scripts and diag keep working without inventing evidence they lack.
+
+**General form**: a filter placed to answer one question will answer a second one
+by omission. `if x in whitelist: keep` also silently encodes *what happens to
+everything else* — here, "keep looking," which turned a lookup into a
+reassignment. When the fallthrough has consequences, make it a branch and name it.
+
+---
+
+## 53. Refusing a bad value is not the same as knowing the right one
+
+**Symptom**: NVDA 215C, bought on a limit of 2.70, actually filled at **1.01**.
+The fill-price gate from #26 judged 1.01 too far from the limit and refused to
+backfill `avg_entry`, which therefore stayed at 2.70 — the limit. Five seconds
+after the order, before the fill report even arrived, the SL watcher read
+`last=0.99` against a cost of 2.70, computed -63%, and closed all four contracts
+at 0.91.
+
+Real loss: about **-$40**. Recorded loss: **-$724**. The stop should never have
+fired at all.
+
+**Why non-obvious**: the gate is correct and was correct here in the only sense it
+claims — it is designed for a broker returning a price that never existed (8/20:
+limit 2.97, report 0.13), and refusing is the right response to a value you
+cannot trust. The comment above it says exactly that, and says why it keeps the
+limit: "DB 里留着限价（偏高但量级正确），好过写进一个把成本基准打穿的垃圾值."
+
+That reasoning compares a refused value against a *wrong* value. It does not
+consider the third state the refusal actually creates: **unknown**. Downstream
+there is no such state — `avg_entry` is a float, every consumer reads it as cost,
+and a limit price is a perfectly plausible-looking float. So "we decline to say
+what this cost" is stored as "this cost exactly what we bid," and the SL
+threshold, the TP ladder, the ratchet floor and the P&L ledger all quietly build
+on a number nobody paid.
+
+The timing is what makes it fire rather than merely lurk: the fill report arrives
+seconds *after* the position is live, so there is always a window in which
+`avg_entry` is the limit — the refusal simply makes that window permanent. And
+the two numbers that agreed with each other, `last=0.99` and `dealt_avg=1.01`,
+were both on the side the gate rejected.
+
+**Defense**: an explicit `entry_unconfirmed` flag set when the backfill is
+refused. While it is set, every cost-derived decision stands down — SL
+thresholds, the TP ladder, the ratchet — while the paths that do not depend on
+cost keep working (EOD force-close, caller close instructions), because those are
+what still protect the position. The alert now says which decisions are suspended
+rather than just reporting the deviation.
+
+**General form**: a validator produces three outcomes, not two — good, bad, and
+*unknown* — and the third is only real if the type system or the schema can hold
+it. When rejection leaves the previous value in place, every reader downstream is
+told a confident lie. Decide where "we don't know" is stored before deciding what
+to reject.
+
+---
+
+## 54. An instrument that drowns the log has stopped being an instrument
+
+**Symptom**: swing observe-mode shipped on 9/16 and worked — 11 contracts priced,
+5 "would have stopped" alerts, the first price series this system has ever had for
+naked positions. It also wrote **15,332 of the night's 16,624 log lines (92%)**,
+taking the raw log from ~70 KB to **2.17 MB**.
+
+**Why non-obvious**: this file already carries two lessons pointing straight at
+it. #33 is that an alert with no possible action trains you to ignore the alert
+that has one, and the 8/13 postmortem records a 1.09 MB log produced by a reject
+loop — with the explicit note that the review process has to read these. Knowing
+both, the same shape was reproduced the very next day, because it did not arrive
+as an alert or a bug: it arrived as **data collection**, which felt like a
+different category of thing.
+
+The tell was available before shipping: one line per position per 5s tick is
+arithmetic, not a surprise — 8 positions × 8 hours is ~46k lines. Nothing about
+it required a night of production to discover.
+
+The deeper mistake is one of destination. The output is a **price series** — a
+structured artifact whose consumer is a future backtest — and it was written to
+the operational log, whose consumer is a human reading a night's events. Once
+those two share a file, the volume of one sets the legibility of the other, and
+the one that scales with time always wins.
+
+**Defense**: the series goes to `logs/observe_<ET date>.jsonl`, one JSON object
+per sample; the operational log keeps only the "would have stopped" line. Both
+readers get better at once — the night log returns to ~100 KB, and the backtest
+reads records instead of grepping formatted text.
+
+**General form**: before adding a per-tick log line, multiply by the tick rate and
+the position count. And ask who reads the output: if the answer is "a program,
+later," it is data and belongs in a file of its own, not in the log a person
+scrolls at 7am.
+
+---
+
+## 55. A scheduled wake buys you a moment awake, not a window
+
+**Symptom**: the night of 9/17 traded nothing. No listener, no session log, no
+line in `ops.log`, and no Telegram alert — the first anyone knew was the next
+morning. The scheduled wake was configured and it fired: `pmset repeat
+wakeorpoweron ... 23:10:00` woke the machine on time.
+
+**Why non-obvious**: waking is not staying awake. Nothing held a sleep assertion,
+so **87 seconds later** — 23:11:27 — the Mac entered `Idle Sleep`, landing right
+on top of the first of the four launchd triggers. With the machine asleep, the
+remaining three (23:15/20/25) were missed too, and launchd did what it always
+does with missed calendar intervals: it coalesced them and fired once on the next
+wake. That wake, at 23:27:22, was a **DarkWake lasting 2 seconds**.
+
+DarkWake is where this gets expensive. LaunchServices will not bring up a GUI app
+in DarkWake, so `open -a Terminal` could not start the window — but it still
+**returned 0**. The shim wrote its `.command` file, exec'd `open`, and exited
+clean; launchd recorded `last exit code = 0`. Every observable signal said the
+job ran.
+
+The failure was therefore **completely silent in both directions**. Nothing
+errored, and the component that would have alerted — the listener — is the thing
+that never started, so there was no process left alive to notice its own absence.
+The existing defenses all assumed the opposite failure: the mutex (#47) and the
+two pgrep guards exist to stop *two* listeners from running. Nothing watched for
+*zero*.
+
+Redundant triggers do not help here either. The four trigger points were added
+precisely for wake-window redundancy, but redundancy across time only pays off if
+the machine is awake at *some* point in that spread. Four triggers inside one
+sleep collapse to one delayed firing, not four chances.
+
+**Defense**: split the two jobs. The scheduled wake moves to 23:05 and keeps its
+one job — get the machine up. Holding it up is a separate agent,
+`com.chengqiu.autotrade.caffeinate`, firing at 23:05/23:08 with `caffeinate
+-imsu -t 2400`: `-i` blocks the `Idle Sleep` path that actually fired, and `-u`
+promotes DarkWake to FullWake so a GUI app can launch at all. It runs 40 minutes
+and hands off to the `caffeinate -is` that `night_run.sh` already holds for the
+rest of the night. `caffeinate` lives in `/usr/bin` and touches no TCC-protected
+directory, so launchd can exec it directly without the Terminal shim. The shim
+keeps a last-resort `caffeinate -u -t 3` before `open`, for the case where only a
+DarkWake is ever available.
+
+**General form**: a wake schedule and a sleep assertion are different mechanisms
+solving different halves of the problem, and having one makes it easy to believe
+you have both. More generally: when a launcher's success is measured by its own
+exit code, it is measuring whether it *asked*, not whether anything *started*.
+The check that would have caught this is not on the launch path at all — it is a
+separate observer asking, after the window closes, whether the thing is running.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -2547,6 +2733,9 @@ downside is priced in dollars.
 | 49 | 评论与指令的差别在**距离**不在词表；照着唯一样本打的补丁比不打更糟 | 尚无自动回归 —— 刻意的：本条的结论是"先装仪器再定阈值"（同 #48），阈值定下来之前没有可断言的行为。**证据**：9/14 IREN + 9/15 SPY 两条误平原文；16 条含「锁定」的历史语料全量重放（只有 1 条判定变化，证明单词补丁过窄）；真指令动词↔ticker 距离 3/6/11/14 字 vs 误平 37/~60 字。**落地时必须先加语料行再改行为**（corpus 铁律 2）|
 | 50 | 保护与否取决于喊单员那句话写没写止损价 —— 那不是策略 | 无自动回归（这是**未决的钱路**，不是缺陷）。防御现状：`policy/positions.py::categorize` 的 `apply_sl=False` for swing + `open_flow::_apply_declared_stop`（#43）。**量化口径**：`ops/pnl.py` 的「未了结」一节按 `apply_sl / manual_stop / eod_force` 三者之一拆有保护/裸奔 —— 9/15 夜是 2 个 $462 有保护 vs 8 个 $4,810 裸奔（91%）。数据缺口：swing 根本不进 SL watcher，没有价格序列可回测 |
 | 51 | 预算耗尽不是异常，而熔断把它和"出事了"共用同一个返回值 | 无自动回归（改它等于改风控口径，需拍板）。现状在 `risk.py` 的两处 `block_rest_of_day=True`：`MAX_DAILY_ORDERS`（异常，该停）与 `MAX_DAILY_COST`（预算用完，不该停）。**证据**：9/10 / 9/14 / 9/15 连续三晚触发，撞线时间逐日变晚（02:35 ET），说明是稳定消耗而非少数离群单 |
+| 52 | 用来消歧的白名单，会顺带把指令**改派**给名单内的标的 | `test_overnight_0917.py::test_last_nights_close_no_longer_reassigns_to_a_held_ticker`（契约翻转：当晚原文逐字，前身返回 CLOSE ['TSLA']）、`::test_it_still_closes_when_the_subject_is_actually_held`（主语持有时照常平）。**反向护栏**：`::test_real_instructions_are_untouched`（5 条，含 `NVDA BOOM, OUT 80%` —— BOOM 比 NVDA 更靠近动词，证明判据必须是 known_symbols 而不是距离；以及 `$` 前缀路径不受影响）。**不变量**：`::test_without_known_symbols_behaviour_is_unchanged`（回放/diag 不传证据时逐字退回旧行为）|
+| 53 | 拒绝一个坏值 ≠ 知道正确值；"未知"必须有地方存 | `test_overnight_0917.py::test_cost_unknown_position_is_skipped_by_sl`（当晚 NVDA 215C 形状：avg_entry=限价 2.70、last=0.99，必须一动不动）、`::test_cost_unknown_position_is_out_of_the_tp_ladder`（消费端第二处，缺了它 TP 会在错误价位触发）。**反向不变量**：`::test_confirmed_position_still_stops_normally`（成本已确认的照常止损 —— 改的是"成本未知"这一种）。写入点：`fill_checker` 拒绝回填时调 `positions_db.mark_entry_unconfirmed` |
+| 54 | 淹掉日志的仪器已经不是仪器了（上线前先乘一下 tick 率 × 仓位数）| 无自动回归（日志量是运行期属性）。防御：`sl_watcher._append_observe_row` 写 `logs/observe_<ET日期>.jsonl`，操作日志只留"本会触发止损"那一条。**验证方法**：跑一夜后 `wc -l` 原始日志应回到 ~1000 行量级，`wc -l logs/observe_*.jsonl` 才是序列长度 |
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |
