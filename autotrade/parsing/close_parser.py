@@ -943,6 +943,20 @@ def _extract_strike_hint(scope: str, symbols: list, full_text: str = "") -> tupl
     return (strike, side)
 
 
+# [9/18 回归] 「主语不在持仓就不改派」那条规则（#52）有个反噬：判据是
+# known_symbols = 我们**交易过**的 symbol，而里面混着若干同时是常用英文词的
+# ticker —— 我们买过 ServiceNow，于是 `ALL OUT NOW, 100% BANGER` 里的副词
+# `NOW` 被当成"真 ticker 但不在持仓"，整条平仓指令被丢掉。
+# 这正是 open_symbols 白名单存在的那个歧义（见模块顶部「NOW 既是副词也是
+# ServiceNow」）—— 修复把它本要消除的东西复活了一次。
+#
+# 复用既有的 _OUT_BARE_SYM_STOPWORDS，不另造一张表：两处要挡的是同一批词。
+# 对这些词**只是不认领主语**，扫描照常继续 —— 退回改动前的行为，不是更差。
+# 代价：`CLOSING BE` 这类真指令也不认领主语了；但实测那种消息里通常压根没有
+# 可改派的持仓标的，落到"什么都没抽到"，与改动前同一个结局。
+_AMBIGUOUS_BARE = frozenset(_OUT_BARE_SYM_STOPWORDS.split("|"))
+
+
 def _extract_symbols(text: str, open_symbols: set[str],
                      known_symbols: "set | None" = None) -> list[str]:
     """抽 symbol。优先 $SYMBOL；只有完全没有 $ 标记时才 fallback 到裸 SYMBOL。
@@ -1000,7 +1014,8 @@ def _extract_symbols(text: str, open_symbols: set[str],
             if s in open_symbols:
                 found.append(s)
                 seen.add(s)
-            elif known_symbols and s in known_symbols and not found:
+            elif (known_symbols and s in known_symbols and not found
+                  and s not in _AMBIGUOUS_BARE):
                 # 主语是真 ticker 但我们没持有 —— 停在这里，别改派
                 logger.info(
                     f"[close_parser] 指令主语 {s} 是已知 ticker 但不在持仓 "

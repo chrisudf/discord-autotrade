@@ -110,6 +110,12 @@ async def confirm_buy_fill(order_id: str, option_code: str, qty: int, limit_pric
                 f"[fill] buy {option_code} filled dealt_avg={dealt:.2f} "
                 f"(limit {limit_price:.2f}) order={order_id}"
             )
+            # [9/22] 成交已确认 → 解除"成本未知"。**必须覆盖"dealt 正好等于
+            # 限价"那条路径** —— 那条不走 adjust_entry_price，漏了它标记会永远
+            # 挂着，SL/TP 从此不再看护该仓位（比原 bug 更糟）。
+            # 拒绝回填的分支在下面 return 前不清除，保持置位。
+            if dealt > 0:
+                positions_db.clear_entry_unconfirmed(option_code)
             if dealt > 0 and abs(dealt - limit_price) > 1e-9:
                 lo = limit_price * _DEALT_MIN_RATIO
                 hi = limit_price * _DEALT_MAX_RATIO
@@ -123,6 +129,8 @@ async def confirm_buy_fill(order_id: str, option_code: str, qty: int, limit_pric
                     )
                     # [9/17] 拒绝回填 ≠ 限价就是成本。打标记让 SL/TP 停手，
                     # 否则会拿一个我们没付过的价去算止损（9/16 夜 NVDA 215C）。
+                    # 上面刚 clear 过（dealt>0），这里重新置位：闸门拒绝 =
+                    # 成本仍然未知，且这次是**永久**未知，要人工核。
                     positions_db.mark_entry_unconfirmed(
                         option_code, why=f"dealt={dealt:.2f} vs limit={limit_price:.2f}")
                     await send_telegram(format_error(

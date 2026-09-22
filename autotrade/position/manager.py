@@ -109,6 +109,23 @@ def on_order_filled(
         msg_id=str(msg_id),
     )
 
+    # [9/22] 开仓即"成本未知"：这里的 fill_price 是 broker 的**挂单限价**，
+    # 不是成交价。真实成交由 fill_checker 事后回填（实测晚 12-15 秒），而 SL
+    # 每 5 秒扫一次 —— **每一笔单都要穿过这个窗口**。
+    #
+    # 9/22 夜 RKLB 71C：00:41:03 开仓记 2.81（限价）→ 00:41:06 SL 按 2.81 算出
+    # -45% 把 4 张全平在 1.42 → 00:41:18 回填才说真实成交是 **1.51**。
+    # 9/16 夜 NVDA 215C 同一形状（限价 2.70 / 实成 1.01 / 幻觉亏损 $680）。
+    # 当时只把它当成"闸门拒绝回填"的特例修了（lesson #53），**把特例当成了通例**
+    # —— 拒绝回填只是让这个窗口变成永久，窗口本身每次开仓都存在。
+    #
+    # 标记打在这一层而不是 positions_db：只有这里知道传进去的是限价。
+    # 代价是开仓后约 15 秒 SL 不保护 —— 可以接受，那 15 秒里我们连成本都不知道，
+    # "保护"本来就是负的（上面两次都是它主动造成的亏损）。
+    # EOD / 喊单员平仓 / 声明止损的绝对价比较都不依赖成本，不受影响。
+    positions_db.mark_entry_unconfirmed(
+        option_code, why=f"开仓价 {fill_price:.2f} 是限价，等 fill 回填")
+
     logger.info(
         f"[position_mgr] OPEN {option_code} qty={qty} avg={fill_price:.2f} "
         f"category={category} apply_sl={apply_sl} eod={eod_force} tags={tags}"

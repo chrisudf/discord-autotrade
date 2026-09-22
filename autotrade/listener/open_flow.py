@@ -74,6 +74,26 @@ def _apply_declared_stop(raw: str, option_code: str, entry: float) -> None:
         target = entry if stop == STOP_AT_BREAKEVEN else float(stop)
         if target <= 0:
             return
+        # [9/22] **开仓那一刻**，高于成本的"止损"不是止损，是一张即时卖单。
+        #
+        # 喊单员的止损锚在**他自己**的入场上。我们的成交经常明显更好（分档
+        # 滑点 + 1-3 秒时间差），于是他的数字会落在我们成本之上。
+        # 9/22 夜 RKLB 71C：他喊 "$2.60, STOP LOSS AT $2.20"，我们成交在 1.51 ——
+        # 2.20 比成本高 46%，阈值 2.20/(1-8%)=2.39，价格从一开始就在它下面，
+        # 开仓 35 秒就被"止损"平掉（-$36）。
+        #
+        # **这条检查只能放在开仓路径**，不能放进 set_manual_stop：
+        # 后续把止损往上移到成本之上是**移动止损锁利润**，完全合法 ——
+        # 喊单员每日提醒原话 "SET A TRAILING STOP AROUND OR ABOVE ENTRY AFTER
+        # PARTIAL EXIT"，test_overnight_0909::test_manual_stop_only_ever_ratchets_up
+        # 钉的就是那条。区别在**时机**不在数值：刚买完时价格还贴着成本，
+        # 高于成本的底就是立刻触发；涨上去之后同一个数字是锁利润。
+        if entry > 0 and target > entry:
+            logger.warning(
+                f"[OPEN] 拒绝录入开仓自带止损 {option_code}: 声明 ${target:.2f} "
+                f"高于我方成交 ${entry:.2f}（高 {(target/entry-1)*100:.0f}%）—— "
+                f"那不是止损，是即时卖单。该仓位按类目的常规保护走")
+            return
         if positions_db.set_manual_stop(option_code, target):
             logger.info(
                 f"[OPEN] 开仓喊话自带止损已记录 {option_code}: "

@@ -2205,6 +2205,90 @@ separate observer asking, after the window closes, whether the thing is running.
 
 ---
 
+## 56. Fixing the case you saw, when what you saw was the permanent version of a window everyone passes through
+
+**Symptom**: RKLB 71C, 9/22. Opened 00:41:03 at a limit of 2.81; the stop fired at
+00:41:06 against `entry=2.81`; the fill report arrived at 00:41:18 saying the real
+fill was **1.51**. Bought at 1.51, sold at 1.42, position dead 35 seconds after it
+opened.
+
+This is the same shape as NVDA 215C six nights earlier, which produced lesson #53
+and a fix — `entry_unconfirmed`, set when the fill-price gate **refuses** to
+backfill. That fix did not fire here, because nothing was refused: 1.51 sat
+comfortably inside the gate's `[1.41, 2.95]` window and was accepted normally.
+
+**Why non-obvious**: the two incidents look like one bug with a shared cause, and
+the first postmortem named that cause correctly — "downstream treats the limit
+price as cost." Where it went wrong was scope. The refusal was the *visible* part,
+so the fix attached itself there, and the write-up read as complete because the
+one observed incident was fully explained.
+
+But the refusal is not what creates the exposure. `on_order_filled` records the
+**limit** as `avg_entry` on every single order, and the fill report arrives 12-15
+seconds later while the SL watcher polls every 5. **Every position passes through
+a window in which its recorded cost is a price we did not pay.** A refused backfill
+merely makes that window permanent — it is the rare, loud version of a condition
+that is universal and silent.
+
+So the first fix covered the tail and left the body. It even looked validated: the
+night after shipping it, `entry_unconfirmed` fired zero times and that read as "no
+occurrences," when it actually meant "the guard is watching a door almost nobody
+uses."
+
+**Defense**: the flag is now set at `on_order_filled` — the only layer that knows
+`fill_price` is a limit — and cleared when the fill is confirmed, including the
+path where `dealt == limit` exactly (that branch skips `adjust_entry_price`, so
+forgetting it would leave the flag stuck on forever, which is worse than the
+original bug). SL and TP stand down for those ~15 seconds. That is the right
+trade: during that window we do not know the cost, so the "protection" was
+negative — it caused both incidents rather than preventing anything.
+
+**General form**: when a bug arrives through an unusual path, ask whether the
+unusual part is the cause or just what made it visible. A condition that is
+permanent in the rare case is often intermittent in the common one, and a fix
+aimed at the rare case will report zero hits while the common one keeps firing.
+
+---
+
+## 57. The same number means opposite things before and after the position moves
+
+**Symptom**: the caller alerts `RKLB - $71 CALLS ... $2.60, STOP LOSS AT $2.20`.
+We fill at **1.51**. The declared stop is recorded, the threshold computes to
+`2.20 / (1 - 8%) = 2.39`, and the price is under it from the first tick — so the
+"stop" sells immediately. Not a stop at all: a market order with extra steps.
+
+**Why non-obvious**: the stop is correct — for him. He entered at 2.60 and 2.20 is
+a sensible floor. Our fill was 42% better, which is the system working as intended
+(tiered slippage plus a 1-3 second edge), and the better our fill, the more of his
+stops land *above* our cost. The feature punishes its own success.
+
+The first fix attempt put the check in `set_manual_stop`, the single chokepoint
+where every declared stop is written, and an existing test immediately failed:
+`test_manual_stop_only_ever_ratchets_up` asserts that a stop of 3.60 against an
+entry of 3.20 is accepted. That test is right. Raising a stop above entry is a
+**trailing stop that locks in profit** — the channel's own daily reminder says
+"SET A TRAILING STOP AROUND OR ABOVE ENTRY AFTER PARTIAL EXIT," and doing it is
+the point.
+
+So `stop > entry` is simultaneously the signature of a broken stop and of a good
+one. The two are indistinguishable in the values; what separates them is **when
+the number arrives**. Just after filling, the price is still next to our cost, so a
+floor above it triggers instantly. Once the position has run, the same number is
+profit protection.
+
+**Defense**: the check lives only on the opening path
+(`open_flow._apply_declared_stop`), never in `set_manual_stop`. A stop above our
+fill that arrives *with the entry signal* is refused and logged; the same stop
+arriving later is recorded as before. The position falls back to its category's
+normal protection rather than being sold on arrival.
+
+**General form**: before validating a value, ask whether the same value is valid at
+a different moment. When it is, the rule belongs at the entry point that carries
+the timing, not at the shared write path that has lost it — and a chokepoint that
+serves several callers is exactly where that context has already been discarded.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -2736,6 +2820,8 @@ downside is priced in dollars.
 | 52 | 用来消歧的白名单，会顺带把指令**改派**给名单内的标的 | `test_overnight_0917.py::test_last_nights_close_no_longer_reassigns_to_a_held_ticker`（契约翻转：当晚原文逐字，前身返回 CLOSE ['TSLA']）、`::test_it_still_closes_when_the_subject_is_actually_held`（主语持有时照常平）。**反向护栏**：`::test_real_instructions_are_untouched`（5 条，含 `NVDA BOOM, OUT 80%` —— BOOM 比 NVDA 更靠近动词，证明判据必须是 known_symbols 而不是距离；以及 `$` 前缀路径不受影响）。**不变量**：`::test_without_known_symbols_behaviour_is_unchanged`（回放/diag 不传证据时逐字退回旧行为）|
 | 53 | 拒绝一个坏值 ≠ 知道正确值；"未知"必须有地方存 | `test_overnight_0917.py::test_cost_unknown_position_is_skipped_by_sl`（当晚 NVDA 215C 形状：avg_entry=限价 2.70、last=0.99，必须一动不动）、`::test_cost_unknown_position_is_out_of_the_tp_ladder`（消费端第二处，缺了它 TP 会在错误价位触发）。**反向不变量**：`::test_confirmed_position_still_stops_normally`（成本已确认的照常止损 —— 改的是"成本未知"这一种）。写入点：`fill_checker` 拒绝回填时调 `positions_db.mark_entry_unconfirmed` |
 | 54 | 淹掉日志的仪器已经不是仪器了（上线前先乘一下 tick 率 × 仓位数）| 无自动回归（日志量是运行期属性）。防御：`sl_watcher._append_observe_row` 写 `logs/observe_<ET日期>.jsonl`，操作日志只留"本会触发止损"那一条。**验证方法**：跑一夜后 `wc -l` 原始日志应回到 ~1000 行量级，`wc -l logs/observe_*.jsonl` 才是序列长度 |
+| 56 | 你看见的那次，可能只是人人都要穿过的那个窗口的"永久版" | `test_overnight_0922.py::test_sl_stands_down_between_open_and_fill_adjust`（契约翻转：当晚 RKLB 在这个窗口里被按限价止损）、`::test_open_marks_cost_unknown_then_fill_clears_it`（标记在 on_order_filled 置位、fill 确认后清除）。**易漏点**：`dealt == limit` 那条路径不走 `adjust_entry_price`，漏了它标记会永久挂着 —— 比原 bug 更糟，`fill_checker` 里 `if dealt > 0: clear` 专管这条 |
+| 57 | 同一个数字在建仓前后含义相反（止损 vs 移动止损锁利润）| `test_overnight_0922.py::test_declared_stop_above_our_fill_is_refused`（当晚原文：他喊 2.20、我们成交 1.51）、`::test_declared_stop_below_our_fill_is_recorded`（正常止损照收）。**反向不变量**：`::test_trailing_stop_above_entry_is_still_allowed_later` 与既有 `test_overnight_0909::test_manual_stop_only_ever_ratchets_up` —— 检查只能在开仓路径，放进 `set_manual_stop` 会拦掉合法的移动止损（第一版就是这么写的，被那条既有用例当场拦下）|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |

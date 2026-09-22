@@ -331,15 +331,18 @@ async def handle_close_signal(
         dists = verb_symbol_distance(raw, targets)
         far = {k: v for k, v in dists.items()
                if v is not None and v > _FAR_BIND_CHARS}
+        # [9/22] **降级为只记日志，不再发 TG。**
+        # 上线时它的任务是当探照灯，而它完成了：9/16 夜那条 TSLA 误平
+        # （`{'TSLA': 66}`，8 次判定里唯一超阈值的）就是靠它找到的。
+        # 但根因查明后是**改派**不是距离（lesson #52），改派堵死之后它的战绩
+        # 变成 0 真阳 / 2 假阳：
+        #     9/18  AMD just broke $545 … trim here at 6.60      → 46 字，真指令
+        #     9/22  META LOTTOS ROUND 1 ALL OUT                  → 24 字，真指令
+        # 两条都是"ticker 在句首、动词在句尾"的正常语序。继续发 TG 就是在
+        # 训练人忽略这个通道（lesson #33）。日志字段保留 —— 它仍是异常判定的
+        # 第一手线索，只是不该再打扰人。
         logger.info(f"[CLOSE] 动词↔ticker 距离: {dists}"
                     + ("  ⚠️ 超阈值（仅记录，照常执行）" if far else ""))
-        if far:
-            await _safe_notify(format_close_skipped(
-                f"⚠️ 远距离绑定（**已照常执行**，仅供观察）：{far}\n"
-                f"真指令实测 3-16 字；9/14 IREN 误平 37 字、9/15 SPY 误平 71 字。\n"
-                f"若这条确实不是平仓指令，请留着这条 TG —— 它是将来定阈值的语料。",
-                raw,
-            ))
     except Exception:
         logger.exception("[CLOSE] 距离仪器失败（不影响平仓主链路）")
 
