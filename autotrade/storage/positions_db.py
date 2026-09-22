@@ -359,6 +359,18 @@ def record_close(
 
 # ============ 查询 ============
 
+def clear_entry_unconfirmed(option_code: str) -> bool:
+    """成交价已确认 → 解除"成本未知"，SL/TP 恢复看护。"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "UPDATE positions SET entry_unconfirmed = 0 WHERE option_code = ? "
+            "AND entry_unconfirmed = 1", (option_code,))
+        ok = cur.rowcount > 0
+    if ok:
+        logger.info(f"[positions] {option_code} 成本已确认，恢复 SL/TP 看护")
+    return ok
+
+
 def mark_entry_unconfirmed(option_code: str, why: str = "") -> bool:
     """标记"这个仓位的成本我们并不知道"。
 
