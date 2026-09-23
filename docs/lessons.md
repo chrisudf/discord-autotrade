@@ -2289,6 +2289,76 @@ serves several callers is exactly where that context has already been discarded.
 
 ---
 
+## 58. A flag cleared by an event is only as reliable as whoever is waiting for that event
+
+**Symptom**: MU 1105C 1DTE, 9/22 ET. Opened 05:01 at a limit of 7.88 and flagged
+`entry_unconfirmed` (#56). The fill checker polled for 180 seconds, sent "buy timed
+out", and returned. The order filled some time between 05:11 and 06:11 — the
+reconciler's hourly pass stopped reporting it as db_only. Nobody was waiting any
+more, so the flag was never cleared: the SL watcher logged skipping it 114 times
+that night and 303 times the next day, the caller's declared stop at 6.50
+included. The caller's two partial exits arrived before the fill and were refused
+as naked shorts. The next day EOD got no quote until 15:52 ET and force-closed 4
+contracts at 0.01 — close to the whole premium, up to ~$3,150 (simulated; the fill
+price is still unknown, ≤ 7.88).
+
+**Why non-obvious**: #56 checked the clearing path carefully, down to the
+`dealt == limit` branch that skips `adjust_entry_price`. What it never checked was
+whether the clearing path *runs*. The fill checker had always given up at 180
+seconds, and before #56 that was harmless: giving up left the limit as
+`avg_entry`, and for a buy the limit is an upper bound on cost — wrong, but with a
+bounded error. After #56 the same give-up leaves "cost unknown", which the SL reads
+as "do not protect". A bounded error became an unbounded one, and nothing in the
+diff touched the timeout. The change was in what the timeout *meant*.
+
+**Defense**: after the timeout alert the checker keeps polling (60 s, up to 6.5 h);
+a late fill goes through the normal backfill path — clear the flag, reprice, check
+the declared stop (#59) — plus a TG saying the timeout alert is void.
+**Still open**: the confirm task lives only in memory, so a process restart while
+an order is pending strands the flag the same way.
+
+**General form**: when you add state that one event sets and another clears, trace
+the clearing event to whoever observes it and list every way that observer can
+stop — timeouts, give-ups, crashes, restarts. And review changes for altered
+*meaning*, not only altered lines: an untouched timeout can become a different
+failure when the state it leaves behind changes.
+
+---
+
+## 59. A test that hands the function a value production does not have yet
+
+**Symptom**: GILD, 9/22 ET. `GILD - $152.5 CALLS NEXT WEEK $3.00, STOP LOSS AT
+$2.50` was parsed as this week's contract (a separate bug) and bought as an add-on
+at a limit of 3.15. #57's check — refuse a declared stop above our fill — compared
+2.50 with 3.15 and let it through. The fill came back at 1.92 (where this week's
+contract actually traded), the average dropped to 1.88, and 3 seconds later the SL
+sold all 8 contracts at 1.77, the 4 from the earlier entry included.
+
+**Why non-obvious**: #57's test was built from the incident's own numbers. It called
+`_apply_declared_stop(raw, code, 1.51)` — 1.51 being RKLB's real fill — and asserted
+the stop was refused. Green. But the production call site passes
+`order_result["price"]`, the limit, because at that moment the fill report does not
+exist; it arrives 12-15 s later. Replaying RKLB itself with the production input
+(limit 2.81, stop 2.20) passes the check. The test proved the rule was right and
+said nothing about whether the rule ever sees the right number. #57's own general
+form was "the rule belongs where the timing is" — and the fix sat one step before
+the number it needed.
+
+**Defense**: the comparison also runs at backfill in `fill_checker`: once the real
+average is known, a declared stop above it is cleared and reported. There is no
+`await` between clearing `entry_unconfirmed` and clearing the stop, so the SL
+watcher can never see "cost confirmed, stop above cost". The open-path check stays
+(it still catches stops above the limit). The new tests drive the production
+order: open at the limit → record the stop → confirm the fill.
+**Known edge**: a breakeven stop recorded before a *late* fill anchors on the limit,
+so it will be dropped at backfill. Rare; not handled.
+
+**General form**: when a test's inputs come from the post-mortem, check which of
+those numbers the code could actually have seen at that moment. Post-mortems are
+written with the final state in hand; the code runs in the middle of the timeline.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -2822,6 +2892,8 @@ downside is priced in dollars.
 | 54 | 淹掉日志的仪器已经不是仪器了（上线前先乘一下 tick 率 × 仓位数）| 无自动回归（日志量是运行期属性）。防御：`sl_watcher._append_observe_row` 写 `logs/observe_<ET日期>.jsonl`，操作日志只留"本会触发止损"那一条。**验证方法**：跑一夜后 `wc -l` 原始日志应回到 ~1000 行量级，`wc -l logs/observe_*.jsonl` 才是序列长度 |
 | 56 | 你看见的那次，可能只是人人都要穿过的那个窗口的"永久版" | `test_overnight_0922.py::test_sl_stands_down_between_open_and_fill_adjust`（契约翻转：当晚 RKLB 在这个窗口里被按限价止损）、`::test_open_marks_cost_unknown_then_fill_clears_it`（标记在 on_order_filled 置位、fill 确认后清除）。**易漏点**：`dealt == limit` 那条路径不走 `adjust_entry_price`，漏了它标记会永久挂着 —— 比原 bug 更糟，`fill_checker` 里 `if dealt > 0: clear` 专管这条 |
 | 57 | 同一个数字在建仓前后含义相反（止损 vs 移动止损锁利润）| `test_overnight_0922.py::test_declared_stop_above_our_fill_is_refused`（当晚原文：他喊 2.20、我们成交 1.51）、`::test_declared_stop_below_our_fill_is_recorded`（正常止损照收）。**反向不变量**：`::test_trailing_stop_above_entry_is_still_allowed_later` 与既有 `test_overnight_0909::test_manual_stop_only_ever_ratchets_up` —— 检查只能在开仓路径，放进 `set_manual_stop` 会拦掉合法的移动止损（第一版就是这么写的，被那条既有用例当场拦下）|
+| 58 | 靠某个事件清除的标记，可靠程度取决于谁在等那个事件 | `test_overnight_0923.py::test_fill_after_timeout_still_backfills_and_clears_the_flag`（契约翻转：当晚 MU 1105C 形状，超时后才成交）。**不变量**：`::test_still_no_fill_after_late_window_keeps_the_flag`（续查到上限仍无终态 = 仍然不知道，标记与在飞登记都保持，同 #34）。**未覆盖**：确认任务只在内存里，窗口内重启进程标记仍会卡住 |
+| 59 | 测试喂给函数的值，生产在那一刻还没有 | `test_overnight_0923.py::test_open_path_check_cannot_see_the_fill`（钉住现状：生产输入是限价，开仓检查必然放行）、`::test_stop_above_real_fill_is_dropped_on_backfill`（9/22 RKLB 按生产顺序重放）、`::test_gild_addon_replay_no_longer_dumps_all_eight`（端到端：回填 + SL tick 不卖）。**反向**：`::test_stop_below_real_fill_is_kept`。同批普通 bug：`::test_calls_next_week_is_next_friday` / `::test_calls_next_week_in_commentary_does_not_shift`（#42 同族）、`::test_hedged_close_is_not_an_instruction` / `::test_real_close_next_to_a_hedge_still_fires`（EN 侧是 #24 的形状）|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |
