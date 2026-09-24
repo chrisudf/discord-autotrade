@@ -80,6 +80,18 @@ def test_fill_after_timeout_still_backfills_and_clears_the_flag():
     positions_db.record_close(code, 4, 7.5, "manual", note="ut")
 
 
+def test_fill_after_reconciler_closed_the_row_says_so():
+    """MU 1105C 差一小时就是这个形状：对账器两轮落账之后单子才成交，broker 上多出一张没人管的仓。"""
+    code = _open_at_limit(_uniq("MUY"), 7.88)
+    positions_db.record_close(code, 4, 0.0, "broker_sync", note="ut: reconcile auto-close")
+    inflight.mark_submitted(code, "ORD")
+
+    tg = _confirm(code, 4, 7.88, [TIMEOUT, _filled(7.50)])
+
+    assert "DB 已被对账器平掉" in tg.await_args_list[-1].args[0], "不许再说'按正常成交回填'"
+    assert inflight.is_pending(code) is False
+
+
 def test_still_no_fill_after_late_window_keeps_the_flag():
     """续查到上限仍无终态：仍然不知道，标记与在飞登记都保持。"""
     code = _open_at_limit(_uniq("MUX"), 7.88)

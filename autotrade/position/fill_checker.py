@@ -128,10 +128,21 @@ async def confirm_buy_fill(order_id: str, option_code: str, qty: int, limit_pric
                 logger.warning(f"[fill] buy {option_code} 续查到上限仍无终态，order={order_id}")
                 return
             if res["outcome"] == "filled":
+                dealt_late = res.get("filled_avg_price") or 0
+                # 对账器不看在挂的买单，拖够两轮会先把 DB 记成 CLOSED；这时成交出来的是一张没人看护的仓
+                if (positions_db.get(option_code) or {}).get("status") not in ("OPEN", "PARTIAL"):
+                    inflight.clear(option_code, order_id)
+                    logger.error(f"[fill] buy {option_code} 超时后成交 ${dealt_late:.2f}，但 DB 已平 —— broker 上无人看护")
+                    await send_telegram(format_error(
+                        "⚠️ 买单超时后成交，但 DB 已被对账器平掉",
+                        f"{option_code} x{qty} order={order_id} 成交 ${dealt_late:.2f}\n"
+                        f"broker 上现在有这张仓位，SL/TP/EOD 都不管它 —— 请在 moomoo 手动处理"
+                    ))
+                    return
                 await send_telegram(format_error(
                     "买单超时后成交（前一条超时告警作废）",
                     f"{option_code} x{qty} order={order_id} "
-                    f"成交 ${res.get('filled_avg_price') or 0:.2f}，按正常成交回填成本"
+                    f"成交 ${dealt_late:.2f}，按正常成交回填成本"
                 ))
         # [9/2] 在飞登记销账。**只在拿到终态时销** —— timeout 的语义是"仍然
         # 不知道成没成交"，那正是 naked-short 该被豁免的状态（见 broker/inflight）。
