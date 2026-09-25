@@ -19,6 +19,7 @@ DRY_RUN 下 query_order_status 直接返回 FILLED_ALL，任务瞬时完成，�
 环境变量：
 - FILL_POLL_SEC     : 轮询间隔，默认 15 秒
 - FILL_TIMEOUT_SEC  : 超时告警阈值，默认 180 秒
+- FILL_LATE_POLL_SEC / FILL_LATE_TIMEOUT_SEC : 买单超时告警后的低频续查，默认 60 秒 / 6.5 小时
 
 TODO（实测调整）：
 - 卖单超时后可以更进一步：自动撤单 + 更激进限价重挂（当前只告警，人工接管）
@@ -58,15 +59,19 @@ def _cfg() -> dict:
     return {
         "poll": float(os.getenv("FILL_POLL_SEC", "15")),
         "timeout": float(os.getenv("FILL_TIMEOUT_SEC", "180")),
+        "late_poll": float(os.getenv("FILL_LATE_POLL_SEC", "60")),
+        "late_timeout": float(os.getenv("FILL_LATE_TIMEOUT_SEC", "23400")),
     }
 
 
-async def _poll_until_terminal(order_id: str) -> dict:
+async def _poll_until_terminal(order_id: str, late: bool = False) -> dict:
     """轮询到 成交 / 失败终态 / 超时。返回最后一次 status dict + 'outcome' 字段。
 
-    outcome ∈ {"filled", "dead", "timeout"}
+    outcome ∈ {"filled", "dead", "timeout"}；late=True 用超时后的低频续查节奏。
     """
     cfg = _cfg()
+    poll = cfg["late_poll"] if late else cfg["poll"]
+    timeout = cfg["late_timeout"] if late else cfg["timeout"]
     waited = 0.0
     last: dict = {}
     while True:
@@ -76,10 +81,27 @@ async def _poll_until_terminal(order_id: str) -> dict:
             return {**last, "outcome": "filled"}
         if last.get("success") and status in _DEAD_STATUSES:
             return {**last, "outcome": "dead"}
-        if waited >= cfg["timeout"]:
+        if waited >= timeout:
             return {**last, "outcome": "timeout"}
-        await asyncio.sleep(cfg["poll"])
-        waited += cfg["poll"]
+        await asyncio.sleep(poll)
+        waited += poll
+
+
+async def _drop_stop_above_cost(option_code: str) -> None:
+    """回填后声明止损若高于真实成本就作废 —— 开仓那一刻只有限价，比不出来。"""
+    pos = positions_db.get(option_code) or {}
+    stop, avg = pos.get("manual_stop"), pos.get("avg_entry_price") or 0.0
+    if not stop or avg <= 0 or stop <= avg:
+        return
+    # [9/23 GILD] 限价 3.15 时止损 2.50 看着合理，回填成 1.88 后它成了即时卖单，4 秒卖光 8 张
+    positions_db.clear_manual_stop(option_code)
+    logger.warning(
+        f"[fill] {option_code} 声明止损 {stop:.2f} 高于真实成本 {avg:.2f} —— 作废，按类目常规保护走")
+    await send_telegram(format_error(
+        "声明止损高于真实成本，已作废",
+        f"{option_code}\n喊单员止损 ${stop:.2f} / 我方成交均价 ${avg:.2f}\n"
+        f"那不是止损，是即时卖单。该仓位按类目的常规保护走"
+    ))
 
 
 async def confirm_buy_fill(order_id: str, option_code: str, qty: int, limit_price: float):
@@ -92,6 +114,36 @@ async def confirm_buy_fill(order_id: str, option_code: str, qty: int, limit_pric
         return
     try:
         res = await _poll_until_terminal(order_id)
+        if res["outcome"] == "timeout":
+            await send_telegram(format_error(
+                "买单超时未确认成交",
+                f"{option_code} x{qty} order={order_id} "
+                f"status={res.get('status')} filled={res.get('filled_qty', '?')}/{qty}\n"
+                f"继续低频确认中；成交前该仓位成本未知，SL/TP 不看护。\n"
+                f"请核对 moomoo 或跑 scripts/sync_positions.py"
+            ))
+            # [9/23 MU 1105C] 超时后才成交，查询已停 → 成本未知标记永久卡住，SL/TP 整晚停摆
+            res = await _poll_until_terminal(order_id, late=True)
+            if res["outcome"] == "timeout":
+                logger.warning(f"[fill] buy {option_code} 续查到上限仍无终态，order={order_id}")
+                return
+            if res["outcome"] == "filled":
+                dealt_late = res.get("filled_avg_price") or 0
+                # 对账器不看在挂的买单，拖够两轮会先把 DB 记成 CLOSED；这时成交出来的是一张没人看护的仓
+                if (positions_db.get(option_code) or {}).get("status") not in ("OPEN", "PARTIAL"):
+                    inflight.clear(option_code, order_id)
+                    logger.error(f"[fill] buy {option_code} 超时后成交 ${dealt_late:.2f}，但 DB 已平 —— broker 上无人看护")
+                    await send_telegram(format_error(
+                        "⚠️ 买单超时后成交，但 DB 已被对账器平掉",
+                        f"{option_code} x{qty} order={order_id} 成交 ${dealt_late:.2f}\n"
+                        f"broker 上现在有这张仓位，SL/TP/EOD 都不管它 —— 请在 moomoo 手动处理"
+                    ))
+                    return
+                await send_telegram(format_error(
+                    "买单超时后成交（前一条超时告警作废）",
+                    f"{option_code} x{qty} order={order_id} "
+                    f"成交 ${dealt_late:.2f}，按正常成交回填成本"
+                ))
         # [9/2] 在飞登记销账。**只在拿到终态时销** —— timeout 的语义是"仍然
         # 不知道成没成交"，那正是 naked-short 该被豁免的状态（见 broker/inflight）。
         # 9/2 TSLA 就死在这里：超时之后 2 分钟来的平仓信号撞上 broker 的 0 长仓，
@@ -153,6 +205,8 @@ async def confirm_buy_fill(order_id: str, option_code: str, qty: int, limit_pric
                         f"[fill] buy {option_code} dealt_avg={dealt:.2f} "
                         f"(limit {limit_price:.2f}) → avg_entry 已回填"
                     )
+                    # 与上面的 clear_entry_unconfirmed 之间不能有 await，否则 SL 会先看到高于成本的止损
+                    await _drop_stop_above_cost(option_code)
                 else:
                     # [8/18 SPCX] 此前这里是静默 return —— 加仓必然走到这条分支，
                     # 日志里一个字都没有，只能靠"四笔有 FILL_ADJUST、一笔没有"
@@ -171,14 +225,6 @@ async def confirm_buy_fill(order_id: str, option_code: str, qty: int, limit_pric
                 f"DB 已按持仓入账但订单已死 —— 请核对 moomoo，"
                 f"必要时跑 scripts/sync_positions.py 对账"
             ))
-            return
-        await send_telegram(format_error(
-            "买单超时未确认成交",
-            f"{option_code} x{qty} order={order_id} "
-            f"status={res.get('status')} filled={res.get('filled_qty', '?')}/{qty}\n"
-            f"DB 已按持仓入账 —— 若实际未成交，SL/TP 会盯着一个不存在的仓位。\n"
-            f"请核对 moomoo 或跑 scripts/sync_positions.py"
-        ))
     except Exception:
         logger.exception(f"[fill] confirm_buy_fill crashed for {order_id}")
 

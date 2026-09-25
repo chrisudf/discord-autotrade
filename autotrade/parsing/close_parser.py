@@ -696,6 +696,19 @@ ZH_AFTER_CLAUSE_RE = re.compile(
     r"在[^，,。！？\n]{0,12}?(?:减仓|减持|平仓|清仓|卖出|止盈|出清|平掉)[^，,。！？\n]{0,6}?后"
 )
 
+# 对冲语气 "可能/也许/考虑 + 平仓动词" 是在想不是在做。[9/23 AVGO] "我可能会进行平仓" 全平 4 张
+# （EN 原文 "I MIGHT DO A BREAKEVEN CLOSE"）。只抹语气词在动词**前面**的从句，"减仓，可能还会回落" 照常。
+ZH_HEDGE_CLAUSE_RE = re.compile(
+    r"(?:可能|也许|或许|考虑)[^，,。！？\n]{0,6}?"
+    r"(?:减仓|减持|平仓|清仓|全平|卖出|止盈|出清|平掉|砍仓|减半)[^，,。！？\n]*"
+)
+# EN 当晚没触发是词表巧合不是语气判断，"I MIGHT TRIM AVGO HERE" 照样会卖（lesson #24 的形状）。
+EN_HEDGE_CLAUSE_RE = re.compile(
+    r"\b(?:might|maybe|considering|thinking\s+(?:of|about))\b[^,.!?\n]{0,20}?"
+    r"(?:scal(?:e|ing)\s+out|trim\w*|cut\w*|sell\w*|clos\w*|exit\w*|dump\w*)[^,.!?\n]*",
+    re.IGNORECASE,
+)
+
 # === 作者自述"我不平，我拿着" ===
 # 同一条 8/3 SPY 消息的第二道防线：作者明确说自己在持有，这条消息就不是
 # 给跟单方的平仓指令，整条跳过。
@@ -1186,6 +1199,7 @@ def _normalize_en(text: str) -> str:
     text = EN_SUGGESTION_CLAUSE_RE.sub(" ", text)
     text = EN_OPTIONAL_CLAUSE_RE.sub(" ", text)   # 否定条件句抹到句末（8/3 SPY）
     text = EN_AFTER_CLAUSE_RE.sub(" ", text)      # 时间状语从句（8/20 PLTR EN 侧）
+    text = EN_HEDGE_CLAUSE_RE.sub(" ", text)      # 对冲语气（9/23 AVGO EN 侧）
     return text
 
 
@@ -1197,6 +1211,7 @@ def _normalize_zh(text: str) -> str:
     text = ZH_SUGGESTION_CLAUSE_RE.sub(" ", text)    # 建议句（7/29 SPY）
     text = ZH_OPTIONAL_CLAUSE_RE.sub(" ", text)      # 否定条件句（8/3 SPY）
     text = ZH_AFTER_CLAUSE_RE.sub(" ", text)         # 时间状语从句（8/20 PLTR）
+    text = ZH_HEDGE_CLAUSE_RE.sub(" ", text)         # 对冲语气（9/23 AVGO）
     return text
 
 

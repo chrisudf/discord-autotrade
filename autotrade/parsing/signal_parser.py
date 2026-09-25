@@ -249,9 +249,12 @@ def _normalize_bare_ticker(text: str) -> str:
 # 要求 next/this week 紧跟在到期词后面，不认裸的 "next week"：后者在行情评论里
 # 太常见（"我明天也会关注 $PLTR 下行"那条同夜就出现过 "next week" 语境），
 # 裸词会把"持有到下周"的评论也当成到期日声明。ZH 侧只认完整的"下周到期"。
+# [9/23 GILD] \u53e6\u4e00\u79cd\u5199\u6cd5 "CALLS NEXT WEEK $3.00" / "\u770b\u6da8\u671f\u6743\u4e0b\u5468 $3.00"\uff1a\u671f\u6743\u8bcd\u7d27\u8ddf\u4e0b\u5468\u3001
+# \u518d\u7d27\u8ddf $\u4ef7\u683c \u624d\u7b97\uff0c"more calls next week" \u8fd9\u7c7b\u8bc4\u8bba\u591f\u4e0d\u7740\u3002
 _NEXT_WEEK_RE = re.compile(
     r"(?:expiration|expiring|expires|exp\.?)\s+next\s+week"
-    r"|\u4e0b\s*(?:\u4e2a)?\s*\u5468\s*\u5230\u671f",
+    r"|\u4e0b\s*(?:\u4e2a)?\s*\u5468\s*\u5230\u671f"
+    r"|(?:calls?|puts?)\s*(?:next\s+week|\u4e0b\s*(?:\u4e2a)?\s*\u5468)\s*\$",
     re.IGNORECASE,
 )
 

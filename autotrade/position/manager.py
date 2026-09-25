@@ -122,7 +122,7 @@ def on_order_filled(
     # 标记打在这一层而不是 positions_db：只有这里知道传进去的是限价。
     # 代价是开仓后约 15 秒 SL 不保护 —— 可以接受，那 15 秒里我们连成本都不知道，
     # "保护"本来就是负的（上面两次都是它主动造成的亏损）。
-    # EOD / 喊单员平仓 / 声明止损的绝对价比较都不依赖成本，不受影响。
+    # EOD / 喊单员平仓不依赖成本，不受影响；声明止损会一起停手（sl_watcher 整条跳过）。
     positions_db.mark_entry_unconfirmed(
         option_code, why=f"开仓价 {fill_price:.2f} 是限价，等 fill 回填")
 

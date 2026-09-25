@@ -424,6 +424,18 @@ def set_manual_stop(option_code: str, stop_price: float) -> bool:
         return cur.rowcount > 0
 
 
+def clear_manual_stop(option_code: str) -> bool:
+    """作废声明止损。唯一调用方是回填时发现它高于真实成本（fill_checker）。"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "UPDATE positions SET manual_stop = NULL, last_action_at = ? "
+            "WHERE option_code = ? AND status IN ('OPEN','PARTIAL') "
+            "AND manual_stop IS NOT NULL",
+            (_utc_iso(), option_code),
+        )
+        return cur.rowcount > 0
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict:
     d = dict(row)
     d["apply_sl"] = bool(d["apply_sl"])

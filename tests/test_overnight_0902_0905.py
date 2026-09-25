@@ -134,7 +134,7 @@ def test_sell_order_picks_the_deferred_branch_while_buy_in_flight(monkeypatch):
 def _run_confirm(monkeypatch, outcome: dict):
     from autotrade.position import fill_checker
 
-    async def fake_poll(order_id):
+    async def fake_poll(order_id, late=False):
         return outcome
 
     monkeypatch.setattr(fill_checker, "_poll_until_terminal", fake_poll)

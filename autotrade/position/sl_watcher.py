@@ -325,8 +325,8 @@ async def _sl_tick():
         if p.get("entry_unconfirmed"):
             logdedup.log_throttled(
                 f"sl-unconfirmed:{p['option_code']}",
-                f"[sl] 跳过 {p['option_code']}：成本未知（fill 闸门拒绝回填），"
-                f"等人工核对后清除标记", level="WARNING")
+                f"[sl] 跳过 {p['option_code']}：成本未确认（等成交回填，"
+                f"或闸门拒绝后待人工核对）", level="WARNING")
             continue
         if p.get("apply_sl"):
             watch.append((p, cfg["sl_pct"]))
