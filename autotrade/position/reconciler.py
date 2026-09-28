@@ -41,10 +41,10 @@ import asyncio
 import os
 
 from autotrade.broker.common import _is_dry_run
-from autotrade.broker.trade import list_open_option_positions
+from autotrade.broker.trade import list_open_option_positions, query_order_status
 from autotrade.notify.transport import send_telegram
 from autotrade.notify.watchdog import notify_tick_error, notify_tick_ok
-from autotrade.storage import positions_db
+from autotrade.storage import logger_db, positions_db
 from autotrade.utils import logdedup
 from autotrade.utils.envcfg import env_int
 from autotrade.utils.logger import logger
@@ -144,7 +144,22 @@ def _split_by_confirmation(
     return stale_codes & seen, stale_codes - seen
 
 
-def _auto_close(diffs: list[dict], broker_rows: dict[str, int]) -> tuple[list[str], str]:
+# moomoo 里"还可能成交"的状态。只认这几个：陌生状态若也算在挂，仓位会永远落不了账
+_WORKING_STATUSES = {"WAITING_SUBMIT", "SUBMITTING", "SUBMITTED", "FILLED_PART"}
+
+
+async def _buy_order_states(codes: "set[str]") -> "dict[str, dict]":
+    """db_only 代码最近一张买单的状态；orders 表里没有的不在结果里。"""
+    out = {}
+    for code in codes:
+        oid = logger_db.last_buy_order_id(code)
+        if oid:
+            out[code] = await asyncio.to_thread(query_order_status, oid)
+    return out
+
+
+def _auto_close(diffs: list[dict], broker_rows: dict[str, int],
+                never_filled: "set[str] | None" = None) -> tuple[list[str], str]:
     """把确定性 db_only 落账为 CLOSED。返回 (已落账的 code 列表, 说明串)。
 
     单条失败不影响其余（逐条 try）：对账是止血路径，一条写不进去不该让
@@ -189,8 +204,11 @@ def _auto_close(diffs: list[dict], broker_rows: dict[str, int]) -> tuple[list[st
                 # NULL 的语义是"没有成交价"，PnL 统计据此跳过它。
                 option_code=code, qty_sold=d["db_qty"], fill_price=None,
                 trigger_source="broker_sync",
-                note="reconcile auto-close: broker no longer has this position "
-                     "(auto-exercise / expired / manual close)",
+                # pnl 靠这句区分"从未成交（真实盈亏 0）"和"仓位消失（盈亏未知）"
+                note=("reconcile auto-close: buy order never filled"
+                      if code in (never_filled or set()) else
+                      "reconcile auto-close: broker no longer has this position "
+                      "(auto-exercise / expired / manual close)"),
             )
             closed.append(code)
             logger.warning(
@@ -331,6 +349,19 @@ async def _reconcile_tick() -> list[dict]:
     known = positions_db.known_option_codes(extra)
 
     diffs = diff_positions(db_rows, broker_rows, known_codes=known)
+
+    # [9/23] 对账器以前不看在挂的买单：RKLB 72C 下单 4 分钟就被判 db_only，挂够两轮就落账；
+    # 之后才成交的话，broker 上就是一张 SL/TP/EOD 都不管的仓（MU 1105C 差一小时）
+    stale_codes = {d["option_code"] for d in diffs if d["kind"] == KIND_DB_ONLY}
+    states = await _buy_order_states(stale_codes) if stale_codes else {}
+    working = {c for c, s in states.items()
+               if s.get("success") and (s.get("status") or "").upper() in _WORKING_STATUSES}
+    never_filled = {c for c, s in states.items()
+                    if s.get("success") and c not in working and not s.get("filled_qty")}
+    if working:
+        logger.info(f"[reconcile] db_only 但买单仍在挂，不算漂移: {sorted(working)}")
+        diffs = [d for d in diffs
+                 if not (d["kind"] == KIND_DB_ONLY and d["option_code"] in working)]
     if not diffs:
         # 漂移清零 → 重置签名：同样的漂移将来再出现，属于新事件要重新告警
         _last_signature = None
@@ -357,7 +388,7 @@ async def _reconcile_tick() -> list[dict]:
 
     # [0018] 确定性漂移自动落账。放在 TG 节流**之前**：这一轮真的动了 DB，
     # 那就是新事件，不能被"与上一轮签名相同"压掉（8/13 那一夜正是被压掉的）。
-    closed, auto_note = _auto_close(diffs, broker_rows)
+    closed, auto_note = _auto_close(diffs, broker_rows, never_filled)
 
     signature = tuple(sorted(
         (d["kind"], d["option_code"], d["db_qty"], d["broker_qty"]) for d in diffs))

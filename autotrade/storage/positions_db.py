@@ -225,13 +225,14 @@ def open_or_add(
             is_reopen = existing_status == "CLOSED" or existing_remaining == 0
 
             if is_reopen:
+                # manual_stop 属于上一轮：9/18 MU 1000C 第二轮没声明止损，却沿用了第一轮的 2.10
                 conn.execute("""
                     UPDATE positions
                     SET qty_total = ?, qty_remaining = ?, avg_entry_price = ?,
                         category = ?, apply_sl = ?, eod_force_close = ?,
                         tags = ?, channel_name = ?, open_msg_id = ?,
                         opened_at = ?, last_action_at = ?, status = ?,
-                        closed_at = NULL, tp_hits = 0
+                        closed_at = NULL, tp_hits = 0, manual_stop = NULL
                     WHERE option_code = ?
                 """, (
                     qty, qty, fill_price,

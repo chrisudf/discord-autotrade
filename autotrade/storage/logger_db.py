@@ -100,6 +100,17 @@ def processed_msg_ids_since(since: datetime) -> set:
     return {r[0] for r in rows}
 
 
+def last_buy_order_id(option_code: str) -> "str | None":
+    """该合约最近一张提交成功的买单（orders 表只记买单）。"""
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT order_id FROM orders WHERE option_code = ? AND success = 1 "
+            "AND order_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (option_code,),
+        ).fetchone()
+    return row[0] if row else None
+
+
 def log_order(msg_id, signal, result):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(

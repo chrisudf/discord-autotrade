@@ -187,6 +187,7 @@ def exit_legs(events: list, positions: dict,
             "net": round((price - entry) * qty * CONTRACT_MULTIPLIER
                          - leg_fee(qty, e["event_type"], per_contract), 2),
             "fabricated": is_fabricated(e),
+            "never_filled": "never filled" in (e.get("note") or ""),
         })
     return out
 
@@ -435,9 +436,10 @@ def format_report(legs: list, positions: dict, show_legs=True,
         out.append(f"  ⚠️ 另有 {len(bad)} 条 **捏造价** 平仓未计入合计"
                    f"（reconciler 自动落账写的 0，不是成交价）：")
         for l in bad:
+            tail = ("买单从未成交，真实盈亏 0" if l.get("never_filled") else
+                    f"若按 0 计会虚记 ${-l['entry'] * l['qty'] * 100:+,.0f}")
             out.append(f"      {l['et_date']}  {l['option_code']}  "
-                       f"{l['qty']} 张 @ 入 {l['entry']:.2f} —— "
-                       f"若按 0 计会虚记 ${-l['entry'] * l['qty'] * 100:+,.0f}")
+                       f"{l['qty']} 张 @ 入 {l['entry']:.2f} —— {tail}")
 
     for key, title in (("channel", "按频道"), ("category", "按类目"),
                        ("et_date", "按 ET 交易日")):
