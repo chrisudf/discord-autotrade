@@ -14,17 +14,20 @@
 set -eu
 
 PROJ="${0:A:h:h}"
-APPSUP="$HOME/Library/Application Support/autotrade-ops"
-LA_DIR="$HOME/Library/LaunchAgents"
+# 两个目录可由 env 覆盖，只为在沙盒里验证本脚本（lesson #39 的验证方法）
+APPSUP="${APPSUP:-$HOME/Library/Application Support/autotrade-ops}"
+LA_DIR="${LA_DIR:-$HOME/Library/LaunchAgents}"
 NIGHT_LABEL="com.chengqiu.autotrade.night"
 MORNING_LABEL="com.chengqiu.autotrade.morning"
 CAFF_LABEL="com.chengqiu.autotrade.caffeinate"
+POWER_LABEL="com.chengqiu.autotrade.power"
+ALIVE_LABEL="com.chengqiu.autotrade.alive"
 GUI="gui/$(id -u)"
 
 unload() { launchctl bootout "$GUI/$1" 2>/dev/null || true; }
 
 if [[ "${1:-}" == "--uninstall" ]]; then
-  for L in $NIGHT_LABEL $MORNING_LABEL $CAFF_LABEL; do
+  for L in $NIGHT_LABEL $MORNING_LABEL $CAFF_LABEL $POWER_LABEL $ALIVE_LABEL; do
     unload "$L"
     rm -f "$LA_DIR/$L.plist"
     echo "已卸载 $L"
@@ -41,7 +44,13 @@ chmod +x "$PROJ"/ops/*.sh
 
 # 垫片必须住在非 TCC 保护目录，launchd 才读得到
 cp "$PROJ/ops/launch_in_terminal.sh" "$APPSUP/launch_in_terminal.sh"
-chmod +x "$APPSUP/launch_in_terminal.sh"
+cp "$PROJ/ops/watchdog.sh" "$APPSUP/watchdog.sh"
+chmod +x "$APPSUP/launch_in_terminal.sh" "$APPSUP/watchdog.sh"
+
+# 看门狗要发 TG，但 launchd 读不了 Desktop 下的 config/.env —— 只抄这两行过去，600
+( umask 077
+  grep -E '^TELEGRAM_(BOT_TOKEN|CHAT_ID)=' "$PROJ/config/.env" > "$APPSUP/tg.env" 2>/dev/null ) \
+  || echo "⚠️ config/.env 里没找到 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID，看门狗会只记日志不发 TG"
 
 # launchd 不继承登录 shell 的 PATH。这个 PATH 只给垫片用，真正的活儿在
 # Terminal 里跑，那边是登录 shell 的完整环境。
@@ -166,6 +175,43 @@ emit_plist "$MORNING_LABEL" morning_collect.sh ""            7:00
 # 两个触发点是唤醒窗口冗余（同 lesson #28）。launchd 的单实例保证会让 23:08 这个
 # 在前一个还跑着时自动跳过，不会叠出两个 caffeinate。
 emit_caffeinate_plist 23:05 23:08
+
+# 看门狗：launchd 直接执行 Application Support 下的脚本，不开 Terminal
+emit_watchdog_plist() {
+  local label=$1 mode=$2 t=$3
+  cat > "$LA_DIR/$label.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>$label</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/zsh</string>
+		<string>$APPSUP/watchdog.sh</string>
+		<string>$mode</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<dict><key>Hour</key><integer>$((10#${t%%:*}))</integer><key>Minute</key><integer>$((10#${t##*:}))</integer></dict>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardOutPath</key>
+	<string>$APPSUP/launchd.watchdog.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>$APPSUP/launchd.watchdog.err.log</string>
+</dict>
+</plist>
+EOF
+  plutil -lint "$LA_DIR/$label.plist" > /dev/null
+  unload "$label"
+  launchctl bootstrap "$GUI" "$LA_DIR/$label.plist"
+  launchctl enable "$GUI/$label"
+  echo "已安装 $label  →  每天 $t  watchdog.sh $mode"
+}
+
+emit_watchdog_plist "$POWER_LABEL" power 22:30
+emit_watchdog_plist "$ALIVE_LABEL" alive 23:28
 
 cat <<TIP
 

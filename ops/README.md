@@ -22,8 +22,10 @@ launchd 用本机时区。作者机器是 Australia/Brisbane（UTC+10，无夏�
 
 | 时间 | 谁 | 做什么 |
 |---|---|---|
+| 22:30 | launchd → `watchdog.sh power` | 用电池或合着盖就 TG 叫人去插电（9/23、9/24 两晚晚启动都在电池上）|
 | 23:05 | launchd → `caffeinate -imsu -t 2400` | 拿住 sleep assertion 撑到 23:45，把机器顶在 FullWake，别让它在触发点之间睡回去 |
-| 23:11 | launchd → `night_run.sh` | 开新 Terminal 窗口跑 `caffeinate -i make run`，输出 tee 到 `logs/session_YYYY-MM-DD.log` |
+| 23:11 | launchd → `night_run.sh` | 开新 Terminal 窗口跑 `caffeinate -i make run`，输出 tee 到 `logs/session_YYYY-MM-DD_HHMM.log`（按启动时刻，避免跨午夜撞名）|
+| 23:28 | launchd → `watchdog.sh alive` | listener 进程不在就 TG（9/23 夜四个触发点都"成功"，进程却没起来）|
 | 07:00 | launchd → `morning_collect.sh` | SIGTERM 停 listener → 整晚日志存到桌面 → 从 `trades.db` 抽摘要（含 `ops/pnl.py` 生成的已实现盈亏一节）|
 
 **早上只取证，不自动复盘**（2026-08-17 起）：`morning_collect.sh` 全是纯 shell，
