@@ -8,7 +8,8 @@ set -u
 
 # 路径从脚本位置推导，不写死 —— 换机器 / 换目录都不用改。
 PROJ="${0:A:h:h}"
-SESSION_LOG="$PROJ/logs/session_$(date +%Y-%m-%d).log"
+# [9/24] 按启动时刻命名：过了午夜才起的那晚会和下一晚撞名、被 tee -a 拼进同一个文件
+SESSION_LOG="$PROJ/logs/session_$(date +%Y-%m-%d_%H%M).log"
 OPS_LOG="$PROJ/logs/ops.log"
 
 mkdir -p "$PROJ/logs"
