@@ -548,7 +548,8 @@ def test_closing_gerund_routes_to_close():
     )
     assert r is not None
     assert r["symbols"] == ["MSFT"]
-    assert r["pct"] == 33
+    # 契约翻转（9/28）：平的是 runner（剩下的全部），33% 在只剩 1 张时取整为 0、等于没执行
+    assert r["pct"] == 100
     assert r["hint_strike"] == 390.0
     assert r["hint_side"] == "CALL"
     assert r["signal_price"] == 5.0

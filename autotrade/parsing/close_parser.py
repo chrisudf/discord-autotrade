@@ -315,7 +315,9 @@ _OUT_FULL_CLOSE_RE = re.compile(
 )
 
 # 全平动词（pct 缺省 → 100）
-FULL_CLOSE_VERBS = ["closed", "cutting", "cut ", "dumped", "dumping"]
+# [9/28] "closing" 以前只进 ACTION 不进这里，没写比例就按 33% 减仓：
+# "CLOSING NVDA CALLS"、"AMZN CLOSING REST AT ENTRY" 都只卖了三分之一。历史上 30 多条全是离场指令
+FULL_CLOSE_VERBS = ["closed", "closing", "cutting", "cut ", "dumped", "dumping"]
 
 # 提取百分比："25%" / "20 %"
 # 排除 `-15%` `+30%` 这类 PnL 标注（前面有符号/数字 → 不是 trim 比例）
@@ -363,6 +365,8 @@ _HOLD_CONTEXT_TEMPLATES = (
     # "All cash now besides $HOOD 1.5% position"（7/15）——besides/except
     # 后面的 symbol 是**留着**的，close 目标是"其他所有"，不是它
     r"(?:besides|except(?:\s+for)?)\s+(?:the\s+|my\s+)?\$?{sym}\b",
+    # "FTNT ROUND 1 REST OPEN OVERNIGHT, ROUND 2 CLOSING NEAR ENTRY"（9/15）：这一句里 FTNT 是留着的
+    r"\b{sym}\b[^.\n]{{0,20}}?\brest\s+open\s+overnight",
 )
 _ZH_HOLD_CONTEXT_TEMPLATES = (
     r"保留[^\n，。]{{0,8}}{sym}",
@@ -839,11 +843,21 @@ def _has_bulk_marker(text_lower: str) -> bool:
 
 # took-off / runners-only 不属于 "out" 家族，单开一个 RE（两条都自带边界条件：
 # took 必须跟 another 或百分比，runners only 必须跟 @价格，见各自常量注释）
+# [9/23] ashley 的两种平仓写法一直不在词表里：
+#   "AVGO GREEN, REDUCING MY POSITION BY 50%" —— 只收后接 position / N% 的，"reducing risk" 不算
+#   "AAPL CALLS BREAKEVEN CLOSE ON REST" —— 原形 close 只在 breakeven 后面算，裸 close 太常是名词
+_REDUCE_PATTERN = (
+    r"\breduc(?:e|ing)\s+(?:my\s+)?"
+    r"(?:position\b|another\s+\d+(?:\.\d+)?\s*%|\d+(?:\.\d+)?\s*%)"
+)
+_BREAKEVEN_CLOSE_PATTERN = r"\bbreakeven\s+close\b"
+
 _EXTRA_ACTION_RE = re.compile(
     _TOOK_OFF_PATTERN + r"|" + _RUNNERS_ONLY_PATTERN
     # [9/1 COIN] down-to 分数 / securing 宾语，两条都自带边界（见各自常量注释）
     + r"|" + _DOWN_TO_FRACTION_PATTERN
-    + r"|" + _SECURE_SOME_PATTERN,
+    + r"|" + _SECURE_SOME_PATTERN
+    + r"|" + _REDUCE_PATTERN + r"|" + _BREAKEVEN_CLOSE_PATTERN,
     re.IGNORECASE,
 )
 
@@ -867,10 +881,20 @@ def _has_action_verb(text_lower: str, text: str = "") -> bool:
     )
 
 
+def _full_close_only_from_closing(text_lower: str, text: str = "") -> bool:
+    """全平判定是否只靠 "closing"（9/28 才进全平词表）。close_flow 据此在多仓位时退回 33%。"""
+    return ("closing" in text_lower
+            and not any(v in text_lower for v in FULL_CLOSE_VERBS if v != "closing")
+            and not re.search(_BREAKEVEN_CLOSE_PATTERN, text_lower)
+            and not _OUT_FULL_CLOSE_RE.search(text_lower)
+            and not (text and _OUT_FULL_CLOSE_RE.search(text)))
+
+
 def _has_full_close_verb(text_lower: str, text: str = "") -> bool:
     """同 _has_action_verb：裸 "out <TICKER>" 要靠原文判定大小写。"""
     return (
         any(v in text_lower for v in FULL_CLOSE_VERBS)
+        or bool(re.search(_BREAKEVEN_CLOSE_PATTERN, text_lower))
         or bool(_OUT_FULL_CLOSE_RE.search(text_lower))
         or bool(text and _OUT_FULL_CLOSE_RE.search(text))
     )
@@ -890,7 +914,8 @@ _ACTION_RE = re.compile(
     + r"|" + _TOOK_OFF_PATTERN
     + r"|" + _RUNNERS_ONLY_PATTERN
     + r"|" + _DOWN_TO_FRACTION_PATTERN
-    + r"|" + _SECURE_SOME_PATTERN,
+    + r"|" + _SECURE_SOME_PATTERN
+    + r"|" + _REDUCE_PATTERN + r"|" + _BREAKEVEN_CLOSE_PATTERN,
     re.IGNORECASE,
 )
 
@@ -1104,6 +1129,9 @@ def _extract_pct(text: str, text_lower: str) -> int:
     if re.search(r"\bout\s+(?:majority|most)\b", scope, re.I):
         return 75
 
+    # "closing half" 不能因为 closing 进了全平词表就变 100
+    if re.search(r"\bhalf\b", scope, re.I):
+        return 50
     return 100 if _has_full_close_verb(text_lower, text) else 33
 
 
@@ -1262,6 +1290,7 @@ def _parse_close_en(text: str, open_symbols: set[str], known_symbols: "set | Non
             "hint_strike": hint_strike, "hint_side": hint_side,
             "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
             "price_unattributable": price_unattributable,
+            "pct_only_from_closing": pct == 100 and _full_close_only_from_closing(text_lower, text),
             "matched": text[:120], "lang": "en"}
 
 

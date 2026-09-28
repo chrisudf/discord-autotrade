@@ -458,6 +458,13 @@ async def handle_close_signal(
         # （9/9 TSLA 00:09 正是这一种）。
         _apply_stop_adjust(raw, positions)
 
+        # [9/28] "closing" 没写比例、又分不清是哪一张时退回旧口径 33%：ashley 常分轮进同一标的，
+        # 100% 会把她还拿着的那一轮也平掉
+        sym_pct = pct
+        if parsed.get("pct_only_from_closing") and len(positions) > 1:
+            sym_pct = 33
+            logger.warning(f"[CLOSE] {symbol}: closing 未指明哪一张、有 {len(positions)} 个仓位 → 按 33%")
+
         for pos in positions:
             # TG 展示/节流 key 用的仓位标签（字段不可变，锁外算安全）
             pos_label = f"{pos['symbol']} {pos['strike']}{pos['side'][0]}"
@@ -465,7 +472,7 @@ async def handle_close_signal(
             # 走 sell_executor；KC 专属的 runner-preserve / 策略B /
             # quote-fallback 决策留在本模块（_kc_sell 的 plan 闭包，锁内执行）。
             outcome, _ = await _kc_sell(
-                pos, pos_label, pct, parsed, raw, msg_id, strategy_b_reasons,
+                pos, pos_label, sym_pct, parsed, raw, msg_id, strategy_b_reasons,
                 spare_reasons,
             )
             outcomes.append((outcome, pos_label))

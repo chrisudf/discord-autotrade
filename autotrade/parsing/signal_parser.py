@@ -24,6 +24,7 @@ from autotrade.parsing.close_parser import (
     _OUT_FRACTION_PATTERN,
     _OUT_PCT_PATTERN,
     _OUT_REST_PATTERN,
+    _REDUCE_PATTERN,
     _RUNNERS_ONLY_PATTERN,
     _SECURE_SOME_PATTERN,
     _TOOK_OFF_PATTERN,
@@ -1211,6 +1212,7 @@ WEAK_CLOSE_RE = re.compile(
     + r"|" + _SECURE_SOME_PATTERN
     + r"|" + _ZH_DOWN_TO_FRACTION_PATTERN
     + r"|" + _ZH_SECURE_SOME_PATTERN
+    + r"|" + _REDUCE_PATTERN           # [9/23] "REDUCING MY POSITION BY 50%"，与 close_parser 同进同退
     + r"|\bselling\b"
     r"|\bscaling\s+down\b"
     # [8/26 扫描补漏] cut/cutting/dumped/dumping 在 close_parser.FULL_CLOSE_VERBS
@@ -1229,7 +1231,8 @@ WEAK_CLOSE_RE = re.compile(
 OPEN_INTENT_RE = re.compile(
     r"\b(buy(?:ing)?|bought|add(?:ing|ed)?|grab(?:bed|bing)?|"
     r"load(?:ing|ed)?|bto|(?<!re-)enter(?:ed|ing)?|"
-    r"(?<!at\s)(?<!to\s)entry|in at)\b",
+    # "CLOSING ABOVE / BELOW / NEAR ENTRY" 里的 entry 是价位不是开仓（NVDA、RKLB、FTNT 等 11 条被判成 OPEN）
+    r"(?<!at\s)(?<!to\s)(?<!above\s)(?<!below\s)(?<!near\s)(?<!around\s)entry|in at)\b",
     re.I,
 )
 # 否定式的开仓词（"not adding" / "won't buy"）是**放弃**开仓，不该否决
