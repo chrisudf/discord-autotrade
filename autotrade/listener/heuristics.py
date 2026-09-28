@@ -60,6 +60,22 @@ _BOT_NOISE_RE = _re.compile(
 )
 
 
+# [9/23] 三件套只认词不认形：一整晚报的全是评论（"META CALLS AT $12.00 IF YOU'RE STILL IN"），
+# 真信号反而一条没报（SPY 769C 裸价、SNDK 没写 c/p、enrich 没写 ticker）。
+# 通用三件套再要求一个行权价（数字紧贴方向词）；三种频道开仓模板解析失败时无条件报。
+_OPEN_STRIKE_RE = _re.compile(
+    r"\b\d+(?:\.\d+)?[cp]\b|\d+(?:\.\d+)?\s*(?:[A-Za-z]+\s+){0,2}(?:calls?|puts?)\b"
+    r"|\d+(?:\.\d+)?\s*[\u4e00-\u9fff]{0,3}看[涨跌]期权",       # "$310 每周看涨期权" / "$215 的看涨期权"
+    _re.I,
+)
+_OPEN_TEMPLATE_RE = _re.compile(
+    r"^\s*:RedAlert:"                                                        # ashley
+    r"|\b[A-Z]{2,5}\s+\d+(?:\.\d+)?[cp]?\s+\d{1,2}/\d{1,2}\s*@\s*\$?\.?\d"       # KC
+    r"|\$\d+(?:\.\d+)?\s+\d{1,2}/\d{1,2}\b[^\n]*?\b(?:calls?|puts?)\b[^\n]*?\$\.?\d",  # enrich
+    _re.MULTILINE,
+)
+
+
 def _strip_bot_noise(text: str) -> str:
     return _BOT_NOISE_RE.sub(" ", text or "")
 
@@ -72,10 +88,13 @@ def _looks_like_open_attempt(text: str) -> bool:
     if not text:
         return False
     text = _strip_bot_noise(text)
+    if _OPEN_TEMPLATE_RE.search(text):
+        return True
     return bool(
         _OPEN_TICKER_RE.search(text)
         and _OPEN_SIDE_RE.search(text)
         and _OPEN_PRICE_RE.search(text)
+        and _OPEN_STRIKE_RE.search(text)
     )
 
 
@@ -154,8 +173,30 @@ _TWIN_SUPPRESS_WINDOW = timedelta(seconds=60)
 _recent_exec: dict[tuple[int, str], dict] = {}
 
 
+# 开仓后 10 分钟内只报一个到期日的消息，是在更正上一单（9/23 NVDA：9/30 下单，74 秒后 "EXPIRATION 9/28"）。
+# _recent_exec 只留 60 秒（给孪生抑制用），装不下，另记一份每频道最后一次开仓
+_LAST_OPEN_WINDOW = timedelta(minutes=10)
+_last_open: dict[int, dict] = {}
+_EXPIRY_ONLY_RE = _re.compile(r"^\s*(?:EXPIRATION|EXP\.?|到期)\s*(\d{1,2})/(\d{1,2})\s*$", _re.I)
+
+
+def _expiry_correction(text: str, cid: int) -> "str | None":
+    """这条消息是否在更正本频道刚开的那单的到期日。返回告警正文或 None。"""
+    m = _EXPIRY_ONLY_RE.match(_strip_bot_noise(text))
+    last = _last_open.get(cid)
+    if not m or not last or datetime.now(timezone.utc) - last["ts"] > _LAST_OPEN_WINDOW:
+        return None
+    said = f"{int(m.group(1))}/{int(m.group(2))}"
+    if said == last["expiry"]:
+        return None
+    return (f"刚下的 {last['symbol']} {last['strike']:g}{last['side'][0]} {last['expiry']}，"
+            f"喊单员随后说到期是 {said} —— 我们的单不会自动改，请人工核对")
+
+
 def _record_recent_exec(cid: int, signal: dict):
     now = datetime.now(timezone.utc)
+    _last_open[cid] = {"ts": now, "symbol": signal["symbol"], "strike": signal.get("strike") or 0,
+                       "side": signal.get("side") or "?", "expiry": signal.get("expiry")}
     # 顺手清掉过期条目，dict 不增长
     for key in [k for k, e in _recent_exec.items() if now - e["ts"] > _TWIN_SUPPRESS_WINDOW]:
         _recent_exec.pop(key, None)

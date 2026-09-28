@@ -68,6 +68,10 @@ def breakeven_exit_price(entry_price: float, sell_slip: float = 0.05) -> tuple[f
     return round(be_price, 2), round(be_pct, 1)
 
 
+# 指数期权的交易代码不是指数本身：9/28 用 get_option_chain("US..SPX") 实测，每日到期的是 US.SPXW…
+_OPTION_ROOT = {"SPX": "SPXW"}
+
+
 def build_option_code(symbol: str, exp_date: date, strike: float, side: str) -> str:
     """
     构造 moomoo 期权代码
@@ -90,7 +94,7 @@ def build_option_code(symbol: str, exp_date: date, strike: float, side: str) -> 
     date_str = exp_date.strftime("%y%m%d")
     cp = "C" if side == "CALL" else "P"
     strike_str = str(round(strike * 1000))
-    return f"US.{symbol}{date_str}{cp}{strike_str}"
+    return f"US.{_OPTION_ROOT.get(symbol, symbol)}{date_str}{cp}{strike_str}"
 
 
 # 卖单挂价相对参照价的负偏移 —— 偏移要够"吃"穿 bid，避免挂在 ask 上没人接。

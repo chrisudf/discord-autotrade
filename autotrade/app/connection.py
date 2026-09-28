@@ -16,6 +16,7 @@ from loguru import logger
 from autotrade.config.channel_loader import registry
 # handle_message 以裸名 import:_backfill_missed 必须经由本模块的
 # `handle_message` 全局调用,tests(test_backfill)才能 monkeypatch 它。
+from autotrade.listener.open_flow import set_startup_replay
 from autotrade.listener.router import handle_message
 from autotrade.notify.transport import _safe_notify
 from autotrade.notify.watchdog import notify_tick_error, notify_tick_ok
@@ -273,7 +274,11 @@ async def startup_backfill(minutes: int):
     if _last_disconnect_wall is None or _last_disconnect_wall > anchor:
         _last_disconnect_wall = anchor
     logger.info(f"[backfill] 启动回补:重放最近 {minutes} 分钟的频道历史")
-    await _backfill_missed()
+    set_startup_replay(True)
+    try:
+        await _backfill_missed()
+    finally:
+        set_startup_replay(False)
 
 
 # 每频道每次回补最多拉多少条。50 太小:睡眠/晚启动的窗口能到几十分钟,
