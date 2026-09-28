@@ -239,6 +239,16 @@ async def _handle_message_edit_inner(before, after):
     # 再提醒只是噪音。
     old_sig = parse_signal(old_raw, msg_ts=msg_date_et) if old_raw.strip() else None
     if isinstance(old_sig, dict) and not old_sig.get("skip"):
+        # [9/23 RKLB] "$72 calls" 编辑成 "$75 calls"：我们按 72C 下了单，这里原来只当价格修正放过
+        changed = [k for k in ("symbol", "strike", "side", "expiry_date") if old_sig.get(k) != sig.get(k)]
+        if changed:
+            desc = lambda s: f"{s['symbol']} {s['strike']:g}{s['side'][0]} {s.get('expiry', '')} @ {s.get('price')}"
+            logger.warning(f"[edit] 编辑改了合约 {changed}: {desc(old_sig)} → {desc(sig)}")
+            if edit_signal_should_alert(_signal_fingerprint(sig)):
+                await _safe_notify(format_error(
+                    "喊单员编辑改了合约（未自动处理）",
+                    f"原：{desc(old_sig)}\n新：{desc(sig)}\n按原消息下的单不会自动改，请人工核对\n\n{new_raw[:200]}"))
+            return
         logger.info(
             f"[edit] 编辑前已可解析（{old_sig['symbol']} @ {old_sig.get('price')}"
             f" → {sig.get('price')}），按价格修正处理，不提醒"

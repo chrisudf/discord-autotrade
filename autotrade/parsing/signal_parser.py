@@ -389,6 +389,7 @@ def parse_signal(text: str, msg_ts: date = None):
             or _try_pattern_b(text, today)
             or _try_pattern_c(text, today)
             or _try_pattern_d(text, today)
+            or _try_pattern_redalert(text, today)
         )
     except ValueError as e:
         # smart_expiry 对 6/31 这类无效日期抛 ValueError → 按解析失败处理，
@@ -794,6 +795,57 @@ def _try_pattern_b(text: str, today: date):
 
 
     return None
+
+
+# [9/9-9/25] ashley 的 :RedAlert: 有 35 个信号（70 条中英）从没解析成功过：裸 strike
+# （SPX - 7800）、裸小数喊价（.50）、strike 与方向之间夹 ITM/0DTE、中文前置"本周到期的"、
+# BE 撞裸 ticker 停用词。只在 A/B/C/D 全落空后兜底，并锚定在开头的 ":RedAlert: TICKER - "。
+_REDALERT_RE = re.compile(
+    r"^\s*:RedAlert:\s*\$?(?P<sym>[A-Z]{1,5})\s*[-\u2013\u2014]\s*"
+    r"[^\d$\n]{0,12}?"                            # 中文前置修饰："本周到期的 "
+    r"\$?(?P<strike>\d+(?:\.\d+)?)\s*"
+    r"(?:(?:ITM|OTM|\d+DTE)\s*)?"                 # strike 与方向之间的 ITM / 0DTE
+    r"(?i:(?P<side>calls?|puts?))\b"
+    r"(?P<mid>[^\n]*?)"
+    r"(?<![\d.])\$?(?P<price>\d*\.\d+)"          # 喊价必须带小数点
+)
+
+
+def _ndte_expiry(today: date, n: int) -> date:
+    """往后数 n 个交易日。B1 的"日历日 + n 再往回调"在周五 1DTE 会退回周五本身。"""
+    d = today if is_trading_day(today) else adjust_to_trading_day(today, direction="forward")
+    for _ in range(n):
+        d = adjust_to_trading_day(d + timedelta(days=1), direction="forward")
+    return d
+
+
+def _try_pattern_redalert(text: str, today: date):
+    """ashley :RedAlert: 模板兜底：`TICKER - [$]STRIKE [ITM|0DTE] CALLS|PUTS ... [$].PRICE`"""
+    m = _REDALERT_RE.match(text)
+    if not m or _price_qualified(text, m.start("price"), m.start()):
+        return None
+    gap = text[m.end("strike"):m.start("price")]
+    dte = re.search(r"(\d+)DTE", gap)
+    mmdd = re.search(r"(?<![\d.$])(\d{1,2})/(\d{1,2})(?![\d/])", m.group("mid"))
+    if dte:
+        expiry_date, expiry = _ndte_expiry(today, int(dte.group(1))), f"{dte.group(1)}DTE"
+    elif mmdd:
+        mm, dd = int(mmdd.group(1)), int(mmdd.group(2))
+        expiry_date = _adjust_expiry(smart_expiry(mm, dd, today=today), context="R MM/DD")
+        expiry = f"{mm}/{dd}"
+    else:
+        expiry_date, expiry = _weekly_expiry(text, today)
+    return {
+        "raw": text,
+        "matched": m.group(0).strip(),
+        "symbol": m.group("sym"),
+        "side": "CALL" if m.group("side").lower().startswith("call") else "PUT",
+        "strike": float(m.group("strike")),
+        "expiry": expiry,
+        "expiry_date": expiry_date,
+        "price": float(m.group("price")),
+        "tags": _extract_tags(text),
+    }
 
 
 def _try_pattern_c(text: str, today: date):

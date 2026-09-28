@@ -26,6 +26,7 @@ tests/corpus/
   2026-07-29.jsonl   7/29-30 夜（建议句"若想止盈离场"、叙述价 vs 喊价）
   2026-08-03.jsonl   8/3-4 夜（裸 out <TICKER>、否定条件句误平、out 1/2、day_trade）
   lessons.jsonl      6/14-7/17 历史实锤（来自 test_parser / test_close_parser）
+  redalert_bare_price.jsonl  9/9-9/25 ashley :RedAlert: 解析失败的 67 条（裸 strike / 裸小数价 / ITM / 中文前置到期）
 ```
 
 按"复盘夜"分文件（与 `tests/test_overnight_MMDD.py` 同一命名口径）；
@@ -134,3 +135,14 @@ python -m pytest tests/ -q
 
 失败输出形如 `[2026-07-23:meta_into_the_close_open] detect: 期望 OPEN, 实际 CLOSE`
 ——文件名即夜份，name 即定位键。
+
+## 全历史回放（语料之外的第二道门）
+
+语料只锁几百条已知形状；改 `signal_parser` / `close_parser` 时再用生产库里全部原始消息（几千条）对比一次，
+变化只该落在预期的那几条上：
+
+```
+PYTHONPATH=<main 目录> python <分支>/autotrade/ops/replay_parse.py --db <main>/data/trades.db --out /tmp/before.json
+python -m autotrade.ops.replay_parse --db <main>/data/trades.db --out /tmp/after.json
+python -m autotrade.ops.replay_parse --diff /tmp/before.json /tmp/after.json
+```

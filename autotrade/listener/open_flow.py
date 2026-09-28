@@ -8,6 +8,7 @@ record_order → _record_recent_exec → position_mgr.on_order_filled →
 fill_checker.spawn → 成交通知 + 延迟统计。
 """
 import asyncio
+import re
 from datetime import datetime, timezone
 
 from autotrade.broker.trade import place_order
@@ -23,6 +24,7 @@ from autotrade.listener.dedup import (
 )
 from autotrade.listener.heuristics import (
     _TWIN_SUPPRESS_WINDOW,
+    _expiry_correction,
     _looks_like_addon_attempt,
     _looks_like_open_attempt,
     _looks_like_sized_entry,
@@ -109,6 +111,18 @@ def _apply_declared_stop(raw: str, option_code: str, entry: float) -> None:
 _order_flow_lock = asyncio.Lock()
 
 
+# 喊单员自己说"预期归零"的彩票：9/28 决定只记录不跟，复盘时按这行日志列出
+_EXPECT_ZERO_RE = re.compile(r"EXPECT\s*0\b|(?:预计|预期|期待)\s*0(?![\d.])", re.IGNORECASE)
+
+# 启动回补期间为 True：回放出来的开仓一律只告警（9/23 META 747.5C 在喊单员止损之后才被买入）
+_startup_replay = False
+
+
+def set_startup_replay(on: bool) -> None:
+    global _startup_replay
+    _startup_replay = on
+
+
 async def process_open(message, raw, cfg, cid, t0, msg_date_et):
     """OPEN 编排。router._handle_message_inner 在 detect_action != CLOSE 时调用。
 
@@ -124,6 +138,11 @@ async def process_open(message, raw, cfg, cid, t0, msg_date_et):
         # 真·没匹配任何模式。只对"含 $TICKER + 侧别 + 价格"三件套的发 TG，
         # 否则视为 KC 状态评论/行情解说，仅 log（避免每晚 10+ 条 TG 噪音，见 6/24 review）
         logger.warning("Parse failed")
+        fix = _expiry_correction(raw, cid)
+        if fix:
+            logger.warning(f"[correction] {fix}")
+            await _safe_notify(format_error("喊单员更正了到期日（未自动处理）", f"{fix}\n\n{raw[:200]}"))
+            return
         # 先查 add-on（更具体）：加已持仓标的 + @price → 提醒人工跟加（7/6 SPY 漏加实锤）
         addon_sym = _looks_like_addon_attempt(raw)
         if addon_sym:
@@ -236,7 +255,8 @@ async def process_open(message, raw, cfg, cid, t0, msg_date_et):
         # 坏值退默认而不是抛:这行在每条消息的处理路径上,ValueError 会一路
         # 冒到 router 兜底,表现为**所有 OPEN 被静默丢掉**——闸门反成断路器。
         max_age = env_float("OPEN_SIGNAL_MAX_AGE_SEC", 300.0, minimum=1.0)
-        if age_sec > max_age:
+        # 启动回补期间实时到达的消息只有一两秒，60 秒足以把它们和回放分开
+        if age_sec > max_age or (_startup_replay and age_sec > 60):
             logger.warning(
                 f"[age-guard] OPEN 信号已 {age_sec:.0f}s(> {max_age:.0f}s 上限),"
                 f"不自动下单: {raw[:80]}"
@@ -263,6 +283,12 @@ async def process_open(message, raw, cfg, cid, t0, msg_date_et):
             f"{signal.get('expiry_date', '')} "
             f"(prev {ago_sec:.0f}s ago)"
         )
+        return
+
+    if _EXPECT_ZERO_RE.search(raw):
+        logger.warning(
+            f"[lotto-skip] EXPECT 0 不跟: {signal['symbol']} {signal['strike']}"
+            f"{signal['side'][0]} {signal.get('expiry', '')} @ {signal.get('price')} | {raw[:80]}")
         return
 
     # ---- 短线标签 × 长 DTE 防护 ----
