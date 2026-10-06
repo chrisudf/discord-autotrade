@@ -286,3 +286,78 @@ async def test_without_qualifier_behaviour_is_unchanged():
     b = _open_pos("QTSD", 475.0, "CALL", "0dte_lotto")
     sold, _ = await _close("QTSD OUT 50% HERE @ 2.50 @everyone")
     assert set(sold) == {a, b}
+
+
+# ============================================================
+# 4. PR#22 review（Copilot 5 条，例子取自 review 原文）
+# ============================================================
+
+def test_qualifier_binds_to_the_action_clause_occurrence():
+    """review：第一次出现的 TSM 在行情句里，动作句里的才是被平的那张。"""
+    assert extract_position_qualifiers("TSM calls ran +30%. Closing TSM PUTS now", "TSM") == ("PUT", None)
+
+
+def test_qualifier_window_stops_at_clause_or_another_ticker():
+    """review：「TSM减仓，META看跌期权减仓」的看跌属于 META，不能算到 TSM 头上。"""
+    text = "TSM减仓，META看跌期权减仓"
+    assert extract_position_qualifiers(text, "TSM", ["TSM", "META"]) == (None, None)
+    assert extract_position_qualifiers(text, "META", ["TSM", "META"]) == ("PUT", None)
+    assert extract_position_qualifiers("Trimmed TSM CALLS and META PUTS here", "TSM", ["TSM", "META"]) == ("CALL", None)
+
+
+@pytest.mark.asyncio
+async def test_every_explicit_target_gets_its_own_qualifier():
+    """review：只过滤第一个标的时，`… and META PUTS` 会把 META 的 call 也卖掉。"""
+    a_call, a_put = _open_pos("QTSE", 480.0, "CALL", "weekly"), _open_pos("QTSE", 470.0, "PUT", "weekly")
+    b_call, b_put = _open_pos("QMTE", 750.0, "CALL", "weekly"), _open_pos("QMTE", 740.0, "PUT", "weekly")
+    # 多标的共用一个喊价时会丢弃喊价改用实时报价，这里给一个报价
+    with patch.object(close_flow, "get_sell_ref_price", return_value=2.50):
+        sold, _ = await _close("Trimmed QTSE CALLS and QMTE PUTS here @ 2.50 @everyone")
+    assert set(sold) == {a_call, b_put}
+    for c in (a_put, b_call):
+        positions_db.record_close(c, 4, 0.01, "manual", note="ut")
+
+
+def _sel(sym, side=None, cats=None):
+    return {"kind": "CLOSE", "symbols": [sym], "pct": 50, "selectors": {sym: (side, cats)}}
+
+
+def test_dedup_treats_a_different_named_side_as_a_new_instruction():
+    """review：CALLS 之后 60s 内的 PUTS 不是孪生；没点名方向的机翻孪生仍然去重。"""
+    dedup._close_fps.clear()
+    assert dedup._is_duplicate_close(_sel("QDDA", "CALL"))[0] is False
+    assert dedup._is_duplicate_close(_sel("QDDA", "PUT"))[0] is False
+    assert dedup._is_duplicate_close(_sel("QDDA"))[0] is True          # 「QDDA 出局 50%」这种译丢了方向的孪生
+    assert dedup._is_duplicate_close(_sel("QDDA", "CALL"))[0] is True  # 原样重发
+
+
+def test_dedup_rollback_only_drops_its_own_registration():
+    """回滚 PUTS 那条（broker 失败）不能把已经执行的 CALLS 登记一起抹掉，否则 CALLS 的孪生会再卖一遍。"""
+    dedup._close_fps.clear()
+    dedup._is_duplicate_close(_sel("QDDB", "CALL"))
+    dedup._is_duplicate_close(_sel("QDDB", "PUT"))
+    dedup._unregister_close_fp(_sel("QDDB", "PUT"))
+    assert dedup._is_duplicate_close(_sel("QDDB"))[0] is True
+    assert dedup._is_duplicate_close(_sel("QDDB", "PUT"))[0] is False   # PUTS 的孪生可以重试
+
+
+@pytest.mark.asyncio
+async def test_expiry_underlying_is_fetched_once_per_tick(_eod_state):
+    """review：同一标的几张无报价合约，每张各取一次标的价会吃光 60 次/30s 的配额。"""
+    now = _trading_now_et()
+    codes = [_open_expiring("QFTA", k, "CALL", now.date()) for k in (190.0, 195.0, 200.0)]
+    _, _, und = await _eod_tick(now, {"QFTA": 150.0})
+    assert [c.args for c in und.call_args_list].count(("QFTA",)) == 1
+    for c in codes:
+        positions_db.record_close(c, 2, 0.01, "manual", note="ut")
+
+
+@pytest.mark.asyncio
+async def test_barely_itm_is_sold_not_labelled_otm(_eod_state):
+    """review：价内 $0.04 也会被行权，不能标成[价外]说不用管。"""
+    now = _trading_now_et()
+    code = _open_expiring("QNIT", 100.0, "CALL", now.date())
+    sells, tgs, _ = await _eod_tick(now, {"QNIT": 100.04})
+    mine = [s for s in sells if s["option_code"] == code]
+    assert mine and mine[0]["limit_price"] == 0.04
+    assert not any(code in t and "[价外]" in t for t in tgs)

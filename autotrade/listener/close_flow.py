@@ -292,6 +292,11 @@ async def handle_close_signal(
             await _safe_notify(format_close_skipped("parser skipped (recap/no-symbol)", raw))
         return
 
+    # 方向/类目限定词要在去重之前算：TSM CALLS 之后 60s 内的 TSM PUTS 是另一条指令（见 dedup._selectors_conflict）
+    if parsed["kind"] == "CLOSE":
+        syms = parsed.get("symbols") or []
+        parsed["selectors"] = {s: extract_position_qualifiers(raw, s, syms) for s in syms}
+
     # CLOSE dedup —— 双语双发 / 同信号重发拦截（查即登记，原子堵双发窗口；
     # broker 失败时末尾回滚指纹，孪生版本充当重试）
     is_dup, ago = _is_duplicate_close(parsed)
@@ -452,8 +457,9 @@ async def handle_close_signal(
             positions = matched
         # [10/2 TSM] 没写 strike 但点名了 PUTS / LOTTOS / NEXT WEEK：只卖被点名的几张；
         # 滤空就提醒、不退回全卖（她明说周合约要拿过周末，系统还是一起卖了）
-        elif symbol == hint_source_symbol and len(positions) > 1:
-            q_side, q_cats = extract_position_qualifiers(raw, symbol)
+        # strike hint 只属于第一个标的，限定词每个标的各有各的（"Trimmed TSM CALLS and META PUTS"）
+        elif parsed["kind"] == "CLOSE" and len(positions) > 1:
+            q_side, q_cats = (parsed.get("selectors") or {}).get(symbol, (None, None))
             if q_side or q_cats:
                 picked = [
                     p for p in positions

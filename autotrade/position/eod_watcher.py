@@ -174,13 +174,16 @@ _expiry_alert_stage: dict = {}
 _FINAL_CALL_LEAD_MIN = int(os.getenv("EOD_NOQUOTE_FINAL_LEAD_MIN", "3"))
 
 
-# 价内不到 5 美分和归零没区别，卖不卖结果一样，仍按无报价处理
-_ITM_MIN_INTRINSIC = 0.05
+# 本轮已取过的标的价（含 None）：同一标的几张合约只吃一次 snapshot，_eod_tick 开头清空
+_tick_spot: dict = {}
 
 
 async def _intrinsic_value(pos: dict) -> "float | None":
     """按标的现价算内在价值；标的也取不到时为 None（判断不了价内还是价外）。"""
-    spot = await asyncio.to_thread(get_underlying_price, pos["symbol"])
+    sym = pos["symbol"]
+    if sym not in _tick_spot:
+        _tick_spot[sym] = await asyncio.to_thread(get_underlying_price, sym)
+    spot = _tick_spot[sym]
     if spot is None:
         return None
     strike = float(pos["strike"])
@@ -243,8 +246,9 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float, today_iso: st
             is_expiry_today = fresh.get("expiry") == today_iso
             # [10/2 FTNT] 到期日价内合约拒卖 = 被自动行权（9/25 FTNT/TEM 已发生）。
             # 9/14 否决"无报价打折卖"是因为不知道值多少；标的现价给出了内在价值这个下限。
+            # 价内多少都卖：价内 $0.01 也会被行权，行权要的是整手正股的钱
             intrinsic = await _intrinsic_value(fresh) if is_expiry_today else None
-            if intrinsic is not None and intrinsic > _ITM_MIN_INTRINSIC:
+            if intrinsic is not None and intrinsic > 0:
                 limit = max(0.01, round(intrinsic * (1 - sell_slip), 2))
                 logger.warning(
                     f"[eod] 🕒 ITM fallback {code}: no option quote, "
@@ -264,7 +268,7 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float, today_iso: st
                 "code": code, "qty": qty,
                 "entry": fresh["avg_entry_price"],
                 "expiry_today": is_expiry_today,
-                # 到期日才有意义：OTM = 确认归零；unknown = 标的也没价，价内的话会被行权
+                # 到期日才有意义：OTM = 内在价值为 0；unknown = 标的也没价，价内的话会被行权
                 "moneyness": (("unknown" if intrinsic is None else "OTM")
                               if is_expiry_today else None),
             })
@@ -516,6 +520,7 @@ async def _eod_tick(now_et: datetime):
     )
     global _tick_priced
     _tick_noquote.clear()
+    _tick_spot.clear()
     _tick_priced = 0
     for pos in positions:
         await _force_close(pos, cfg["sell_slip"], ts_now, today_iso)

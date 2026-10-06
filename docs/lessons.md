@@ -2425,9 +2425,13 @@ contract by kind — PUTS, LOTTOS, NEXT WEEK — never by strike. The hint extra
 returned `(None, None)`, and `None` meant "no filter", i.e. all of them.
 
 **Defense**: `extract_position_qualifiers` reads side/category words in the 3
-tokens right after the ticker; `close_flow` filters on them when no strike was
-given and the symbol has more than one position; filtering down to nothing sends a
-TG and sells nothing. The window came from the 77 historical EN closes containing
+tokens after the ticker, using the occurrence in the action sentence, and stops at
+a clause boundary or at the next ticker. `close_flow` applies it to every explicit
+target when the symbol has more than one position; filtering down to nothing sends
+a TG and sells nothing. The selectors are computed before dedup, so `TSM CALLS …`
+followed within 60s by `TSM PUTS …` is a second instruction, not a twin. A twin whose
+translation dropped the word (`TSM 呼叫更多`) is still a twin: a conflict needs both
+sides to name a selector. The window came from the 77 historical EN closes containing
 such words: in `closed the rest of SPY …, I almost took TSLA calls` and
 `Closing IBM round 2 also, lottos open …` the word is far from the ticker and
 means a different contract.
@@ -2454,8 +2458,9 @@ of dollars plus a weekend gap) — while the alert told the operator that most o
 the time there was nothing to do.
 
 **Defense**: on expiry day with no option quote, `eod_watcher` fetches the
-underlying (`get_underlying_price`; SPX → `US..SPX`). ITM by more than 0.05 →
-sell at intrinsic × (1 − EOD slip); OTM → refuse as before; underlying unknown →
+underlying once per tick (`get_underlying_price`; SPX → `US..SPX`). Any ITM →
+sell at max(0.01, intrinsic × (1 − EOD slip)), because $0.01 ITM is still exercised
+into a full lot of stock; OTM → refuse as before; underlying unknown →
 refuse, and the TG lists those contracts as 价内价外未知. The 9/14 objection was
 "you don't know what it's worth"; intrinsic value is a known floor.
 
@@ -3052,8 +3057,8 @@ downside is priced in dollars.
 | 59 | 测试喂给函数的值，生产在那一刻还没有 | `test_overnight_0923.py::test_open_path_check_cannot_see_the_fill`（钉住现状：生产输入是限价，开仓检查必然放行）、`::test_stop_above_real_fill_is_dropped_on_backfill`（9/22 RKLB 按生产顺序重放）、`::test_gild_addon_replay_no_longer_dumps_all_eight`（端到端：回填 + SL tick 不卖）。**反向**：`::test_stop_below_real_fill_is_kept`。同批普通 bug：`::test_calls_next_week_is_next_friday` / `::test_calls_next_week_in_commentary_does_not_shift`（#42 同族）、`::test_hedged_close_is_not_an_instruction` / `::test_real_close_next_to_a_hedge_still_fires`（EN 侧是 #24 的形状）|
 | 60 | 已合并 ≠ 已部署；复盘读的是没 pull 的代码 | 无自动回归（流程问题）。防御：复盘先 `git fetch && git status -sb`，对照启动横幅的 sha；`ops/` 有改动时 pull 后必须重跑 `zsh ops/install.sh`。9/29 复盘建议①（PR#19 早已做完）就是这么来的 |
 | 61 | 只看自己匹配窗口的兜底，把"窗口外的信息"当成"没有" | `test_overnight_1002.py::test_date_before_ticker_is_used_not_this_friday`、`::test_ndte_between_strike_and_side_goes_to_redalert_template`（契约翻转，原文逐字）。**反向**：`::test_date_on_another_line_belongs_to_another_ticker`（第一版被全历史回放抓到的回归）、`::test_no_date_still_falls_back_to_this_friday`。**验证**：`replay_parse` 全历史 4,287 条只变 8 条（META 0DTE ×6、RKLB ×2）|
-| 62 | 看不懂的限定词 = 不过滤 = 全卖 | `test_overnight_1002.py::test_lottos_trim_leaves_the_weekly_alone`、`::test_puts_trim_only_touches_the_put`（契约翻转）、`::test_qualifier_matching_nothing_alerts_instead_of_selling_everything`。**反向**：`::test_qualifiers_far_from_the_ticker_are_ignored`（全历史里两条说的是别的合约）、`::test_without_qualifier_behaviour_is_unchanged` |
-| 63 | 到期日"什么都不做"本身就是一个动作（被行权） | `test_overnight_1002.py::test_expiry_itm_call_without_quote_sells_at_intrinsic`（契约翻转：10/2 FTNT）、`::test_expiry_itm_put_uses_strike_minus_spot`、`::test_underlying_price_maps_index_options_to_the_index`。**反向**：`::test_expiry_otm_without_quote_still_refuses`（9/14 的否决理由对价外仍成立）、`::test_expiry_unknown_moneyness_is_flagged_not_reassured`、`::test_non_expiry_no_quote_does_not_fetch_underlying` |
+| 62 | 看不懂的限定词 = 不过滤 = 全卖 | `test_overnight_1002.py::test_lottos_trim_leaves_the_weekly_alone`、`::test_puts_trim_only_touches_the_put`（契约翻转）、`::test_qualifier_matching_nothing_alerts_instead_of_selling_everything`。**反向**：`::test_qualifiers_far_from_the_ticker_are_ignored`（全历史里两条说的是别的合约）、`::test_without_qualifier_behaviour_is_unchanged`。PR#22 review 补：`::test_qualifier_binds_to_the_action_clause_occurrence`、`::test_qualifier_window_stops_at_clause_or_another_ticker`、`::test_every_explicit_target_gets_its_own_qualifier`、`::test_dedup_treats_a_different_named_side_as_a_new_instruction`、`::test_dedup_rollback_only_drops_its_own_registration` |
+| 63 | 到期日"什么都不做"本身就是一个动作（被行权） | `test_overnight_1002.py::test_expiry_itm_call_without_quote_sells_at_intrinsic`（契约翻转：10/2 FTNT）、`::test_expiry_itm_put_uses_strike_minus_spot`、`::test_underlying_price_maps_index_options_to_the_index`。**反向**：`::test_expiry_otm_without_quote_still_refuses`（9/14 的否决理由对价外仍成立）、`::test_expiry_unknown_moneyness_is_flagged_not_reassured`、`::test_non_expiry_no_quote_does_not_fetch_underlying`。PR#22 review 补：`::test_barely_itm_is_sold_not_labelled_otm`、`::test_expiry_underlying_is_fetched_once_per_tick` |
 | 64 | 一个开关管着两个走势相反的类目 | `test_0013_lotto_floor.py::test_0dte_lotto_not_covered`（契约翻转，原 `test_0dte_lotto_also_covered`）；lotto 本身仍由 `::test_lotto_floor_triggers_at_minus_85` 覆盖。生产 `.env` 要加 `LOTTO_STOP_LOSS_PCT=50` 才生效（代码缺省仍是关）|
 | 65 | 判断出场好坏，要把替代方案跑到它自己结束 | 无自动回归（复盘方法）。案例：10-01 复盘 INTC 124C 由「误平 -$150」更正为「+$90」|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
