@@ -981,6 +981,30 @@ def _extract_strike_hint(scope: str, symbols: list, full_text: str = "") -> tupl
     return (strike, side)
 
 
+# [10/2 TSM] 同一标的拿着几张时，喊单员不写 strike，靠紧跟 ticker 的 CALLS/PUTS/LOTTOS/NEXT WEEK 点名。
+# 只看 ticker 后 3 个词：「closed SPY …, almost took TSLA calls」「IBM round 2 also, lottos open」说的是别的。
+_QUALIFIER_WINDOW_TOKENS = 3
+_SIDE_QUALIFIERS = (("CALL", re.compile(r"\bcalls?\b|看涨", re.I)),
+                    ("PUT", re.compile(r"\bputs?\b|看跌", re.I)))
+_LOTTO_QUALIFIER_RE = re.compile(r"\blottos?\b|彩票|乐透", re.I)
+_SWING_QUALIFIER_RE = re.compile(r"\bnext\s+week\b|\bswings?\b|下周|波段", re.I)
+LOTTO_QUALIFIER_CATS = frozenset({"0dte", "0dte_lotto", "lotto"})
+SWING_QUALIFIER_CATS = frozenset({"weekly", "swing"})
+
+
+def extract_position_qualifiers(text: str, symbol: str) -> "tuple[str | None, frozenset | None]":
+    """紧跟 ticker 的方向词/类目词 → (side, categories)；两种方向或两类同时出现时该项为 None。"""
+    m = re.search(rf"(?<![A-Za-z]){re.escape(symbol)}(?![A-Za-z])", text)
+    if not m:
+        return None, None
+    window = " ".join(text[m.end():].split()[:_QUALIFIER_WINDOW_TOKENS])
+    sides = [s for s, r in _SIDE_QUALIFIERS if r.search(window)]
+    lotto = bool(_LOTTO_QUALIFIER_RE.search(window))
+    swing = bool(_SWING_QUALIFIER_RE.search(window))
+    cats = (LOTTO_QUALIFIER_CATS if lotto else SWING_QUALIFIER_CATS) if lotto != swing else None
+    return (sides[0] if len(sides) == 1 else None), cats
+
+
 # [9/18 回归] 「主语不在持仓就不改派」那条规则（#52）有个反噬：判据是
 # known_symbols = 我们**交易过**的 symbol，而里面混着若干同时是常用英文词的
 # ticker —— 我们买过 ServiceNow，于是 `ALL OUT NOW, 100% BANGER` 里的副词

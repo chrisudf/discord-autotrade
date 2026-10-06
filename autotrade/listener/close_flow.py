@@ -29,6 +29,7 @@ from autotrade.notify.messages import (
 from autotrade.notify.transport import _safe_notify
 from autotrade.parsing.close_parser import (
     STOP_AT_BREAKEVEN,
+    extract_position_qualifiers,
     parse_close,
     parse_stop_adjust,
     parse_symbolless_close,
@@ -449,6 +450,33 @@ async def handle_close_signal(
                 f"{len(matched)}/{len(positions)} positions selected"
             )
             positions = matched
+        # [10/2 TSM] 没写 strike 但点名了 PUTS / LOTTOS / NEXT WEEK：只卖被点名的几张；
+        # 滤空就提醒、不退回全卖（她明说周合约要拿过周末，系统还是一起卖了）
+        elif symbol == hint_source_symbol and len(positions) > 1:
+            q_side, q_cats = extract_position_qualifiers(raw, symbol)
+            if q_side or q_cats:
+                picked = [
+                    p for p in positions
+                    if (q_side is None or p["side"] == q_side)
+                    and (q_cats is None or p.get("category") in q_cats)
+                ]
+                desc = f"side={q_side} cats={sorted(q_cats) if q_cats else None}"
+                if not picked:
+                    logger.warning(
+                        f"[CLOSE] {symbol} qualifier {desc} matches none of "
+                        f"{[(p['strike'], p['side'][0], p.get('category')) for p in positions]}. Skipping."
+                    )
+                    await _safe_notify(format_close_skipped(
+                        f"{symbol} 有 {len(positions)} 个仓位，原文点名的（{desc}）一个都对不上，不平",
+                        raw,
+                    ))
+                    outcomes.append((Outcome.SKIPPED_NOTIFIED, symbol))
+                    continue
+                logger.info(
+                    f"[CLOSE] qualifier-filter: {symbol} {desc} → "
+                    f"{len(picked)}/{len(positions)} positions selected"
+                )
+                positions = picked
 
         # [9/9] 喊单员顺手声明的止损（"stop at entry now" / "止损设置为保本"）。
         # 放在这里而不是循环外：twin 防护、频道过滤、strike 过滤都已经生效，

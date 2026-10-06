@@ -41,7 +41,7 @@ from datetime import datetime, timezone, date as date_cls
 from zoneinfo import ZoneInfo
 
 from autotrade.broker.trade import place_sell_order
-from autotrade.broker.quote import describe_quote, get_last_price
+from autotrade.broker.quote import describe_quote, get_last_price, get_underlying_price
 from autotrade.parsing.holidays import is_early_close
 from autotrade.position import manager as position_mgr
 from autotrade.position import fill_checker
@@ -174,6 +174,19 @@ _expiry_alert_stage: dict = {}
 _FINAL_CALL_LEAD_MIN = int(os.getenv("EOD_NOQUOTE_FINAL_LEAD_MIN", "3"))
 
 
+# 价内不到 5 美分和归零没区别，卖不卖结果一样，仍按无报价处理
+_ITM_MIN_INTRINSIC = 0.05
+
+
+async def _intrinsic_value(pos: dict) -> "float | None":
+    """按标的现价算内在价值；标的也取不到时为 None（判断不了价内还是价外）。"""
+    spot = await asyncio.to_thread(get_underlying_price, pos["symbol"])
+    if spot is None:
+        return None
+    strike = float(pos["strike"])
+    return max(0.0, spot - strike) if pos["side"] == "CALL" else max(0.0, strike - spot)
+
+
 def _gc_skip(today_et: date_cls):
     """跨日清空 skip/alert set，避免昨天的失败影响今天。"""
     global _skip_until_date, _skip_until
@@ -228,6 +241,19 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float, today_iso: st
             # 时复盘还有日志可查）。变的只是 TG —— 不再每个仓位各发各的，
             # 改由 _report_no_quote 在本轮结束后汇总成一条，带上模式判定。
             is_expiry_today = fresh.get("expiry") == today_iso
+            # [10/2 FTNT] 到期日价内合约拒卖 = 被自动行权（9/25 FTNT/TEM 已发生）。
+            # 9/14 否决"无报价打折卖"是因为不知道值多少；标的现价给出了内在价值这个下限。
+            intrinsic = await _intrinsic_value(fresh) if is_expiry_today else None
+            if intrinsic is not None and intrinsic > _ITM_MIN_INTRINSIC:
+                limit = max(0.01, round(intrinsic * (1 - sell_slip), 2))
+                logger.warning(
+                    f"[eod] 🕒 ITM fallback {code}: no option quote, "
+                    f"intrinsic={intrinsic:.2f} qty={qty} limit={limit}"
+                )
+                return SellPlan(
+                    qty=qty, limit=limit, remark="eod_force", notify_pct=100,
+                    note=f"EOD ITM fallback (no quote, intrinsic={intrinsic:.2f})",
+                )
             logger.warning(
                 f"[eod] no quote for {code}, refusing entry-fallback sell, "
                 f"manual close required ("
@@ -238,6 +264,9 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float, today_iso: st
                 "code": code, "qty": qty,
                 "entry": fresh["avg_entry_price"],
                 "expiry_today": is_expiry_today,
+                # 到期日才有意义：OTM = 确认归零；unknown = 标的也没价，价内的话会被行权
+                "moneyness": (("unknown" if intrinsic is None else "OTM")
+                              if is_expiry_today else None),
             })
             return SkipSell(Outcome.SKIPPED_NOTIFIED)
 
@@ -418,9 +447,17 @@ async def _report_no_quote(now_et: datetime, cfg: dict) -> None:
                 "缺少「取到价的对照样本」，无法区分「这几张都恰好没市场」和"
                 "「行情源在返回空数据」—— 下面的逐条探测结果是判据。\n")
 
+    # 价内的已经按内在价值兜底卖了；剩下标的也没价的，不能和"确认价外"一起说"不用管"
+    unknown = [d["code"] for d in expiry_rows if d.get("moneyness") == "unknown"]
+    if unknown:
+        head += ("⚠️ 以下到期合约连标的价都取不到，判断不了是否价内 —— 价内的话不平会被行权，"
+                 f"请人工看一眼：{', '.join(unknown)}\n")
+
+    tag = {"OTM": " [价外]", "unknown": " [价内价外未知]"}
     lines = []
     for d, q in probes:
-        lines.append(f"• {d['code']} qty={d['qty']} entry=${d['entry']:.2f}\n    {q['detail']}")
+        lines.append(f"• {d['code']} qty={d['qty']} entry=${d['entry']:.2f}"
+                     f"{tag.get(d.get('moneyness'), '')}\n    {q['detail']}")
     if len(_tick_noquote) > len(probes):
         lines.append(f"• …另有 {len(_tick_noquote) - len(probes)} 张未逐一探测")
 

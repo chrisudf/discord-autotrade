@@ -200,6 +200,17 @@ def get_last_price(option_code: str):
     return get_last_prices([option_code]).get(option_code)
 
 
+# 指数期权的标的是指数本身：SPXW 合约的标的报价在 US..SPX
+_UNDERLYING_CODE = {"SPX": "US..SPX", "SPXW": "US..SPX"}
+
+
+def get_underlying_price(symbol: str) -> "float | None":
+    """标的最新价（EOD 到期日判断价内/价外用），走同一条 snapshot 路径；拿不到/stale 为 None。"""
+    sym = symbol.upper()
+    code = _UNDERLYING_CODE.get(sym, f"US.{sym}")
+    return get_last_prices([code]).get(code)
+
+
 def get_sell_ref_price(option_code: str) -> "float | None":
     """[0010] CLOSE 无价 fallback 的卖出参照价：优先 bid，其次 last，
     拿不到/stale 一律 None。

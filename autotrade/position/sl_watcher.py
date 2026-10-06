@@ -3,7 +3,7 @@
 职责：
 - 每 POLL_INTERVAL 秒一轮
 - 扫所有 apply_sl=True 的活跃仓位（全局 STOP_LOSS_PCT 档）
-- 另扫 category in ("lotto", "0dte_lotto") 的活跃仓位（0013 硬底档，
+- 另扫 category == "lotto" 的活跃仓位（0013 硬底档，
   LOTTO_STOP_LOSS_PCT>0 时启用）——同一条阈值/冻结/卖出代码，只是 pct 来源分档
 - 拿 broker.get_last_price，比对 avg_entry * (1 - 对应档位 pct)
 - 触发即全平（激进限价确保成交），调 on_close_filled + TG
@@ -19,9 +19,9 @@
 
 环境变量：
 - STOP_LOSS_PCT       : 默认 0.50（亏 50% 触发；**小数**）
-- LOTTO_STOP_LOSS_PCT : 代码缺省 "0"=关 [ship-dark]，生产模板给 80；**整数百分比**
+- LOTTO_STOP_LOSS_PCT : 代码缺省 "0"=关 [ship-dark]，生产模板给 50（10/5 前是 80）；**整数百分比**
                         （80 = 亏 80% 触发，与 STOP_LOSS_PCT 单位不同，勿混）。
-                        只作用于 category in ("lotto", "0dte_lotto") 的仓位。
+                        只作用于 category == "lotto"（10/5 起不含 0dte_lotto）。
 - SL_POLL_INTERVAL    : 默认 5 秒
 - SL_SELL_SLIP        : 默认 0.08（卖出限价相对当前价的下偏移，确保成交）
 - SL_RATCHET_AFTER_TP : 默认 1（开）。TP 档位命中后把止损底抬到上一级
@@ -140,7 +140,8 @@ def _cfg() -> dict:
 # runner-preserve 挡掉了 KC 的 trim，KC 又没发 100% close，最后整仓归零。
 # 放飞哲学保留：lotto 照旧不挂 TP、不吃全局 SL、放到 expiry；-80% 只是
 # "残值回收"（接近归零时把最后一点权利金抢回来），不是止损策略变更。
-LOTTO_CATEGORIES = ("lotto", "0dte_lotto")
+# [10/5] 只管多日 lotto：9/28-10/2 一周 lotto -72%、0dte_lotto +18%，0dte_lotto 当天有 EOD 兜底
+LOTTO_FLOOR_CATEGORIES = ("lotto",)
 
 
 # 已触发但尚未确认落库的 option_code。
@@ -330,7 +331,7 @@ async def _sl_tick():
             continue
         if p.get("apply_sl"):
             watch.append((p, cfg["sl_pct"]))
-        elif cfg["lotto_pct"] > 0 and p.get("category") in LOTTO_CATEGORIES:
+        elif cfg["lotto_pct"] > 0 and p.get("category") in LOTTO_FLOOR_CATEGORIES:
             watch.append((p, cfg["lotto_pct"]))
         elif p.get("manual_stop"):
             # [9/10] 喊单员**自己声明了绝对止损价**的仓位，无论类目都要看护。

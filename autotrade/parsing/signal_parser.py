@@ -269,6 +269,27 @@ def _weekly_expiry(text: str, today: date) -> "tuple[date, str]":
     return _adjust_expiry(_next_friday(today), context="B2 weekly"), "weekly"
 
 
+# [9/30 RKLB / 9/23 META] B2 只在 $TICKER 后面找日期：日期写在前面（"10/9 $RKLB $80 calls"）
+# 或写了 NDTE 时，兜底成本周五就是静默买错合约。NDTE 让给后面的 RedAlert 模板。
+# 只看 ticker 所在那一行：enrich 一条消息常列好几个合约，别行的日期属于别的 ticker（8/18 MU/CRWV）。
+_ANY_NDTE_RE = re.compile(r"\b\d+\s*DTE\b", re.IGNORECASE)
+_ANY_MMDD_RE = re.compile(r"(?<![\d/.$])(\d{1,2})/(\d{1,2})(?![\d/])")
+
+
+def _b2_expiry(line: str, text: str, today: date) -> "tuple[date, str] | None":
+    """B2 的到期日：本行有 NDTE 或多个日期 → None（不猜）；恰好一个 MM/DD → 用它；否则走本周兜底。"""
+    if _ANY_NDTE_RE.search(line):
+        return None
+    dates = set(_ANY_MMDD_RE.findall(line))
+    if len(dates) > 1:
+        return None
+    if dates:
+        mm, dd = (int(x) for x in dates.pop())
+        return _adjust_expiry(smart_expiry(mm, dd, today=today),
+                              context="B2 MM/DD elsewhere"), f"{mm}/{dd}"
+    return _weekly_expiry(text, today)
+
+
 _INVERTED_PRICE_STRIKE_RE = re.compile(
     r"\$(\.\d+|\d+\.\d+)"                             # $PRICE（必须带小数点）
     r"[\s\-–—]+"                                      # 空白 / 字段分隔破折号（含中文全角）
@@ -781,7 +802,12 @@ def _try_pattern_b(text: str, today: date):
     m = _b_match(p_weekly, text, 4)
     if m:
         symbol, strike, side, price = m.groups()
-        expiry_date, expiry_str = _weekly_expiry(text, today)
+        line_end = text.find("\n", m.start())
+        line = text[text.rfind("\n", 0, m.start()) + 1:line_end if line_end != -1 else None]
+        expiry = _b2_expiry(line, text, today)
+        if expiry is None:
+            return None
+        expiry_date, expiry_str = expiry
         return {
             "raw": text,
             "matched": m.group(0).strip(),
