@@ -2359,6 +2359,167 @@ written with the final state in hand; the code runs in the middle of the timelin
 
 ---
 
+## 60. Merged is not deployed, and a review that reads the checkout reviews the wrong code
+
+**Symptom**: PR#18–#21 were merged on 9/28 23:21. The checkout that launchd runs
+every night was never pulled, so ET 9/29–10/1 all ran `f1b9608`. On 10/1 the
+machine was on battery with the lid closed, slept through 23:11 — the exact case
+PR#18's watchdog exists for — and only started because someone opened the lid at
+23:23, six minutes before the open. The 9/29 review recommended "clear
+`manual_stop` on reopen", which PR#19 had already done: the reviewer read the
+stale checkout.
+
+**Why non-obvious**: every witness said "fine". The banner printed
+`f1b9608 @main 工作区干净` — "clean" is about local edits, not about being current.
+GitHub said merged. Tests on the checkout were green. Nothing compared what runs
+with what was decided.
+
+**Defense**: process. A review starts with `git fetch && git status -sb` and
+compares the behind-count with the banner's sha; a fix counts as live only once a
+night's banner shows its sha. A pull that touches `ops/` is not deployed until
+`zsh ops/install.sh` re-copies the launchd plists and scripts.
+
+**General form**: "merged", "deployed" and "running" are three facts with three
+witnesses (the PR page, the checkout, the process banner). Check the one your
+conclusion depends on.
+
+---
+
+## 61. A fallback that only looks inside its own match decides the missing information is absent
+
+**Symptom**: `Adding back some next weeks 10/9 $RKLB $80 calls $1.00` (9/30) bought
+the **10/2** contract — filled at 0.20 against a called 1.00.
+`:RedAlert: META - $755 0DTE CALLS $4.15` (9/21, 9/23) became Friday's contract.
+Both fell into B2, "no date → this Friday".
+
+**Why non-obvious**: B2's regex starts at `$TICKER`; the date sat before it, the
+`0DTE` between strike and side. "No date in my capture window" was read as "no
+date in the message". The comment above `_NEXT_WEEK_RE` already warned that B2's
+failure mode is a silent wrong contract, and the 9/10 fix covered one phrasing.
+The fill gate (#53) caught the RKLB fill only after the order had filled.
+
+**Defense**: `_b2_expiry` checks the ticker's whole line before falling back: one
+MM/DD → use it; NDTE or several dates → None, so the RedAlert template (or a Parse
+failed alert) takes it. The first version searched the whole message, and the
+full-history replay (`replay_parse`, 4,287 messages) caught a regression: enrich
+lists several contracts per message, and `$MU 8/19 …` on one line moved
+`$CRWV weekly …` on the next to 8/19. Restricted to the line: exactly the 8
+intended changes.
+
+**General form**: a default should check the whole input for the thing it is
+defaulting — and "whole" stops at the boundary of the thing it belongs to. Replay
+the full corpus; a fixture only holds the cases you already thought of.
+
+---
+
+## 62. "No qualifier I understand" became "every position"
+
+**Symptom**: 10/2 we held five ashley TSM contracts: a next-week 480C, two rounds
+of 0DTE calls, a 0DTE put. `TSM LOTTOS TRIMMED PROFITS` trimmed the 480C as well —
+after she had said `NEXT WEEK CALLS CAN SWING OVER THE WEEKEND`.
+`TSM PUTS TRIMMING MORE` also sold a call. About $350.
+
+**Why non-obvious**: the strike filter (#11) exists to prevent exactly this, but
+only fires on `SYM 480c`. A caller who scales into one ticker in rounds names the
+contract by kind — PUTS, LOTTOS, NEXT WEEK — never by strike. The hint extractor
+returned `(None, None)`, and `None` meant "no filter", i.e. all of them.
+
+**Defense**: `extract_position_qualifiers` reads side/category words in the 3
+tokens after the ticker, using the occurrence in the action sentence, and stops at
+a clause boundary or at the next ticker. `close_flow` applies it to every explicit
+target when the symbol has more than one position; filtering down to nothing sends
+a TG and sells nothing. The selectors are computed before dedup, so `TSM CALLS …`
+followed within 60s by `TSM PUTS …` is a second instruction, not a twin. A twin whose
+translation dropped the word (`TSM 呼叫更多`) is still a twin: a conflict needs both
+sides to name a selector. The window came from the 77 historical EN closes containing
+such words: in `closed the rest of SPY …, I almost took TSLA calls` and
+`Closing IBM round 2 also, lottos open …` the word is far from the ticker and
+means a different contract.
+
+**General form**: when a filter's input is "absent", ask whether the message
+carried a different kind of selector you don't parse. "No filter = all" is only
+safe when there is one candidate.
+
+---
+
+## 63. At expiry, the safe no-op is an action
+
+**Symptom**: 9/25 two ITM calls expired unsold and were auto-exercised: the SIM
+account now holds 300 FTNT at 171.666 (= 1×170 + 2×172.5 strikes) and 200 TEM at
+83. 10/2 FTNT 177.5C had no option quote for 8.5 minutes from 15:50 and sold at
+15:58:47 — 7 minutes from a third exercise.
+
+**Why non-obvious**: refusing to sell without a quote is a deliberate guard (7/25
+self-harm sell; 9/14 rejected "discount-sell when there is no quote" because you
+cannot tell $0.01 from $19.02). For an OTM contract, doing nothing is bounded: it
+expires worthless. For an ITM contract on expiry day, doing nothing is the most
+expensive action on the menu — an exercise into stock (in REAL: tens of thousands
+of dollars plus a weekend gap) — while the alert told the operator that most of
+the time there was nothing to do.
+
+**Defense**: on expiry day with no option quote, `eod_watcher` fetches the
+underlying once per tick (`get_underlying_price`; SPX → `US..SPX`). Any ITM →
+sell at max(0.01, intrinsic × (1 − EOD slip)), because $0.01 ITM is still exercised
+into a full lot of stock; OTM → refuse as before; underlying unknown →
+refuse, and the TG lists those contracts as 价内价外未知. The 9/14 objection was
+"you don't know what it's worth"; intrinsic value is a known floor.
+
+**General form**: a "do nothing" guard is only safe while doing nothing has a
+bounded outcome. Re-check such guards at deadlines — when time runs out, inaction
+becomes a decision, often the costliest one.
+
+---
+
+## 64. One switch, two categories moving in opposite directions
+
+**Symptom**: 9/28–10/2 the lotto legs lost 72% (−$3,571 at real fills): MRVL went
+from 2.86 to 6.10 in the first 35 minutes of its expiry day and was sold at 0.09;
+MU 1245C was held through earnings after the caller wrote "Expect 0". The same week
+0dte_lotto made +18%. The obvious fix was "turn on the existing floor",
+`LOTTO_STOP_LOSS_PCT`, which production never set.
+
+**Why non-obvious**: the switch is named for lotto, but
+`LOTTO_CATEGORIES = ("lotto", "0dte_lotto")` — flipping it would have put the floor
+on the one category that was making money. The weekly review first recommended it
+as "an existing switch, smallest change" before anyone read what the switch
+reaches. The template value (80, "residual recovery") and the estimated saving
+(about $700, computed at 50%) also disagreed without anyone noticing.
+
+**Defense**: the floor applies to `lotto` only (`LOTTO_FLOOR_CATEGORIES`);
+0dte_lotto still has EOD the same day. The template moves to 50, from the observe
+series 9/16–10/2: 50% recovers about $490 more than 80%, and the one position that
+later rallied (MRVL) would not have been captured anyway, because lotto has no TP.
+The lever the data actually points at — a lotto TP — is a separate decision.
+
+**General form**: before flipping a switch because of one category's numbers, read
+which categories it touches, and make the threshold and the estimate use the same
+number.
+
+---
+
+## 65. Grade an exit over the period the alternative would have lasted
+
+**Symptom**: the 9/30 review called INTC 124C a "buffer mis-exit, −$150": the
+caller's 1.00 stop was never touched that day, close 1.44, we sold at 1.06. But
+the contract expired 10/2, and 10/1 opened at 0.83 — below her stop. Held, it would
+have been stopped near 0.83; the early exit was worth about +$90.
+
+**Why non-obvious**: every number in the review was verified (K-lines, fills).
+The comparison was accurate; the horizon was wrong. The review's window was "the
+night", and for a multi-day contract "what if we had held" does not end at the
+bell.
+
+**Defense**: process. When judging an exit against the alternative, extend the
+price path to where the alternative would itself have ended (its stop, its EOD, its
+expiry). Applied to the 8.7% declared-stop buffer: 8 of 9 verifiable samples saw
+the caller's own stop breached eventually; only OKLO 38C is a possible mis-exit
+(about $64, inferred).
+
+**General form**: a counterfactual has to run until it would have ended, not until
+your data window does.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -2894,6 +3055,12 @@ downside is priced in dollars.
 | 57 | 同一个数字在建仓前后含义相反（止损 vs 移动止损锁利润）| `test_overnight_0922.py::test_declared_stop_above_our_fill_is_refused`（当晚原文：他喊 2.20、我们成交 1.51）、`::test_declared_stop_below_our_fill_is_recorded`（正常止损照收）。**反向不变量**：`::test_trailing_stop_above_entry_is_still_allowed_later` 与既有 `test_overnight_0909::test_manual_stop_only_ever_ratchets_up` —— 检查只能在开仓路径，放进 `set_manual_stop` 会拦掉合法的移动止损（第一版就是这么写的，被那条既有用例当场拦下）|
 | 58 | 靠某个事件清除的标记，可靠程度取决于谁在等那个事件 | `test_overnight_0923.py::test_fill_after_timeout_still_backfills_and_clears_the_flag`（契约翻转：当晚 MU 1105C 形状，超时后才成交）。**不变量**：`::test_still_no_fill_after_late_window_keeps_the_flag`（续查到上限仍无终态 = 仍然不知道，标记与在飞登记都保持，同 #34）。**未覆盖**：确认任务只在内存里，窗口内重启进程标记仍会卡住 |
 | 59 | 测试喂给函数的值，生产在那一刻还没有 | `test_overnight_0923.py::test_open_path_check_cannot_see_the_fill`（钉住现状：生产输入是限价，开仓检查必然放行）、`::test_stop_above_real_fill_is_dropped_on_backfill`（9/22 RKLB 按生产顺序重放）、`::test_gild_addon_replay_no_longer_dumps_all_eight`（端到端：回填 + SL tick 不卖）。**反向**：`::test_stop_below_real_fill_is_kept`。同批普通 bug：`::test_calls_next_week_is_next_friday` / `::test_calls_next_week_in_commentary_does_not_shift`（#42 同族）、`::test_hedged_close_is_not_an_instruction` / `::test_real_close_next_to_a_hedge_still_fires`（EN 侧是 #24 的形状）|
+| 60 | 已合并 ≠ 已部署；复盘读的是没 pull 的代码 | 无自动回归（流程问题）。防御：复盘先 `git fetch && git status -sb`，对照启动横幅的 sha；`ops/` 有改动时 pull 后必须重跑 `zsh ops/install.sh`。9/29 复盘建议①（PR#19 早已做完）就是这么来的 |
+| 61 | 只看自己匹配窗口的兜底，把"窗口外的信息"当成"没有" | `test_overnight_1002.py::test_date_before_ticker_is_used_not_this_friday`、`::test_ndte_between_strike_and_side_goes_to_redalert_template`（契约翻转，原文逐字）。**反向**：`::test_date_on_another_line_belongs_to_another_ticker`（第一版被全历史回放抓到的回归）、`::test_no_date_still_falls_back_to_this_friday`。**验证**：`replay_parse` 全历史 4,287 条只变 8 条（META 0DTE ×6、RKLB ×2）|
+| 62 | 看不懂的限定词 = 不过滤 = 全卖 | `test_overnight_1002.py::test_lottos_trim_leaves_the_weekly_alone`、`::test_puts_trim_only_touches_the_put`（契约翻转）、`::test_qualifier_matching_nothing_alerts_instead_of_selling_everything`。**反向**：`::test_qualifiers_far_from_the_ticker_are_ignored`（全历史里两条说的是别的合约）、`::test_without_qualifier_behaviour_is_unchanged`。PR#22 review 补：`::test_qualifier_binds_to_the_action_clause_occurrence`、`::test_qualifier_window_stops_at_clause_or_another_ticker`、`::test_every_explicit_target_gets_its_own_qualifier`、`::test_dedup_treats_a_different_named_side_as_a_new_instruction`、`::test_dedup_rollback_only_drops_its_own_registration` |
+| 63 | 到期日"什么都不做"本身就是一个动作（被行权） | `test_overnight_1002.py::test_expiry_itm_call_without_quote_sells_at_intrinsic`（契约翻转：10/2 FTNT）、`::test_expiry_itm_put_uses_strike_minus_spot`、`::test_underlying_price_maps_index_options_to_the_index`。**反向**：`::test_expiry_otm_without_quote_still_refuses`（9/14 的否决理由对价外仍成立）、`::test_expiry_unknown_moneyness_is_flagged_not_reassured`、`::test_non_expiry_no_quote_does_not_fetch_underlying`。PR#22 review 补：`::test_barely_itm_is_sold_not_labelled_otm`、`::test_expiry_underlying_is_fetched_once_per_tick` |
+| 64 | 一个开关管着两个走势相反的类目 | `test_0013_lotto_floor.py::test_0dte_lotto_not_covered`（契约翻转，原 `test_0dte_lotto_also_covered`）；lotto 本身仍由 `::test_lotto_floor_triggers_at_minus_85` 覆盖。生产 `.env` 要加 `LOTTO_STOP_LOSS_PCT=50` 才生效（代码缺省仍是关）|
+| 65 | 判断出场好坏，要把替代方案跑到它自己结束 | 无自动回归（复盘方法）。案例：10-01 复盘 INTC 124C 由「误平 -$150」更正为「+$90」|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |

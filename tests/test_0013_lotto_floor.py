@@ -3,7 +3,7 @@
 背景：AVGO 415C（7/23-24 夜）单张 lotto 从 +50% 一路拿到过期归零——
 runner-preserve 挡掉 trim、KC 没发 100% close、lotto 又不吃全局 SL，
 最终整仓归零。policy/positions.categorize 的 TODO（max_loss_pct -80% 硬底）
-在 sl_watcher 侧兑现：category in ("lotto", "0dte_lotto") 且
+在 sl_watcher 侧兑现：category == "lotto"（10/5 起不含 0dte_lotto）且
 LOTTO_STOP_LOSS_PCT>0 的仓位走与全局 SL 完全同一条代码，只是 pct 分档。
 
 契约测试矩阵（WP-D）：
@@ -11,7 +11,7 @@ LOTTO_STOP_LOSS_PCT>0 的仓位走与全局 SL 完全同一条代码，只是 pc
 - lotto -70% 不触发
 - env=0 完全不选（连报价都不取）
 - weekly 不受影响（照旧吃全局 STOP_LOSS_PCT）
-另加：0dte_lotto 同样覆盖、冻结语义（落库失败不重复卖）与全局 SL 共享、
+另加：0dte_lotto 不覆盖（10/5 契约翻转）、冻结语义（落库失败不重复卖）与全局 SL 共享、
 ship-dark 缺省（env 不设 = 关，护住 test_watchers 的既有断言）。
 """
 import asyncio
@@ -127,21 +127,22 @@ async def test_lotto_floor_holds_at_minus_70(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_0dte_lotto_also_covered(monkeypatch):
-    """0dte_lotto 同样吃硬底（EOD 强平之前的盘中残值回收）。"""
+async def test_0dte_lotto_not_covered(monkeypatch):
+    """[10/5 契约翻转] 0dte_lotto 不吃硬底：一周 0dte_lotto +18% 而 lotto -72%，当天还有 EOD 兜底。"""
     code = _uniq_code("LF3")
     _open_lotto("LFT3", code, category="0dte_lotto", qty=1, entry=1.00)
     sl_watcher._triggered.discard(code)
 
     monkeypatch.setenv("LOTTO_STOP_LOSS_PCT", "80")
+    sell_mock = MagicMock()
     with patch("autotrade.position.sl_watcher.get_last_prices",
                side_effect=_quotes_map({code: 0.10})), \
-         patch("autotrade.position.sl_watcher.place_sell_order",
-               return_value=_sell_ok(code, 1, 0.09)), \
+         patch("autotrade.position.sl_watcher.place_sell_order", sell_mock), \
          patch("autotrade.position.sl_watcher.send_telegram", new_callable=AsyncMock):
         await sl_watcher._sl_tick()
 
-    assert positions_db.get(code)["status"] == "CLOSED"
+    sell_mock.assert_not_called()
+    assert positions_db.get(code)["status"] == "OPEN"
 
 
 @pytest.mark.asyncio

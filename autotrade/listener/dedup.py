@@ -114,6 +114,25 @@ def _close_fingerprint(parsed: dict) -> tuple:
     return (parsed["kind"], syms, parsed["pct"])
 
 
+# [PR#22] 同一 fp 下按方向/类目限定词分开登记：fp → {冻结的 selectors: 登记时刻}
+_close_fp_sels: dict[tuple, dict] = {}
+
+
+def _freeze_selectors(sel: "dict | None") -> tuple:
+    return tuple(sorted((s, side, tuple(sorted(cats)) if cats else None)
+                        for s, (side, cats) in (sel or {}).items()))
+
+
+def _selectors_conflict(a: tuple, b: tuple) -> bool:
+    """两边都点名了方向/类目且不同才算两条指令；一边没写（机翻常把 CALLS 译丢）仍按孪生去重。"""
+    da, db = {s: (x, y) for s, x, y in a}, {s: (x, y) for s, x, y in b}
+    return any(
+        (da[s][0] and db[s][0] and da[s][0] != db[s][0])
+        or (da[s][1] and db[s][1] and da[s][1] != db[s][1])
+        for s in set(da) & set(db)
+    )
+
+
 def _is_duplicate_close(parsed: dict) -> tuple[bool, float]:
     """查重 + 登记，**原子**（单 event loop，中间无 await）。
 
@@ -125,25 +144,39 @@ def _is_duplicate_close(parsed: dict) -> tuple[bool, float]:
     "零成交且有 broker 失败" → _unregister_close_fp，让下一条孪生重试。
     """
     fp = _close_fingerprint(parsed)
+    sel = _freeze_selectors(parsed.get("selectors"))
     now = datetime.now(timezone.utc)
 
     _sweep_expired(_close_fps, now, CLOSE_FP_WINDOW)
+    for k in [k for k in _close_fp_sels if k not in _close_fps]:
+        _close_fp_sels.pop(k, None)
 
     prev_ts = _close_fps.get(fp)
     if prev_ts is not None:
-        return True, (now - prev_ts).total_seconds()
+        for seen, ts in (_close_fp_sels.get(fp) or {(): prev_ts}).items():
+            if now - ts <= CLOSE_FP_WINDOW and not _selectors_conflict(seen, sel):
+                return True, (now - ts).total_seconds()
 
     # cap 淘汰保留在查重之后、登记之前（与老版顺序一致，见 _sweep_expired 注释）
-    if len(_close_fps) >= _CLOSE_FP_MAX:
+    if fp not in _close_fps and len(_close_fps) >= _CLOSE_FP_MAX:
         oldest = min(_close_fps, key=_close_fps.get)
         _close_fps.pop(oldest, None)
+        _close_fp_sels.pop(oldest, None)
     _close_fps[fp] = now
+    _close_fp_sels.setdefault(fp, {})[sel] = now
     return False, 0.0
 
 
 def _unregister_close_fp(parsed: dict):
-    """回滚指纹：broker 失败且零成交时调用，让双语孪生版本充当天然重试。"""
-    _close_fps.pop(_close_fingerprint(parsed), None)
+    """回滚指纹：broker 失败且零成交时调用，让双语孪生版本充当天然重试。只撤这一条的登记。"""
+    fp = _close_fingerprint(parsed)
+    sels = _close_fp_sels.get(fp) or {}
+    sels.pop(_freeze_selectors(parsed.get("selectors")), None)
+    if sels:
+        _close_fps[fp] = max(sels.values())
+    else:
+        _close_fps.pop(fp, None)
+        _close_fp_sels.pop(fp, None)
 
 
 def _is_duplicate_signal(sig: dict) -> tuple[bool, float]:
