@@ -362,6 +362,8 @@ _HOLD_CONTEXT_TEMPLATES = (
     r"runners?\s+on\s+(?:the\s+)?\$?{sym}\b",
     r"hold(?:ing)?\s+(?:the\s+)?\$?{sym}\b",
     r"keep(?:ing)?\s+(?:the\s+)?\$?{sym}\b",
+    # [10/5] "out the rest of Apple, only leaving Tesla" —— Tesla 是留着的
+    r"leav(?:e|ing)\s+(?:the\s+|my\s+)?\$?{sym}\b",
     # "All cash now besides $HOOD 1.5% position"（7/15）——besides/except
     # 后面的 symbol 是**留着**的，close 目标是"其他所有"，不是它
     r"(?:besides|except(?:\s+for)?)\s+(?:the\s+|my\s+)?\$?{sym}\b",
@@ -384,8 +386,8 @@ def _in_hold_context(sym: str, text: str, is_zh: bool = False) -> bool:
     """
     templates = _ZH_HOLD_CONTEXT_TEMPLATES if is_zh else _HOLD_CONTEXT_TEMPLATES
     names = [sym]
-    if is_zh:
-        names += [n for n, t in ZH_NAME_TO_TICKER.items() if t == sym]
+    # 公司名两边都要查：EN 的 "only leaving Tesla" 和 ZH 的 "仅保留英伟达" 同理
+    names += [n for n, t in (ZH_NAME_TO_TICKER if is_zh else EN_NAME_TO_TICKER).items() if t == sym]
     for cand in names:
         for t in templates:
             if re.search(t.format(sym=re.escape(cand)), text, re.IGNORECASE):
@@ -990,16 +992,26 @@ _LOTTO_QUALIFIER_RE = re.compile(r"\blottos?\b|彩票|乐透", re.I)
 _SWING_QUALIFIER_RE = re.compile(r"\bnext\s+week\b|\bswings?\b|下周|波段", re.I)
 LOTTO_QUALIFIER_CATS = frozenset({"0dte", "0dte_lotto", "lotto"})
 SWING_QUALIFIER_CATS = frozenset({"weekly", "swing"})
+# [10/5 SPY] "SPY 1DTE TRIMMED MORE" 连 0DTE 也卖了：NDTE 按开仓时的类目分两档
+_NDTE_QUALIFIER_RE = re.compile(r"\b(\d{1,2})\s*DTE\b", re.I)
+ZERO_DTE_QUALIFIER_CATS = frozenset({"0dte", "0dte_lotto"})
+MULTI_DAY_QUALIFIER_CATS = frozenset({"weekly", "lotto", "swing"})
 # 窗口止于子句边界（不在数字中间的句点，"@ 2.50" 不算）：「TSM减仓，META看跌期权减仓」的看跌属于 META
 _CLAUSE_BOUNDARY_RE = re.compile(r"[,，;；!！?？\n]|(?<!\d)[.。](?!\d)")
 
 
 def _qualifiers_in(window: str) -> tuple:
     sides = [s for s, r in _SIDE_QUALIFIERS if r.search(window)]
-    lotto = bool(_LOTTO_QUALIFIER_RE.search(window))
-    swing = bool(_SWING_QUALIFIER_RE.search(window))
-    cats = (LOTTO_QUALIFIER_CATS if lotto else SWING_QUALIFIER_CATS) if lotto != swing else None
-    return (sides[0] if len(sides) == 1 else None), cats
+    named = []
+    if _LOTTO_QUALIFIER_RE.search(window):
+        named.append(LOTTO_QUALIFIER_CATS)
+    if _SWING_QUALIFIER_RE.search(window):
+        named.append(SWING_QUALIFIER_CATS)
+    for d in {int(x) for x in _NDTE_QUALIFIER_RE.findall(window)}:
+        named.append(ZERO_DTE_QUALIFIER_CATS if d == 0 else MULTI_DAY_QUALIFIER_CATS)
+    # 几类词取交集（"0DTE LOTTOS" → 0dte/0dte_lotto）；交集为空 = 自相矛盾，不过滤
+    cats = frozenset.intersection(*named) if named else None
+    return (sides[0] if len(sides) == 1 else None), (cats or None)
 
 
 def extract_position_qualifiers(text: str, symbol: str,

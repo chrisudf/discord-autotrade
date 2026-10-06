@@ -852,7 +852,8 @@ def _try_pattern_redalert(text: str, today: date):
     if not m or _price_qualified(text, m.start("price"), m.start()):
         return None
     gap = text[m.end("strike"):m.start("price")]
-    dte = re.search(r"(\d+)DTE", gap)
+    # [10/5 SPX] NDTE 也会写在价格后面（"CALLS .35 0DTE"），漏了就兜底成周五
+    dte = re.search(r"(\d+)DTE", gap) or re.match(r"\s*(\d+)\s*DTE\b", text[m.end("price"):])
     mmdd = re.search(r"(?<![\d.$])(\d{1,2})/(\d{1,2})(?![\d/])", m.group("mid"))
     if dte:
         expiry_date, expiry = _ndte_expiry(today, int(dte.group(1))), f"{dte.group(1)}DTE"
@@ -1102,10 +1103,13 @@ def _extract_tags(text: str) -> list:
     # ZH 对应词——ZH 归一化后 enrich 的 ZH 版常常先到先执行（7/17 "彩票头皮 -
     # $ARM ..." ZH 先下单，tags=[] → category 记成 0dte 而非 0dte_lotto；
     # 对周内 lotto 更要命：会被错挂 SL）。tags 决定 category/SL/EOD，必须双语。
-    zh_tag_map = {"彩票": "lotto", "波段": "swing", "头皮": "scalp", "日内": "day_trade"}
+    zh_tag_map = {"彩票": "lotto", "乐透": "lotto", "波段": "swing", "头皮": "scalp", "日内": "day_trade"}
     for zh, tag in zh_tag_map.items():
         if zh in text and tag not in tags:
             tags.append(tag)
+    # [10/5 MU] ashley 的 RISKY DAY TRADE 机翻成「风险日交易」，中文先到时 day_trade 丢失；今日/每日交易不算
+    if re.search(r"(?<![今每本当昨明])日交易", text) and "day_trade" not in tags:
+        tags.append("day_trade")
     return tags
 
 
