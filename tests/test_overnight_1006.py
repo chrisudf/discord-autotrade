@@ -162,3 +162,42 @@ async def test_passed_signal_still_gets_the_trigger_alert(monkeypatch):
     _wire(monkeypatch, placed, alerts, bg)
     await _open(":RedAlert: ORCL - $147 CALLS EXPIRATION THIS WEEK $2.47, STOP LOSS AT $2.00 @everyone")
     assert placed == ["ORCL"] and len(bg) == 1
+
+
+# ============================================================
+# 4. PR#24 review（Copilot 2 条）
+# ============================================================
+
+ZH_LONG = ("enrich:\n这是我明天持有的内容：\n\n$SMCI 10/6 $45 看涨期权\n\n$DELL 10/9 $600 看涨期权，回调可以再加一点\n\n"
+           "$ANET 10/9 $212.5 看涨期权，跑者继续拿着\n\n目前已锁定我所有的 $NBIS $RKLB。\n\n@everyone $alert")
+
+
+def test_long_holding_list_keeps_every_listed_ticker():
+    """review：40 字上限时第三个持有的标的会被当成平仓目标；现在一直看到第一个平仓动词。"""
+    assert ZH_LONG.index("$ANET") - ZH_LONG.index("：") > 40, "用例要真的越过旧上限"
+    r = parse_close(ZH_LONG, {"SMCI", "DELL", "ANET", "NBIS", "RKLB"})
+    assert r["symbols"] == ["NBIS", "RKLB"] and r["pct"] == 100
+
+
+def _snapshot_with_age(monkeypatch, age_sec, with_time=True):
+    import pandas as pd
+    from zoneinfo import ZoneInfo
+    from autotrade.broker import quote
+    ts = (datetime.now(ZoneInfo("America/New_York")) - timedelta(seconds=age_sec)).strftime("%Y-%m-%d %H:%M:%S")
+    row = {"code": "US.X", "ask_price": 0.87, "last_price": 0.85}
+    if with_time:
+        row["update_time"] = ts
+    monkeypatch.setattr(quote, "_is_dry_run", lambda: False)
+    monkeypatch.setattr(quote, "_snapshot", lambda codes: (quote.RET_OK, pd.DataFrame([row])))
+    return quote
+
+
+def test_stale_quote_is_treated_as_unknown(monkeypatch):
+    """review：这个价会拦单。延迟档 ~15min 的旧报价拿来比，0DTE 翻倍就会误拦真信号 → 当没有，放行。"""
+    q = _snapshot_with_age(monkeypatch, 15 * 60)
+    assert q.get_buy_ref_price("US.X") is None
+
+
+def test_fresh_quote_is_used_and_missing_time_is_unknown(monkeypatch):
+    assert _snapshot_with_age(monkeypatch, 5).get_buy_ref_price("US.X") == 0.87
+    assert _snapshot_with_age(monkeypatch, 5, with_time=False).get_buy_ref_price("US.X") is None

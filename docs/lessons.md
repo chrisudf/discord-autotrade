@@ -2565,13 +2565,66 @@ available before the order: the same snapshot the watchers poll every 5 seconds.
 
 **Defense**: `open_flow._quote_mismatch` takes one snapshot (ask, else last) before
 risk/order. A called price more than `OPEN_QUOTE_GUARD_RATIO` (2.0) away from the
-quote → no order, TG with both numbers. No quote or an error → let it through, so a
-quote outage cannot stop trading. Calibration: of 208 historical fills, one was 2×
+quote → no order, TG with both numbers. No quote, an error, or a stale quote (#68)
+→ let it through, so a quote outage cannot stop trading. Calibration: of 208 historical fills, one was 2×
 or more off the call, and it was the TSLA wrong contract.
 
 **General form**: when a post-hoc check keeps catching the same class of error, ask
 whether the input it uses existed earlier. If it did, the check belongs before the
 irreversible step, and the post-hoc one becomes the backstop.
+
+---
+
+## 68. A fail-open guard is only fail-open if "unknown" includes "stale"
+
+**Symptom**: PR#24's pre-trade quote guard (#67) fetched ask/last with no freshness
+check. Every other quote consumer drops snapshots older than 60 s. The docstring
+even said "no freshness filter — only comparing order of magnitude". Review
+(Copilot): delayed-data accounts return quotes about 15 minutes old, and right
+after the open the snapshot can still carry yesterday's last. A 0DTE lotto moves
+2× in minutes, so the guard would have blocked valid live signals.
+
+**Why non-obvious**: the guard was designed fail-open (no quote → place the order)
+so that a quote problem can't stop trading. But to the code a stale quote is not
+"no quote" — it is a number, so it flows into the comparison, and the guard fails
+*closed* under exactly the degraded feed it was meant to tolerate. "Only order of
+magnitude" made freshness feel irrelevant. For options, 15 minutes can be an order
+of magnitude.
+
+**Defense**: `get_buy_ref_price` returns None when the snapshot is older than
+`QUOTE_FRESHNESS_SEC`, or when its age can't be read. The guard then lets the order
+through. Cost: coverage drops when a contract hasn't printed recently. That trade is
+deliberate — a missed guard is a backstop away (the fill gate); a false block is a
+lost trade.
+
+**General form**: for a fail-open guard, list every way its input can be wrong —
+missing, error, stale, from another instrument — and make sure each one maps to
+"unknown", not to a value.
+
+---
+
+## 69. A length cap on "scan until X" is a second, silent boundary
+
+**Symptom**: the ZH holding-list rule (`持有的内容：` … up to the first close verb)
+carried a `{0,40}` cap out of the habit of bounding regexes. The rule means
+"everything listed before the close clause is held". The cap turned it into "the
+first ~40 characters". A third ticker in a longer list would have become a close
+target. Review caught it, not the tests: the only test case had one held ticker 4
+characters after the colon.
+
+**Why non-obvious**: bounding a lazy match is usually the safe move, because it
+limits how far a pattern can wander. Here wandering is the safe direction.
+Over-extending the held region can only sell less, while the cap fails toward
+selling positions the caller is keeping. Which side of a bound is safe depends on
+what the match is used for.
+
+**Defense**: the tempered match runs to the first close verb (list widened to the
+close verbs the parser knows) with no cap. Regression test: a three-ticker list
+whose third ticker is more than 40 characters after the colon.
+
+**General form**: before bounding a matcher, ask what an over-match and an
+under-match each cost, and bound only on the side where overrunning is the
+dangerous failure. Test with the longest realistic input, not just the incident's.
 
 ---
 
@@ -3118,6 +3171,8 @@ downside is priced in dollars.
 | 65 | 判断出场好坏，要把替代方案跑到它自己结束 | 无自动回归（复盘方法）。案例：10-01 复盘 INTC 124C 由「误平 -$150」更正为「+$90」|
 | 66 | 孪生去重后，只有被丢掉那条才有的字段跟着丢了 | `test_overnight_1005.py::test_zh_risky_day_trade_is_day_trade`、`::test_zh_letou_is_lotto`（契约翻转，当晚原文）。**反向**：`::test_today_trading_is_not_day_trade`。同批普通 bug：`::test_only_leaving_tesla_keeps_tesla` / `::test_leaving_also_works_with_the_ticker`（hold-context 补 leaving、EN 查公司名；反向 `::test_plain_close_of_a_company_name_still_closes`）、`::test_ndte_after_price_is_today`（RedAlert 价格后的 NDTE；不变量 `::test_ndte_before_price_and_weekly_are_unchanged`）、`::test_ndte_qualifier_maps_to_two_buckets` / `::test_1dte_trim_leaves_the_0dte_rounds_alone`（#62 加 NDTE 一档）|
 | 67 | 成交之后的检查是报告，不是防护 | `test_overnight_1006.py::test_typo_price_is_not_ordered_and_says_why`（契约翻转，当晚原文）、`::test_quote_guard_flags_order_of_magnitude_mismatch`（ANET $90 / 9/30 RKLB）。**反向**：`::test_quote_guard_lets_normal_and_unknown_quotes_through`（拿不到报价放行）、`::test_matching_quote_still_orders`。同批：`::test_holding_list_keeps_the_listed_ticker_and_lock_all_is_full` / `::test_lock_all_sells_rklb_fully_and_leaves_smci`（中文持有清单 + 锁定所有；反向 `::test_lock_wording_without_all_my_is_unchanged`）、`::test_risk_blocked_signal_sends_one_alert_with_the_contract`（风控拦截后不报「新信号触发」）|
+| 68 | 失败放行的防护，「不知道」必须包括「过期了」 | `test_overnight_1006.py::test_stale_quote_is_treated_as_unknown`（PR#24 review：15 分钟前的报价当没有）、`::test_fresh_quote_is_used_and_missing_time_is_unknown`（读不出时间也当没有）|
+| 69 | 「一直到 X 为止」加了长度上限，就多了一道看不见的边界 | `test_overnight_1006.py::test_long_holding_list_keeps_every_listed_ticker`（PR#24 review：第三个持有标的离冒号 40 字以外）|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |
