@@ -11,6 +11,7 @@ import asyncio
 import re
 from datetime import datetime, timezone
 
+from autotrade.broker.quote import get_buy_ref_price
 from autotrade.broker.trade import place_order
 from autotrade.listener.dedup import (
     _ADDON_ALERT_WINDOW,
@@ -43,7 +44,7 @@ from autotrade.notify.transport import _safe_notify, notify_bg
 from autotrade.parsing.close_parser import STOP_AT_BREAKEVEN, parse_stop_adjust
 from autotrade.parsing.signal_parser import parse_signal
 from autotrade.policy.guards import _suspicious_long_dte
-from autotrade.policy.pricing import breakeven_exit_price, calc_limit_price
+from autotrade.policy.pricing import breakeven_exit_price, build_option_code, calc_limit_price
 from autotrade.position import fill_checker
 from autotrade.position import manager as position_mgr
 from autotrade.risk import check_order, record_order
@@ -51,6 +52,24 @@ from autotrade.storage import positions_db
 from autotrade.storage.logger_db import log_order
 from autotrade.utils.envcfg import env_float
 from autotrade.utils.logger import logger
+
+def _quote_mismatch(signal: dict) -> "str | None":
+    """喊价和合约报价差 OPEN_QUOTE_GUARD_RATIO 倍以上 → 返回说明；拿不到报价时放行（不让行情故障挡住下单）。"""
+    try:
+        code = build_option_code(signal["symbol"], signal["expiry_date"], signal["strike"], signal["side"])
+        ref = get_buy_ref_price(code)
+    except Exception:
+        logger.exception("[quote-guard] 取报价失败，放行")
+        return None
+    price = signal.get("price") or 0
+    if not ref or price <= 0:
+        return None
+    ratio = max(price / ref, ref / price)
+    # 历史 208 笔成交里成交价和喊价差 2 倍以上的只有 1 笔（8/19 TSLA 470C 喊 2.75 成交 0.13，买错合约）
+    if ratio < env_float("OPEN_QUOTE_GUARD_RATIO", 2.0, minimum=1.2):
+        return None
+    return f"{code} 喊价 {price:g}，报价 {ref:.2f}，差 {ratio:.1f} 倍（打错价，或者解析出的不是这张合约）"
+
 
 def _apply_declared_stop(raw: str, option_code: str, entry: float) -> None:
     """开仓喊话里**自带**的止损价 → positions.manual_stop。任何情况下都不抛。
@@ -305,26 +324,14 @@ async def process_open(message, raw, cfg, cid, t0, msg_date_et):
         ))
         return
 
-    # TODO P3: symbol blacklist
+    # [10/6 ANET "$90" / 9/30 RKLB 买错到期日] 下单前拿合约报价比一下数量级：成交后才拦（fill_checker 闸门）已经晚了
+    mismatch = await asyncio.to_thread(_quote_mismatch, signal)
+    if mismatch:
+        logger.warning(f"[quote-guard] {mismatch} — 不下单: {raw[:80]}")
+        await _safe_notify(format_error("喊价和报价对不上，未下单", f"{mismatch}\n\n{raw[:200]}"))
+        return
 
-    # 解析成功立即预警，带 breakeven 提示 + KC tags
-    # [7/23] 改后台发送：预警 TG round-trip（7/22 夜实测 ~1.2s）不再垫在
-    # 风控→下单前面，省下的全是滑点。消息仍必发（notify_bg 持强引用），
-    # 只是可能晚于"下单成功"通知到达。风控拒单/下单结果等通知保持同步 await。
-    entry_p = signal.get("price", 0) or 0
-    be_info = breakeven_exit_price(entry_p) if entry_p > 0 else None
-    notify_bg(format_signal_alert(
-        cfg.name,
-        signal["symbol"],
-        signal["strike"],
-        signal["expiry"],
-        signal["side"][0],
-        entry_p,
-        cfg.default_qty,
-        signal.get("action", "OPEN"),
-        breakeven=be_info,
-        tags=signal.get("tags") or None,
-    ))
+    # TODO P3: symbol blacklist
 
     # ---- 风控 + 下单 + 配额记录：整段串行 ----
     # check_order 与 record_order 之间隔着 broker RTT（await），没有锁的话
@@ -351,12 +358,32 @@ async def process_open(message, raw, cfg, cid, t0, msg_date_et):
             effective_price=calc_limit_price(signal["price"]),
         )
 
+        contract = (f"{signal['symbol']} {signal['strike']}{signal['side'][0]} "
+                    f"{signal.get('expiry', '')} @ {signal.get('price')}")
         if not risk_result.passed:
             logger.warning(
                 f"🛡️  Risk blocked: {risk_result.reason} - {risk_result.detail}"
             )
-            await _safe_notify(format_risk_blocked(risk_result.reason, risk_result.detail))
+            # [10/6] 被拦的信号不再先发"🟢 新信号触发"，合约写进拦截通知里
+            await _safe_notify(format_risk_blocked(risk_result.reason, f"{contract}\n{risk_result.detail}"))
             return
+
+        # 解析成功预警，带 breakeven 提示 + KC tags。[7/23] 后台发送，不垫在下单前面；
+        # [10/6] 挪到风控通过之后，免得被拦的信号先报一条"触发"
+        entry_p = signal.get("price", 0) or 0
+        be_info = breakeven_exit_price(entry_p) if entry_p > 0 else None
+        notify_bg(format_signal_alert(
+            cfg.name,
+            signal["symbol"],
+            signal["strike"],
+            signal["expiry"],
+            signal["side"][0],
+            entry_p,
+            cfg.default_qty,
+            signal.get("action", "OPEN"),
+            breakeven=be_info,
+            tags=signal.get("tags") or None,
+        ))
 
         # ---- 下单 ----
         # 下单（broker.place_order 是同步函数，必须 to_thread 包装）

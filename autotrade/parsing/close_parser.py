@@ -376,6 +376,9 @@ _ZH_HOLD_CONTEXT_TEMPLATES = (
     r"留着?[^\n，。]{{0,6}}{sym}",
     # "除了 $HOOD 1.5% 的头寸外，现在全是现金"（7/15）
     r"除了?[^\n，。]{{0,8}}{sym}",
+    # [10/6 enrich]「这是我明天持有的内容：\n\n$SMCI …\n\n目前已锁定我所有的 $NBIS $RKLB」：
+    # 冒号后列的是留着的，可以跨空行，一直到第一个平仓动词为止（不设字数上限：清单长了第三个标的会被卖）
+    r"持有的?内容[：:](?:(?!锁定|平仓|平掉|清仓|清空|全平|卖出|减仓|减持|出清|止盈|砍仓)[\s\S])*?{sym}",
 )
 
 
@@ -1382,8 +1385,12 @@ def _has_zh_bulk(text: str) -> bool:
     return any(m in text for m in ZH_BULK_MARKERS)
 
 
+# [10/6 enrich]「已锁定我所有的 $NBIS $RKLB」是全平，不是默认 33%。「全部锁定」不算（7/17 语料契约 33%，EN 孪生也是 33）
+_ZH_LOCK_ALL_RE = re.compile(r"锁定了?我?的?所有")
+
+
 def _has_zh_full_close(text: str) -> bool:
-    return any(v in text for v in ZH_FULL_CLOSE_VERBS)
+    return any(v in text for v in ZH_FULL_CLOSE_VERBS) or bool(_ZH_LOCK_ALL_RE.search(text))
 
 
 def _zh_action_sentences(text: str) -> str:
