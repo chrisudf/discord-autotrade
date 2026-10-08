@@ -211,6 +211,22 @@ def get_underlying_price(symbol: str) -> "float | None":
     return get_last_prices([code]).get(code)
 
 
+def get_buy_ref_price(option_code: str) -> "float | None":
+    """[10/6] 下单前比数量级用的报价：优先 ask，其次 last；不做新鲜度过滤，拿不到为 None。"""
+    if _is_dry_run():
+        return get_last_price(option_code)
+    ret, df = _snapshot([option_code])
+    if ret != RET_OK or df is None or not hasattr(df, "iterrows") or len(df) == 0:
+        return None
+    import pandas as pd
+    row = df.iloc[0]
+    for k in ("ask_price", "last_price"):
+        v = row.get(k)
+        if v is not None and not pd.isna(v) and v > 0:
+            return float(v)
+    return None
+
+
 def get_sell_ref_price(option_code: str) -> "float | None":
     """[0010] CLOSE 无价 fallback 的卖出参照价：优先 bid，其次 last，
     拿不到/stale 一律 None。

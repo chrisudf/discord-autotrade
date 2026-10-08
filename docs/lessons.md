@@ -2549,6 +2549,32 @@ language-independent, or merge before discarding.
 
 ---
 
+## 67. A check after the fill is a report, not a guard
+
+**Symptom**: three wrong contracts reached the broker in six weeks. 8/19 TSLA 470C:
+called 2.75, filled 0.13. 9/30 RKLB 80C (a date-before-ticker parse, #61): called
+1.00, filled 0.20. 10/6 `ANET - $220 CALLS … $90` (`.90` typed as `$90`). The fill
+gate in `fill_checker` caught the first two and refused to backfill the cost — after
+the order had already filled. The third was stopped only because $90 × 400 happened
+to exceed the daily budget.
+
+**Why non-obvious**: the gate looks like protection. It sends a TG, marks the cost
+unknown and keeps SL/TP off the bad number. But every one of those actions happens
+once the money is spent. The information it needs — the contract's real price — was
+available before the order: the same snapshot the watchers poll every 5 seconds.
+
+**Defense**: `open_flow._quote_mismatch` takes one snapshot (ask, else last) before
+risk/order. A called price more than `OPEN_QUOTE_GUARD_RATIO` (2.0) away from the
+quote → no order, TG with both numbers. No quote or an error → let it through, so a
+quote outage cannot stop trading. Calibration: of 208 historical fills, one was 2×
+or more off the call, and it was the TSLA wrong contract.
+
+**General form**: when a post-hoc check keeps catching the same class of error, ask
+whether the input it uses existed earlier. If it did, the check belongs before the
+irreversible step, and the post-hoc one becomes the backstop.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -3091,6 +3117,7 @@ downside is priced in dollars.
 | 64 | 一个开关管着两个走势相反的类目 | `test_0013_lotto_floor.py::test_0dte_lotto_not_covered`（契约翻转，原 `test_0dte_lotto_also_covered`）；lotto 本身仍由 `::test_lotto_floor_triggers_at_minus_85` 覆盖。生产 `.env` 要加 `LOTTO_STOP_LOSS_PCT=50` 才生效（代码缺省仍是关）|
 | 65 | 判断出场好坏，要把替代方案跑到它自己结束 | 无自动回归（复盘方法）。案例：10-01 复盘 INTC 124C 由「误平 -$150」更正为「+$90」|
 | 66 | 孪生去重后，只有被丢掉那条才有的字段跟着丢了 | `test_overnight_1005.py::test_zh_risky_day_trade_is_day_trade`、`::test_zh_letou_is_lotto`（契约翻转，当晚原文）。**反向**：`::test_today_trading_is_not_day_trade`。同批普通 bug：`::test_only_leaving_tesla_keeps_tesla` / `::test_leaving_also_works_with_the_ticker`（hold-context 补 leaving、EN 查公司名；反向 `::test_plain_close_of_a_company_name_still_closes`）、`::test_ndte_after_price_is_today`（RedAlert 价格后的 NDTE；不变量 `::test_ndte_before_price_and_weekly_are_unchanged`）、`::test_ndte_qualifier_maps_to_two_buckets` / `::test_1dte_trim_leaves_the_0dte_rounds_alone`（#62 加 NDTE 一档）|
+| 67 | 成交之后的检查是报告，不是防护 | `test_overnight_1006.py::test_typo_price_is_not_ordered_and_says_why`（契约翻转，当晚原文）、`::test_quote_guard_flags_order_of_magnitude_mismatch`（ANET $90 / 9/30 RKLB）。**反向**：`::test_quote_guard_lets_normal_and_unknown_quotes_through`（拿不到报价放行）、`::test_matching_quote_still_orders`。同批：`::test_holding_list_keeps_the_listed_ticker_and_lock_all_is_full` / `::test_lock_all_sells_rklb_fully_and_leaves_smci`（中文持有清单 + 锁定所有；反向 `::test_lock_wording_without_all_my_is_unchanged`）、`::test_risk_blocked_signal_sends_one_alert_with_the_contract`（风控拦截后不报「新信号触发」）|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |
