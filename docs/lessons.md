@@ -2520,6 +2520,35 @@ your data window does.
 
 ---
 
+## 66. When twins are deduplicated, whatever only the loser carried is gone
+
+**Symptom**: 10/5 `:RedAlert: MU - $1100 CALLS 10/9 $9.80, RISKY DAY TRADE`.
+The Chinese twin (`…，风险日交易`) arrived 1 second earlier, parsed with `tags=[]`,
+and opened the position with `eod_force=False`. The English twin was correctly
+dropped as a duplicate, and `day_trade` went with it: the "risky day trade" was held
+overnight. Same night: SPY 773C `CHEAP LOTTO PLAY` opened from `便宜的乐透玩法` as
+`0dte`, not `0dte_lotto`. Replaying history, 48 ZH opens lose a tag their EN twin has.
+More than a dozen are multi-day lottos (ZETA, PLTR, NVDA, TSM, DDOG, PANW `摆动乐透`)
+that became `weekly` (50% SL, TP ladder) or `lotto` depending on which language
+landed first.
+
+**Why non-obvious**: twin dedup is correct and #21/#24 already say "fix both
+languages". But the dedup key is the contract, not the message. Once the twins are
+"the same signal", nothing compares what each one parsed. The ZH tag map was
+written from the words one translation happened to use (`彩票`, `日内`); the same
+caller's next message came through as `乐透` and `日交易`.
+
+**Defense**: `zh_tag_map` adds `乐透` → lotto. `日交易` → day_trade unless preceded by
+今/每/本/当/昨/明 (history has no false hit). The structural fix — merge tags from the
+deduplicated twin into the open position — is not done. Category and `eod_force`
+are decided at open, and changing them after the fact is its own risk.
+
+**General form**: when a deduplicator keeps the first of two copies, any field only
+the second could produce is decided by arrival order. Either make every field
+language-independent, or merge before discarding.
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -3061,6 +3090,7 @@ downside is priced in dollars.
 | 63 | 到期日"什么都不做"本身就是一个动作（被行权） | `test_overnight_1002.py::test_expiry_itm_call_without_quote_sells_at_intrinsic`（契约翻转：10/2 FTNT）、`::test_expiry_itm_put_uses_strike_minus_spot`、`::test_underlying_price_maps_index_options_to_the_index`。**反向**：`::test_expiry_otm_without_quote_still_refuses`（9/14 的否决理由对价外仍成立）、`::test_expiry_unknown_moneyness_is_flagged_not_reassured`、`::test_non_expiry_no_quote_does_not_fetch_underlying`。PR#22 review 补：`::test_barely_itm_is_sold_not_labelled_otm`、`::test_expiry_underlying_is_fetched_once_per_tick` |
 | 64 | 一个开关管着两个走势相反的类目 | `test_0013_lotto_floor.py::test_0dte_lotto_not_covered`（契约翻转，原 `test_0dte_lotto_also_covered`）；lotto 本身仍由 `::test_lotto_floor_triggers_at_minus_85` 覆盖。生产 `.env` 要加 `LOTTO_STOP_LOSS_PCT=50` 才生效（代码缺省仍是关）|
 | 65 | 判断出场好坏，要把替代方案跑到它自己结束 | 无自动回归（复盘方法）。案例：10-01 复盘 INTC 124C 由「误平 -$150」更正为「+$90」|
+| 66 | 孪生去重后，只有被丢掉那条才有的字段跟着丢了 | `test_overnight_1005.py::test_zh_risky_day_trade_is_day_trade`、`::test_zh_letou_is_lotto`（契约翻转，当晚原文）。**反向**：`::test_today_trading_is_not_day_trade`。同批普通 bug：`::test_only_leaving_tesla_keeps_tesla` / `::test_leaving_also_works_with_the_ticker`（hold-context 补 leaving、EN 查公司名；反向 `::test_plain_close_of_a_company_name_still_closes`）、`::test_ndte_after_price_is_today`（RedAlert 价格后的 NDTE；不变量 `::test_ndte_before_price_and_weekly_are_unchanged`）、`::test_ndte_qualifier_maps_to_two_buckets` / `::test_1dte_trim_leaves_the_0dte_rounds_alone`（#62 加 NDTE 一档）|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |
