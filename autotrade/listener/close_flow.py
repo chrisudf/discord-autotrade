@@ -29,6 +29,8 @@ from autotrade.notify.messages import (
 from autotrade.notify.transport import _safe_notify
 from autotrade.parsing.close_parser import (
     STOP_AT_BREAKEVEN,
+    expiry_in_scope,
+    extract_expiry_qualifier,
     extract_position_qualifiers,
     parse_close,
     parse_stop_adjust,
@@ -296,6 +298,7 @@ async def handle_close_signal(
     if parsed["kind"] == "CLOSE":
         syms = parsed.get("symbols") or []
         parsed["selectors"] = {s: extract_position_qualifiers(raw, s, syms) for s in syms}
+        parsed["expiry_sel"] = {s: extract_expiry_qualifier(raw, s, syms) for s in syms}
 
     # CLOSE dedup —— 双语双发 / 同信号重发拦截（查即登记，原子堵双发窗口；
     # broker 失败时末尾回滚指纹，孪生版本充当重试）
@@ -460,13 +463,15 @@ async def handle_close_signal(
         # strike hint 只属于第一个标的，限定词每个标的各有各的（"Trimmed TSM CALLS and META PUTS"）
         elif parsed["kind"] == "CLOSE" and len(positions) > 1:
             q_side, q_cats = (parsed.get("selectors") or {}).get(symbol, (None, None))
-            if q_side or q_cats:
+            q_exp = (parsed.get("expiry_sel") or {}).get(symbol)
+            if q_side or q_cats or q_exp:
                 picked = [
                     p for p in positions
                     if (q_side is None or p["side"] == q_side)
                     and (q_cats is None or p.get("category") in q_cats)
+                    and expiry_in_scope(p["expiry"], q_exp, today_et())
                 ]
-                desc = f"side={q_side} cats={sorted(q_cats) if q_cats else None}"
+                desc = f"side={q_side} cats={sorted(q_cats) if q_cats else None} expiry={q_exp}"
                 if not picked:
                     logger.warning(
                         f"[CLOSE] {symbol} qualifier {desc} matches none of "

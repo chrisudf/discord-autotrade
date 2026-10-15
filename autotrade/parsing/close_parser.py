@@ -44,6 +44,7 @@ TODO（实测调整）：
   把 symbols 必须 in open_symbols 这一硬约束保留住。
 """
 import re
+from datetime import date, timedelta
 from typing import Optional
 
 from autotrade.utils.logger import logger
@@ -334,10 +335,11 @@ FULL_CLOSE_VERBS = ["closed", "closing", "cutting", "cut ", "dumped", "dumping"]
 # pct 悄悄掉回默认 33（比原缺陷更贵）。只收描述仓位大小/性质的词。
 _PCT_SIZE_ADJ = r"(?:lotto|starter|core|runner|swing|scalp|day|initial|small|full|tiny)"
 _PCT_SIZE_NOUN = r"(?:position|pos\b|sizing|cash)"
+# "CAN USE A 25% SL" 是给拿着的人的止损建议，不是平仓比例（10/8 PLTR 因此一张没卖）
 PCT_PATTERN = re.compile(
     r"(?<![-+\d.])(\d{1,3})\s*%"
     r"(?!\s*(?:(?:" + _PCT_SIZE_ADJ + r"\s+)?" + _PCT_SIZE_NOUN
-    + r"|的?\s*仓位|的?\s*头寸|的?\s*现金))",
+    + r"|SL\b|stop[\s-]*loss|的?\s*止损|的?\s*仓位|的?\s*头寸|的?\s*现金))",
     re.IGNORECASE,
 )
 
@@ -1017,29 +1019,59 @@ def _qualifiers_in(window: str) -> tuple:
     return (sides[0] if len(sides) == 1 else None), (cats or None)
 
 
-def extract_position_qualifiers(text: str, symbol: str,
-                                others: "list | tuple" = ()) -> "tuple[str | None, frozenset | None]":
-    """紧跟 ticker 的方向词/类目词 → (side, categories)。
-
-    只看动作句里的出现（同 parse_close 的 _action_sentences），窗口止于子句边界或 others 里的别的 ticker；
-    几处出现说法冲突时该项为 None（= 不过滤）。
-    """
+def _qualifier_windows(text: str, symbol: str, others: "list | tuple" = ()) -> list:
+    """ticker 每次出现后的限定词窗口：只看动作句，止于子句边界或 others 里的别的 ticker。"""
     sym_re = re.compile(rf"(?<![A-Za-z]){re.escape(symbol)}(?![A-Za-z])")
     stop = [re.escape(o) for o in others if o != symbol]
     stop_re = re.compile(rf"(?<![A-Za-z])(?:{'|'.join(stop)})(?![A-Za-z])") if stop else None
     scope = _action_sentences(text)
     src = scope if sym_re.search(scope) else text
-    sides, cats = set(), set()
+    windows = []
     for m in sym_re.finditer(src):
         rest = src[m.end():]
         cuts = [x.start() for x in (_CLAUSE_BOUNDARY_RE.search(rest),
                                     stop_re.search(rest) if stop_re else None) if x]
         if cuts:
             rest = rest[:min(cuts)]
-        side, cat = _qualifiers_in(" ".join(rest.split()[:_QUALIFIER_WINDOW_TOKENS]))
+        windows.append(" ".join(rest.split()[:_QUALIFIER_WINDOW_TOKENS]))
+    return windows
+
+
+def extract_position_qualifiers(text: str, symbol: str,
+                                others: "list | tuple" = ()) -> "tuple[str | None, frozenset | None]":
+    """紧跟 ticker 的方向词/类目词 → (side, categories)。几处出现说法冲突时该项为 None（= 不过滤）。"""
+    sides, cats = set(), set()
+    for window in _qualifier_windows(text, symbol, others):
+        side, cat = _qualifiers_in(window)
         sides.update([side] if side else [])
         cats.update([cat] if cat else [])
     return (next(iter(sides)) if len(sides) == 1 else None), (next(iter(cats)) if len(cats) == 1 else None)
+
+
+# [10/8 PLTR] 本周和下周到期的两张都是 weekly 类目，类目分不开，只能按到期日分
+THIS_WEEK, NEXT_WEEK = "this_week", "next_week"
+_THIS_WEEK_QUALIFIER_RE = re.compile(r"\bweekl(?:y|ies)\b|\bthis\s+week\b|本周|这周", re.I)
+_NEXT_WEEK_QUALIFIER_RE = re.compile(r"\bnext\s+week\b|下周", re.I)
+
+
+def extract_expiry_qualifier(text: str, symbol: str, others: "list | tuple" = ()) -> "str | None":
+    """紧跟 ticker 的 WEEKLIES/本周 → THIS_WEEK，NEXT WEEK/下周 → NEXT_WEEK；冲突或没写 → None。"""
+    found = set()
+    for window in _qualifier_windows(text, symbol, others):
+        if _NEXT_WEEK_QUALIFIER_RE.search(window):
+            found.add(NEXT_WEEK)
+        elif _THIS_WEEK_QUALIFIER_RE.search(window):
+            found.add(THIS_WEEK)
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def expiry_in_scope(expiry: str, rule: "str | None", today: date) -> bool:
+    """THIS_WEEK = 本周五（含）之前到期，NEXT_WEEK = 之后；rule 为 None 不过滤。"""
+    if rule is None:
+        return True
+    friday = today + timedelta(days=(4 - today.weekday()) % 7)
+    in_this_week = date.fromisoformat(str(expiry)[:10]) <= friday
+    return in_this_week if rule == THIS_WEEK else not in_this_week
 
 
 # [9/18 回归] 「主语不在持仓就不改派」那条规则（#52）有个反噬：判据是
@@ -1752,14 +1784,16 @@ def parse_symbolless_close(text: str) -> Optional[dict]:
 
 # 绝对价："stop is at 2.35" / "stop at 2.35" / "raising stop to 3.00"
 # `stops?` 的 \b 天然排除 "stopped"（那是平仓动词，不是设止损）。
+# 喊单员常省掉前导 0（"STOP LOSS AT .40"），所以 `\.\d+` 也算价格。
+_STOP_PRICE = r"(\d+(?:\.\d+)?|\.\d+)"
 _EN_STOP_ABS_RE = re.compile(
-    r"\bstops?\b[^.\n]{0,24}?\b(?:at|to|is)\b\s*\$?(\d+(?:\.\d+)?)", re.IGNORECASE)
+    r"\bstops?\b[^.\n]{0,24}?\b(?:at|to|is)\b\s*\$?" + _STOP_PRICE, re.IGNORECASE)
 # 保本档："stop at entry" / "stop set to break-even" / "stop to BE"
 _EN_STOP_BE_RE = re.compile(
     r"\bstops?\b[^.\n]{0,24}?\b(?:entry|break[-\s]?even|breakeven)\b", re.IGNORECASE)
 
 # ZH 孪生。"止损"后面跟设/移/调/现/在，再跟保本/入场/成本 或一个数字。
-_ZH_STOP_ABS_RE = re.compile(r"止损[^。\n]{0,12}?(\d+(?:\.\d+)?)")
+_ZH_STOP_ABS_RE = re.compile(r"止损[^。\n]{0,12}?" + _STOP_PRICE)
 _ZH_STOP_BE_RE = re.compile(r"止损[^。\n]{0,12}?(?:保本|入场|成本|开仓价)")
 
 # 语义哨兵：调用方拿到它就知道"锚在我们自己的成本上"，而不是一个绝对价。
