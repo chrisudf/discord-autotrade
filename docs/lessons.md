@@ -2677,6 +2677,57 @@ against this Friday. After the filter only one position remains, so the 33% fall
 When the caller names one of those fields, filter on the field. When fixing one of
 two bugs that cancel out, check what the other one does once the first is fixed.
 
+## PR#25 side-effect audit (2026-10-15): what else #70/#71 and the same-batch fixes touch
+
+Each change below was checked against full history (5,591 raw messages, the positions
+table and the `observe_*.jsonl` price logs), not against the incident alone.
+
+**1. Leading-dot stops (#70) turn stops that used to be dropped into live sells.** We opened
+6 of the 10 historical calls. Replayed with the stop recorded:
+- 3 would have exited earlier and lost less (limit-price basis):
+  - ANET 212.5C 9/25: trigger 0.87 hit at 09:49 ET; the actual exit was 0.05; about +$300.
+  - PLTR 205C 10/8: trigger 1.03 vs the actual 50% SL at 0.66; at most about +$130, because the drop took 1m43s.
+  - AAPL 342.5C 10/12: about +$144.
+- 3 unaffected:
+  - SPY 774C 10/5 was the only winner. Its 1m low was 1.12 vs the 1.03 trigger (one history-kline code spent).
+  - SPY 775P and 774P 10/7 never touched the trigger while held.
+
+None of the 6 would have cut a winner. Residual risk: the trigger is `stop / 0.92` on
+`last`, so one thin print can fire it on an illiquid contract (10/9 V 382.5C: a 4-lot
+print at 2.76 vs a 3.00 stop). A reopen still clears `manual_stop` (unchanged).
+
+**2. `N% SL` / `N% stop loss` / `N% 止损` exclusion.** Replay changes 1 message. Residual risk: a
+trim written as `TRIMMED 50% STOP AT BE`, with no comma, would lose its 50 and fall to the
+default pct. History has 0 such messages.
+
+**3. Expiry qualifier (#71).** It is consulted only with ≥2 positions of the same ticker from
+the same channel and no strike hint. History has 3 closes that carry a qualifier; only
+PLTR 10/8 had 2 positions, and that one activation is correct. Known edges:
+- **"weeklies" does not always mean this week.** enrich 9/23 `For the IREN $50 weeklies, …
+  cut` meant the 10/2 contract, while that Friday was 9/25. We held one IREN, so no filter
+  ran. Holding 9/25 and 10/2 together, the filter would have picked the wrong one. Holding
+  two expiries of one ticker at once happened in enrich 1 time, KC 4, ashley 30. If it
+  bites, the fix is to read `weekl(y|ies)` as THIS_WEEK only for ashley, whose opens say
+  `EXPIRATION THIS WEEK` / `NEXT WEEK` explicitly.
+- When the filter matches nothing, the close is skipped and a TG is sent. That fails safe
+  but misses the close.
+- CLOSE dedup ignores the expiry selector, so `X WEEKLIES …` followed by `X NEXT WEEK …`
+  within 60 s counts as a twin. That was already true for NEXT WEEK vs an unqualified close.
+- The translator renders WEEKLIES as 周期性 / 每周, which the regex does not read. If the ZH copy
+  parses as a close and arrives first, it runs unfiltered (#66 shape). Not seen yet: the
+  10/8 ZH copy did not parse as a close.
+
+**4. EOD open guard.** It removes 2 historical orders, both of which EOD would have
+force-sold within a minute. It fails open: with a bad EOD config the guard is off (the
+watcher's existing one-time error still fires). A call at 15:49:59 still buys, and nothing
+after 16:05 is covered (unchanged).
+
+**5. Strike-correction alert.** TG only; trading is unchanged. It had 0 false positives across
+the 3 historical hits. It stays silent if the first order was blocked (only successful
+opens are recorded) or if anything else from that channel opened in between.
+
+---
+
 ---
 
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
