@@ -140,6 +140,13 @@ def _is_eod_window(now_et: datetime, hour: int, minute: int) -> bool:
     return cutoff <= now_et <= window_end
 
 
+def expires_inside_eod_window(expiry: "date_cls | None", now_et: "datetime | None" = None) -> bool:
+    """今天到期、且此刻已进 EOD 强平时窗（开仓侧用，与 watcher 同一套配置和半日市规则）。"""
+    now_et = now_et or datetime.now(ET_TZ)
+    cfg = _cfg()
+    return expiry == now_et.date() and _is_eod_window(now_et, cfg["hour"], cfg["minute"])
+
+
 # 单进程 backoff：连续失败的 code → 下次 tick 跳过
 # {option_code: 下次允许重试的 epoch 秒}
 _skip_until: dict[str, float] = {}
