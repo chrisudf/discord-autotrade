@@ -5,6 +5,10 @@
    WEEKLIES 点名本周到期那张（两张都是 weekly 类目，只能按到期日分）。
 3. 15:51 ET 喊的 SPX 0DTE：已过 EOD 截止点，买进去下一轮就被强平。
 4. DELL 615C → 46 秒后同价同到期重发成 620C：前一张是笔误，两张都下了单。
+
+PR#25 review 时用 10/19–10/22 生产数据补的两条：
+5. 只发一句行权价的更正（10/20 NET 405C 成交后 66 秒 `STRIKE 305`，10/22 KC `*550`）：4 只认整条重发，两次都没吭声。
+6. 10/19 `设定了保本止损，$265 下一个目标价格`：中文把目标价读成止损（AMZN 当场全平），英文倒装的 breakeven stop 没认出。
 """
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
@@ -14,6 +18,7 @@ import pytest
 from autotrade.listener import close_flow, dedup, heuristics, open_flow
 from autotrade.parsing.close_parser import (
     NEXT_WEEK,
+    STOP_AT_BREAKEVEN,
     THIS_WEEK,
     expiry_in_scope,
     extract_expiry_qualifier,
@@ -195,3 +200,56 @@ def test_strike_correction_needs_same_price_expiry_and_a_short_gap():
     assert heuristics._strike_correction({**sig, "strike": 620.0}, 8) is None         # 别的频道
     heuristics._last_open[9]["ts"] -= timedelta(seconds=121)
     assert heuristics._strike_correction({**sig, "strike": 620.0}, 9) is None
+
+
+# ============================================================
+# 5. 只发一句行权价的更正（PR#25 review，10/20 NET、10/22 KC）
+# ============================================================
+
+NET_EN = ":RedAlert: NET - $405 CALLS EXPIRATION THIS WEEK $4.85 @everyone"
+
+
+@pytest.mark.asyncio
+async def test_bare_strike_after_an_executed_open_alerts_once(monkeypatch):
+    """当晚原文：405C 已成交（实际 0.91），66 秒后中英两条 `STRIKE 305`。只报一次，不下单。"""
+    placed, alerts, bg = [], [], []
+    _wire(monkeypatch, placed, alerts, bg)
+    monkeypatch.setattr(open_flow, "get_buy_ref_price", lambda code: 4.85)
+    await _open(NET_EN, day=date(2026, 10, 20))
+    await _open("STRIKE 305", day=date(2026, 10, 20))
+    await _open("STRIKE 305", day=date(2026, 10, 20))
+    assert placed == ["NET"]
+    fix = [a for a in alerts if "更正了行权价" in a]
+    assert len(fix) == 1 and "405" in fix[0] and "305" in fix[0]
+
+
+def test_bare_strike_correction_shapes_and_limits():
+    heuristics._last_open.clear()
+    sig = {"symbol": "MSFT", "strike": 530.0, "side": "CALL", "expiry": "11/20", "price": 5.25}
+    heuristics._record_recent_exec(9, sig)
+    assert heuristics._strike_only_correction("@everyone\nKC Trades Bot:*550", 9)
+    assert heuristics._strike_only_correction("@everyone\nKC交易机器人：*550", 9) is None   # 孪生只报一次
+    assert heuristics._strike_only_correction("STRIKE 530", 9) is None                   # 同一张
+    assert heuristics._strike_only_correction("STRIKE 550 IS THE ONE I LIKE", 9) is None  # 不是单独一句
+    assert heuristics._strike_only_correction("STRIKE 545", 8) is None                   # 别的频道
+    heuristics._last_open[9]["ts"] -= timedelta(minutes=11)
+    assert heuristics._strike_only_correction("STRIKE 545", 9) is None
+
+
+# ============================================================
+# 6. 保本止损写在「止损」前面 / 目标价跟在逗号后（PR#25 review，10/19 AMZN）
+# ============================================================
+
+def test_breakeven_stop_before_the_word_stop_is_breakeven():
+    zh = "AMZN 第三轮减持更多，并对其余部分设定了保本止损，$265 下一个目标价格 @everyone"
+    en = "AMZN round 3 trimmed more and set breakeven stop on rest, $265 next PT @everyone"
+    assert parse_stop_adjust(zh)["stop"] == STOP_AT_BREAKEVEN
+    assert parse_stop_adjust(en)["stop"] == STOP_AT_BREAKEVEN
+
+
+def test_zh_stop_price_does_not_cross_a_comma():
+    """全历史回放只有这两条从「读到一个数」变成 None，两个数都是目标价。"""
+    assert parse_stop_adjust("将持续上移止损，让其运行至+8.00-10.00。") is None
+    assert parse_stop_adjust("在休息时设置盈亏平衡止损，始终管理风险，瞄准195点。")["stop"] == STOP_AT_BREAKEVEN
+    assert parse_stop_adjust("止损设定在 .95")["stop"] == 0.95
+    assert parse_stop_adjust("止损位在 2.40，目标 4.00")["stop"] == 2.40

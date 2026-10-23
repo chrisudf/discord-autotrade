@@ -32,6 +32,7 @@ from autotrade.listener.heuristics import (
     _open_attempt_symbol,
     _record_recent_exec,
     _strike_correction,
+    _strike_only_correction,
     _twin_of_recent_exec,
 )
 from autotrade.notify.messages import (
@@ -158,10 +159,12 @@ async def process_open(message, raw, cfg, cid, t0, msg_date_et):
         # 真·没匹配任何模式。只对"含 $TICKER + 侧别 + 价格"三件套的发 TG，
         # 否则视为 KC 状态评论/行情解说，仅 log（避免每晚 10+ 条 TG 噪音，见 6/24 review）
         logger.warning("Parse failed")
-        fix = _expiry_correction(raw, cid)
+        fix, title = _expiry_correction(raw, cid), "喊单员更正了到期日（未自动处理）"
+        if not fix:
+            fix, title = _strike_only_correction(raw, cid), "喊单员更正了行权价（前一张未自动处理）"
         if fix:
             logger.warning(f"[correction] {fix}")
-            await _safe_notify(format_error("喊单员更正了到期日（未自动处理）", f"{fix}\n\n{raw[:200]}"))
+            await _safe_notify(format_error(title, f"{fix}\n\n{raw[:200]}"))
             return
         # 先查 add-on（更具体）：加已持仓标的 + @price → 提醒人工跟加（7/6 SPY 漏加实锤）
         addon_sym = _looks_like_addon_attempt(raw)

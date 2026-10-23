@@ -1788,13 +1788,15 @@ def parse_symbolless_close(text: str) -> Optional[dict]:
 _STOP_PRICE = r"(\d+(?:\.\d+)?|\.\d+)"
 _EN_STOP_ABS_RE = re.compile(
     r"\bstops?\b[^.\n]{0,24}?\b(?:at|to|is)\b\s*\$?" + _STOP_PRICE, re.IGNORECASE)
-# 保本档："stop at entry" / "stop set to break-even" / "stop to BE"
+# 保本档："stop at entry" / "stop set to break-even" / "stop to BE"，以及倒装的 "set breakeven stop on rest"
 _EN_STOP_BE_RE = re.compile(
-    r"\bstops?\b[^.\n]{0,24}?\b(?:entry|break[-\s]?even|breakeven)\b", re.IGNORECASE)
+    r"\bstops?\b[^.\n]{0,24}?\b(?:entry|break[-\s]?even|breakeven)\b"
+    r"|\b(?:break[-\s]?even|breakeven)\s+stops?\b", re.IGNORECASE)
 
 # ZH 孪生。"止损"后面跟设/移/调/现/在，再跟保本/入场/成本 或一个数字。
-_ZH_STOP_ABS_RE = re.compile(r"止损[^。\n]{0,12}?" + _STOP_PRICE)
-_ZH_STOP_BE_RE = re.compile(r"止损[^。\n]{0,12}?(?:保本|入场|成本|开仓价)")
+# 间隔不跨逗号/分号：10/19 `设定了保本止损，$265 下一个目标价格` 把目标价读成止损，AMZN 当场全平
+_ZH_STOP_ABS_RE = re.compile(r"止损[^。，,；;\n]{0,12}?" + _STOP_PRICE)
+_ZH_STOP_BE_RE = re.compile(r"止损[^。\n]{0,12}?(?:保本|入场|成本|开仓价)|(?:保本|盈亏平衡)止损")
 
 # 语义哨兵：调用方拿到它就知道"锚在我们自己的成本上"，而不是一个绝对价。
 STOP_AT_BREAKEVEN = "breakeven"
