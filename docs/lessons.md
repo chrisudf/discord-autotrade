@@ -2628,6 +2628,124 @@ dangerous failure. Test with the longest realistic input, not just the incident'
 
 ---
 
+## 70. A guard that rejects a mis-parse makes the mis-parse look like policy
+
+**Symptom**: ashley writes stops without a leading zero (`止损位 .40`, `STOP LOSS AT .40`).
+The ZH regex `止损[^。\n]{0,12}?(\d+(?:\.\d+)?)` returned 40.0: the lazy gap consumed
+the `.` because the number group cannot start with one. The EN regex required a digit
+after `at` and returned None. 10 calls (20 bilingual messages) between 9/21 and 10/12
+were affected. The open path's "stop above our fill" guard (#57) rejected every 40.0, and the
+log read `拒绝录入开仓自带止损 … 高 5456%`. It looked like protection working.
+
+**Why non-obvious**: a lazy gap in front of a number group usually fails safe, because
+it finds nothing. Here it found a different number, 100× too big. That value then
+landed on a guard built for a real case (stop above fill). The guard turned a parser
+bug into a reasonable-looking policy decision. The 10/01 review flagged it once, and it
+then came back 6 more times. These were 0DTE lottos, where the declared stop is the
+only protection (#64).
+
+**Defense**: both regexes accept `\.\d+` as a price (`_STOP_PRICE`). Full-history
+replay: exactly those 20 messages change, from 40/55/80/95/None to 0.40/0.55/0.80/0.95.
+
+**General form**: when a guard fires on values off by an order of magnitude, check
+the parser before the policy. A guard that "catches" an impossible value catches it
+again every night after that.
+
+---
+
+## 71. A bucket assigned at open time cannot answer a question about what it was bucketed from
+
+**Symptom**: `PLTR WEEKLIES CLOSING HERE ABOVE ENTRY / CAN USE A 25% SL …`. We held
+PLTR 205C (10/9) and 207.5C (10/16). Both were `weekly`, because DTE 1 and DTE 8 fall
+in the same category. She closed the 10/9 one and kept the 10/16 ("KEEPING BOTH NEXT
+WEEK ROUNDS"). The qualifier layer (#62) only knows side and category, so `WEEKLIES`
+selected nothing. Separately, the pct came out as 25 from the stop advice, and
+last-spare kept both positions.
+
+**Why non-obvious**: two bugs canceled out. Fixing only the pct (25 → 100) would have
+taken the multi-position path, which falls back to 33% and trims **both** contracts.
+That swaps "sold nothing" for "sold half of the one she kept". The category also
+looks like a selector: `NEXT WEEK → {weekly, swing}` reads as "next week's contract",
+but any weekly that expires this week passes the same filter.
+
+**Defense**: `N% SL` / `N% stop loss` / `N% 止损` are not close pcts (replay changes
+exactly this message). `extract_expiry_qualifier` reads WEEKLIES/THIS WEEK/本周 and NEXT WEEK/下周
+in the same ticker window as #62, and `expiry_in_scope` filters on the contract's expiry
+against this Friday. After the filter only one position remains, so the 33% fallback does not apply.
+
+**General form**: a category is a lossy summary of the fields it was computed from.
+When the caller names one of those fields, filter on the field. When fixing one of
+two bugs that cancel out, check what the other one does once the first is fixed.
+
+## PR#25 side-effect audit (2026-10-15): what else #70/#71 and the same-batch fixes touch
+
+Each change below was checked against full history (5,591 raw messages, the positions
+table and the `observe_*.jsonl` price logs), not against the incident alone.
+
+**1. Leading-dot stops (#70) turn stops that used to be dropped into live sells.** We opened
+6 of the 10 historical calls. Replayed with the stop recorded:
+- 3 would have exited earlier and lost less (limit-price basis):
+  - ANET 212.5C 9/25: trigger 0.87 hit at 09:49 ET; the actual exit was 0.05; about +$300.
+  - PLTR 205C 10/8: trigger 1.03 vs the actual 50% SL at 0.66; at most about +$130, because the drop took 1m43s.
+  - AAPL 342.5C 10/12: about +$144.
+- 3 unaffected:
+  - SPY 774C 10/5 was the only winner. Its 1m low was 1.12 vs the 1.03 trigger (one history-kline code spent).
+  - SPY 775P and 774P 10/7 never touched the trigger while held.
+
+None of the 6 would have cut a winner. Residual risk: the trigger is `stop / 0.92` on
+`last`, so one thin print can fire it on an illiquid contract (10/9 V 382.5C: a 4-lot
+print at 2.76 vs a 3.00 stop). A reopen still clears `manual_stop` (unchanged).
+
+**2. `N% SL` / `N% stop loss` / `N% 止损` exclusion.** Replay changes 1 message. Residual risk: a
+trim written as `TRIMMED 50% STOP AT BE`, with no comma, would lose its 50 and fall to the
+default pct. History has 0 such messages.
+
+**3. Expiry qualifier (#71).** It is consulted only with ≥2 positions of the same ticker from
+the same channel and no strike hint. History has 3 closes that carry a qualifier; only
+PLTR 10/8 had 2 positions, and that one activation is correct. Known edges:
+- **"weeklies" does not always mean this week.** enrich 9/23 `For the IREN $50 weeklies, …
+  cut` meant the 10/2 contract, while that Friday was 9/25. We held one IREN, so no filter
+  ran. Holding 9/25 and 10/2 together, the filter would have picked the wrong one. Holding
+  two expiries of one ticker at once happened in enrich 1 time, KC 4, ashley 30. If it
+  bites, the fix is to read `weekl(y|ies)` as THIS_WEEK only for ashley, whose opens say
+  `EXPIRATION THIS WEEK` / `NEXT WEEK` explicitly.
+- When the filter matches nothing, the close is skipped and a TG is sent. That fails safe
+  but misses the close.
+- CLOSE dedup ignores the expiry selector, so `X WEEKLIES …` followed by `X NEXT WEEK …`
+  within 60 s counts as a twin. That was already true for NEXT WEEK vs an unqualified close.
+- The translator renders WEEKLIES as 周期性 / 每周, which the regex does not read. If the ZH copy
+  parses as a close and arrives first, it runs unfiltered (#66 shape). Not seen yet: the
+  10/8 ZH copy did not parse as a close.
+
+**4. EOD open guard.** It removes 2 historical orders, both of which EOD would have
+force-sold within a minute. It fails open: with a bad EOD config the guard is off (the
+watcher's existing one-time error still fires). A call at 15:49:59 still buys, and nothing
+after 16:05 is covered (unchanged).
+
+**5. Strike-correction alert.** TG only; trading is unchanged. It had 0 false positives across
+the 3 historical hits. It stays silent if the first order was blocked (only successful
+opens are recorded) or if anything else from that channel opened in between.
+
+**Review addendum (2026-10-23, after 4 nights of this build in production, ET 10/19–10/22).**
+None of the new paths fired. Two real typos used shapes the PR did not cover:
+- **A bare strike.** 10/20 NET 405C filled, and 66 s later ashley posted `STRIKE 305`. On
+  10/22 KC posted `*550` after `MSFT 530c`. #5 only matches a full re-send at the same price
+  and expiry. Added `_strike_only_correction`: it alerts on a standalone `STRIKE N` / `行权价 N` /
+  `*N` within 10 minutes of the channel's last executed open, once per twin pair. The KC one
+  stays silent, because its 530C had been blocked by the quote guard.
+- **The stop regex family #70 touched.** 10/19 `设定了保本止损，$265 下一个目标价格`: the ZH
+  gap crossed the comma and read the target price as a stop, so AMZN was closed on the spot.
+  The EN twin `set breakeven stop` was not recognized either, because breakeven came before
+  stop. Fix: the ZH gap stops at `，,；;`, and both languages accept the breakeven-first word
+  order. Full-history replay of `parse_stop_adjust` changed 55 messages. Only 5 of them
+  (3 events) reach `_apply_stop_adjust`: the two 9/22 AVGO ones were full closes, so the stop
+  is moot, and the third is AMZN, 265 → breakeven. The other two that changed from a number
+  to None were also targets (`瞄准195点`, `运行至+8.00`).
+
+---
+
+---
+
 # 中文 postmortem 记录（原 src/listener/LESSONS.md 并入）
 
 > 以下为按日期记录的踩坑史，**原样保留**（其中的 `src/...`、`scripts/...`
@@ -3173,6 +3291,8 @@ downside is priced in dollars.
 | 67 | 成交之后的检查是报告，不是防护 | `test_overnight_1006.py::test_typo_price_is_not_ordered_and_says_why`（契约翻转，当晚原文）、`::test_quote_guard_flags_order_of_magnitude_mismatch`（ANET $90 / 9/30 RKLB）。**反向**：`::test_quote_guard_lets_normal_and_unknown_quotes_through`（拿不到报价放行）、`::test_matching_quote_still_orders`。同批：`::test_holding_list_keeps_the_listed_ticker_and_lock_all_is_full` / `::test_lock_all_sells_rklb_fully_and_leaves_smci`（中文持有清单 + 锁定所有；反向 `::test_lock_wording_without_all_my_is_unchanged`）、`::test_risk_blocked_signal_sends_one_alert_with_the_contract`（风控拦截后不报「新信号触发」）|
 | 68 | 失败放行的防护，「不知道」必须包括「过期了」 | `test_overnight_1006.py::test_stale_quote_is_treated_as_unknown`（PR#24 review：15 分钟前的报价当没有）、`::test_fresh_quote_is_used_and_missing_time_is_unknown`（读不出时间也当没有）|
 | 69 | 「一直到 X 为止」加了长度上限，就多了一道看不见的边界 | `test_overnight_1006.py::test_long_holding_list_keeps_every_listed_ticker`（PR#24 review：第三个持有标的离冒号 40 字以外）|
+| 70 | 拒绝误解析的防护，会让误解析看起来像策略 | `test_overnight_1008_1012.py::test_leading_dot_stop_parses_in_both_languages`、`::test_leading_dot_stop_is_recorded_on_open`（契约翻转，当晚原文）。**反向**：`::test_stops_with_a_leading_digit_are_unchanged`。**PR#25 review 补充**：`::test_breakeven_stop_before_the_word_stop_is_breakeven`、`::test_zh_stop_price_does_not_cross_a_comma`（10/19 AMZN 目标价被读成止损）；行权价单独更正：`::test_bare_strike_after_an_executed_open_alerts_once`、`::test_bare_strike_correction_shapes_and_limits` |
+| 71 | 开仓时分的桶，回答不了"按什么分的桶"的问题 | `test_overnight_1008_1012.py::test_weeklies_close_sells_only_this_weeks_round`（契约翻转，当晚两张 PLTR）、`::test_pct_sl_advice_is_not_the_close_pct`、`::test_week_qualifier_is_read_right_after_the_ticker`、`::test_week_scope_splits_on_this_friday`。**反向**：`::test_real_trim_pcts_are_unchanged`。同批：`::test_spx_0dte_after_cutoff_is_not_ordered`（EOD 时窗内不开当日到期；反向 `::test_spx_0dte_before_cutoff_still_orders`）、`::test_strike_only_resend_alerts_about_the_first_order` / `::test_strike_correction_needs_same_price_expiry_and_a_short_gap`（同价同到期只改行权价 = 更正，只告警）|
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |

@@ -193,10 +193,47 @@ def _expiry_correction(text: str, cid: int) -> "str | None":
             f"喊单员随后说到期是 {said} —— 我们的单不会自动改，请人工核对")
 
 
+# 只报一个行权价的消息同理（10/20 NET 405C 已成交，66 秒后 "STRIKE 305"；10/22 KC "*550"）。
+# 剥掉机器人前缀后可能剩下 "KC Trades Bot:" 的冒号
+_STRIKE_ONLY_RE = _re.compile(r"^[\s:：]*(?:STRIKE|行权价|\*)\s*\$?(\d+(?:\.\d+)?)\s*$", _re.I)
+
+
+def _strike_only_correction(text: str, cid: int) -> "str | None":
+    """这条消息是否在更正本频道刚开的那单的行权价。返回告警正文或 None；中英孪生只报一次。"""
+    m = _STRIKE_ONLY_RE.match(_strip_bot_noise(text))
+    last = _last_open.get(cid)
+    if not m or not last or datetime.now(timezone.utc) - last["ts"] > _LAST_OPEN_WINDOW:
+        return None
+    said = float(m.group(1))
+    if said == last["strike"] or last.get("strike_fix") == said:
+        return None
+    last["strike_fix"] = said
+    return (f"刚下的 {last['symbol']} {last['strike']:g}{last['side'][0]} {last['expiry']} @ {last.get('price')}，"
+            f"喊单员随后说行权价是 {said:g} —— 前一张大概率是笔误，买单不会自动撤，请人工撤单/平掉")
+
+
+# 同价同到期只换了行权价的重发 = 更正（9/16 NVDA、9/30 OKLO、10/8 DELL，间隔 22-47 秒，三次两张都下了单）
+_STRIKE_FIX_WINDOW = timedelta(seconds=120)
+
+
+def _strike_correction(signal: dict, cid: int) -> "str | None":
+    """这条开仓是否只改了本频道刚开那单的行权价。返回告警正文或 None。"""
+    last = _last_open.get(cid)
+    if not last or datetime.now(timezone.utc) - last["ts"] > _STRIKE_FIX_WINDOW:
+        return None
+    same = all(last[k] == signal.get(k) for k in ("symbol", "side", "expiry", "price"))
+    if not same or last["strike"] == signal.get("strike"):
+        return None
+    return (f"刚下的 {last['symbol']} {last['strike']:g}{last['side'][0]} {last['expiry']} @ {last['price']}，"
+            f"喊单员随后同价同到期改成了 {signal['strike']:g}{signal['side'][0]} —— "
+            f"前一张大概率是笔误，买单不会自动撤，请人工撤单/平掉")
+
+
 def _record_recent_exec(cid: int, signal: dict):
     now = datetime.now(timezone.utc)
     _last_open[cid] = {"ts": now, "symbol": signal["symbol"], "strike": signal.get("strike") or 0,
-                       "side": signal.get("side") or "?", "expiry": signal.get("expiry")}
+                       "side": signal.get("side") or "?", "expiry": signal.get("expiry"),
+                       "price": signal.get("price")}
     # 顺手清掉过期条目，dict 不增长
     for key in [k for k, e in _recent_exec.items() if now - e["ts"] > _TWIN_SUPPRESS_WINDOW]:
         _recent_exec.pop(key, None)

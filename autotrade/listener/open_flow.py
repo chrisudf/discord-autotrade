@@ -31,6 +31,8 @@ from autotrade.listener.heuristics import (
     _looks_like_sized_entry,
     _open_attempt_symbol,
     _record_recent_exec,
+    _strike_correction,
+    _strike_only_correction,
     _twin_of_recent_exec,
 )
 from autotrade.notify.messages import (
@@ -45,7 +47,7 @@ from autotrade.parsing.close_parser import STOP_AT_BREAKEVEN, parse_stop_adjust
 from autotrade.parsing.signal_parser import parse_signal
 from autotrade.policy.guards import _suspicious_long_dte
 from autotrade.policy.pricing import breakeven_exit_price, build_option_code, calc_limit_price
-from autotrade.position import fill_checker
+from autotrade.position import eod_watcher, fill_checker
 from autotrade.position import manager as position_mgr
 from autotrade.risk import check_order, record_order
 from autotrade.storage import positions_db
@@ -157,10 +159,12 @@ async def process_open(message, raw, cfg, cid, t0, msg_date_et):
         # 真·没匹配任何模式。只对"含 $TICKER + 侧别 + 价格"三件套的发 TG，
         # 否则视为 KC 状态评论/行情解说，仅 log（避免每晚 10+ 条 TG 噪音，见 6/24 review）
         logger.warning("Parse failed")
-        fix = _expiry_correction(raw, cid)
+        fix, title = _expiry_correction(raw, cid), "喊单员更正了到期日（未自动处理）"
+        if not fix:
+            fix, title = _strike_only_correction(raw, cid), "喊单员更正了行权价（前一张未自动处理）"
         if fix:
             logger.warning(f"[correction] {fix}")
-            await _safe_notify(format_error("喊单员更正了到期日（未自动处理）", f"{fix}\n\n{raw[:200]}"))
+            await _safe_notify(format_error(title, f"{fix}\n\n{raw[:200]}"))
             return
         # 先查 add-on（更具体）：加已持仓标的 + @price → 提醒人工跟加（7/6 SPY 漏加实锤）
         addon_sym = _looks_like_addon_attempt(raw)
@@ -309,6 +313,22 @@ async def process_open(message, raw, cfg, cid, t0, msg_date_et):
             f"[lotto-skip] EXPECT 0 不跟: {signal['symbol']} {signal['strike']}"
             f"{signal['side'][0]} {signal.get('expiry', '')} @ {signal.get('price')} | {raw[:80]}")
         return
+
+    # [10/12 SPX] EOD 时窗里开当日到期的仓：下一轮 EOD 就会把它卖掉，买了只是白付两次价差
+    if eod_watcher.expires_inside_eod_window(signal.get("expiry_date")):
+        desc = (f"{signal['symbol']} {signal['strike']}{signal['side'][0]} "
+                f"{signal.get('expiry', '')} @ {signal.get('price')}")
+        logger.warning(f"[eod-guard] 已过 EOD 截止点，当日到期不开仓: {desc} | {raw[:80]}")
+        await _safe_notify(format_error(
+            "EOD 截止后的当日到期开仓，未下单",
+            f"{desc}\n买进去下一轮 EOD 就会强平。要跟请手动。\n\n{raw[:200]}"))
+        return
+
+    # 只告警不拦：更正后的这张照常下单，前一张要人工撤（没有撤单接口）
+    strike_fix = _strike_correction(signal, cid)
+    if strike_fix:
+        logger.warning(f"[correction] {strike_fix}")
+        notify_bg(format_error("喊单员疑似更正了行权价（前一张未自动处理）", f"{strike_fix}\n\n{raw[:200]}"))
 
     # ---- 短线标签 × 长 DTE 防护 ----
     # 7/16 实锤：KC 笔误 "SPY 755c June 20 @ 2.17 day trade"（June 20 已过），
