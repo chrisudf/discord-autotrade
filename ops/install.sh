@@ -103,8 +103,8 @@ EOF
 # 那 3 个兜底触发点静默抹掉**，而且抹掉之后一切看起来都正常，直到某晚 Mac 在 23:15
 # 恰好没醒。现在触发点改成可变参列表，线上什么样这里就写什么样，漂移消失。
 emit_plist() {
-  local label=$1 script=$2 extra_env=$3 short=${1##*.}
-  shift 3
+  local label=$1 script=$2 extra_env=$3 run_at_load=$4 short=${1##*.}
+  shift 4
   local intervals="" t
   for t in "$@"; do
     intervals+="		<dict><key>Hour</key><integer>$((10#${t%%:*}))</integer><key>Minute</key><integer>$((10#${t##*:}))</integer></dict>\n"
@@ -129,7 +129,7 @@ emit_plist() {
 $(printf "$intervals")	</array>
 
 	<key>RunAtLoad</key>
-	<false/>
+	<$run_at_load/>
 
 	<key>EnvironmentVariables</key>
 	<dict>
@@ -155,9 +155,14 @@ EOF
 # 守卫前移到垫片：4 个触发点里只有第一个真开窗口，其余 3 个 pgrep 命中就直接退出
 # （见 launch_in_terminal.sh 的注释）。模式与 night_run.sh 里那道守卫必须逐字一致。
 NIGHT_ENV=$'\t\t<key>SKIP_IF_RUNNING</key>\n\t\t<string>bin/python -m autotrade\\.app\\.main</string>\n'
+# [10/16] 关机错过的触发点 launchd 不补（睡眠错过的会在唤醒时合并补放一次）：那晚 00:47
+# 插电开机后整夜没人拉 listener。RunAtLoad 管开机，23:45 起每半小时一次管中途死掉；
+# 守卫在垫片里（窗口外不开、已在跑不开），收工后的 07:00 由 morning_collect 停机。
+NIGHT_ENV+=$'\t\t<key>ONLY_BETWEEN</key>\n\t\t<string>23:00-07:00</string>\n'
+NIGHT_CATCHUP=(23:45 0:15 0:45 1:15 1:45 2:15 2:45 3:15 3:45 4:15 4:45 5:15 5:45 6:15)
 
-emit_plist "$NIGHT_LABEL"   night_run.sh       "$NIGHT_ENV" 23:11 23:15 23:20 23:25
-emit_plist "$MORNING_LABEL" morning_collect.sh ""            7:00
+emit_plist "$NIGHT_LABEL"   night_run.sh       "$NIGHT_ENV" true  23:11 23:15 23:20 23:25 $NIGHT_CATCHUP
+emit_plist "$MORNING_LABEL" morning_collect.sh ""           false 7:00
 
 # [9/18] 撑住 23:05→23:45 的启动窗口。
 #
@@ -178,7 +183,12 @@ emit_caffeinate_plist 23:05 23:08
 
 # 看门狗：launchd 直接执行 Application Support 下的脚本，不开 Terminal
 emit_watchdog_plist() {
-  local label=$1 mode=$2 t=$3
+  local label=$1 mode=$2
+  shift 2
+  local intervals="" t
+  for t in "$@"; do
+    intervals+="		<dict><key>Hour</key><integer>$((10#${t%%:*}))</integer><key>Minute</key><integer>$((10#${t##*:}))</integer></dict>\n"
+  done
   cat > "$LA_DIR/$label.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -193,7 +203,8 @@ emit_watchdog_plist() {
 		<string>$mode</string>
 	</array>
 	<key>StartCalendarInterval</key>
-	<dict><key>Hour</key><integer>$((10#${t%%:*}))</integer><key>Minute</key><integer>$((10#${t##*:}))</integer></dict>
+	<array>
+$(printf "$intervals")	</array>
 	<key>RunAtLoad</key>
 	<false/>
 	<key>StandardOutPath</key>
@@ -207,11 +218,13 @@ EOF
   unload "$label"
   launchctl bootstrap "$GUI" "$LA_DIR/$label.plist"
   launchctl enable "$GUI/$label"
-  echo "已安装 $label  →  每天 $t  watchdog.sh $mode"
+  echo "已安装 $label  →  每天 $*  watchdog.sh $mode"
 }
 
-emit_watchdog_plist "$POWER_LABEL" power 22:30
-emit_watchdog_plist "$ALIVE_LABEL" alive 23:28
+# [10/22] 22:30 那一道发了「在用电池」，22:46 就没电休眠了 —— 要更早、带电量地叫人。
+# alive 跟着 night 的补启动每小时查一次（:28，补启动在 :15/:45）。
+emit_watchdog_plist "$POWER_LABEL" power 20:30 21:30 22:30
+emit_watchdog_plist "$ALIVE_LABEL" alive 23:28 0:28 1:28 2:28 3:28 4:28 5:28
 
 cat <<TIP
 

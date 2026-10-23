@@ -2677,6 +2677,183 @@ against this Friday. After the filter only one position remains, so the 33% fall
 When the caller names one of those fields, filter on the field. When fixing one of
 two bugs that cancel out, check what the other one does once the first is fixed.
 
+---
+
+## 72. A schedule says when to start; nothing says what happens to a night it missed
+
+**Symptom**: on 10/16 the battery ran out some time after 22:06 Brisbane, and the Mac powered
+back on at 00:47 on AC (ET 10:47). night.plist had only the 23:11–23:25 triggers and
+`RunAtLoad=false`, and both watchdogs had the same blind spot. Nothing started the
+listener, and the whole ET session was lost (about $1,500, inferred). On 10/22 the
+22:30 watchdog did send "在用电池". Nobody acted, the Mac hit Low Power Sleep at 22:46,
+and the session started 68 minutes after the open.
+
+**Why non-obvious**: the four redundant triggers (#28) and the watchdog were built for
+"asleep at 23:11". launchd coalesces calendar events missed **during sleep** and fires
+them on wake, so every earlier late start looked like the design working. Events
+missed while **powered off** are dropped. Sleep and shutdown look the same until one
+of them happens. Separately, "在用电池" was true but carried no deadline. The same
+line fires on an evening at 90%, so it reads as background noise.
+
+**Defense**: the night job gets `RunAtLoad` plus a catch-up trigger every 30 minutes
+from 23:45 to 06:15. The launcher gates it with `ONLY_BETWEEN=23:00-07:00`: outside the
+window, or when the listener is already running, it opens no window. `watchdog.sh power`
+runs at 20:30, 21:30 and 22:30, reporting battery % and the time it will run out at the
+current drain. It leads with ⛔ when that time is before 23:11 or before 07:00.
+`alive` runs hourly.
+
+**General form**: for a scheduled job, write down what happens to a trigger missed
+while asleep, while powered off, and after the process died. Those are three different
+mechanisms. An alert that is true but doesn't say how much time is left gets read as
+noise.
+
+---
+
+## 73. An alert that can only be fixed in code needs a queue, not a phone
+
+**Symptom**: ashley posts `:RedAlert: BRK.B - $540 CALLS …`. The template's ticker group
+is `[A-Z]{1,5}`, so the `.` makes the whole template fail in both languages. All 8 BRK.B
+opens from 10/13 to 10/21 were missed. Every one the listener saw (6; the other 2 came on
+10/16, when it didn't run) sent `Parse failed (looks like signal)` to Telegram. But no nightly review was written from 10/14 to 10/22, and nothing else turns
+a repeated alert into a fix. This week alone that cost about +$1,500–3,900 in gains we didn't
+make (inferred from the TP ladder; the range is wide).
+
+**Why non-obvious**: the failure was loud, not silent. The parse-fail alert answers "is this
+one message a missed signal?", which the operator can decide on a phone. "The parser can't
+read this ticker shape" needs a code change, and a 23:43 notification has nowhere to put
+that. Eight identical alerts look like an alarm that works.
+
+**Defense**: not fixed yet (weekly review 10/16–10/22 §6②). Ticker
+`[A-Z]{1,5}(?:\.[A-Z])?`; the option code drops the dot (`US.BRKB…`) while the stock keeps
+it (`US.BRK.B`), both verified with `get_option_chain`.
+
+**General form**: if an alert can only be resolved in code, count it by shape and send the
+count to whoever writes the code. A string of identical alerts means there is no queue,
+not that the alarm works.
+
+---
+
+## 74. A guard that skips stale quotes is blind exactly where typos land
+
+**Symptom**: on 10/20 ashley typed `NET - $405 CALLS … $4.85` and corrected it to 305
+66 s later. The pre-trade quote check (#67) exists for this case: 4.85 against a contract
+worth about 0.91 is 5×. It let the order through because the snapshot counted as stale
+(#68). The 405C had not traded since 09:30, so `update_time` was 45 minutes old (inferred:
+the snapshot showed update_time 09:30, volume 0). 4 contracts filled at 0.91 and expire
+worthless tonight, -$364. On 10/21 GE `$210` (meant about 310) passed the same way (also
+inferred: that contract had 0 volume all day); that order just never filled.
+
+**Why non-obvious**: #68 mapped stale → unknown → place the order, and priced it as
+"coverage drops when a contract hasn't printed recently". But a strike typo almost always
+lands on a strike nobody trades, far OTM or deep ITM. The blind spot is not random. It is
+correlated with the error the guard exists to catch.
+
+**Defense**: not fixed yet (weekly review §6③). Use bid/ask for the order-of-magnitude
+check whenever both are > 0, whatever `update_time` says: quotes on an illiquid strike are
+live even when trades aren't. With no quote at all, fall back to the underlying (premium vs
+intrinsic, strike distance). First confirm what `update_time` tracks intraday.
+
+**General form**: before accepting a guard's "unknown → allow" path, ask whether "unknown"
+is independent of "wrong". If bad inputs land in "unknown" more often than good ones, the
+guard covers the cases that didn't need it.
+
+---
+
+## 75. A fill gate that rejects has two numbers, and either can be the wrong one
+
+**Symptom**: NET 405C again: limit 5.09, broker dealt 0.91. The fill gate (#26) refused the
+backfill, so `avg_entry_price` stayed at 5.09 with `entry_unconfirmed`. Effects:
+- For three nights the SL watcher skipped it (`成本未确认`, about 1,200 log lines).
+- `pnl.py` will book -$2,036 for a -$364 loss.
+- Confirming 5.09 by hand would put the SL at 2.55 against a bid of 0, which sells
+  immediately.
+
+**Why non-obvious**: #26 came from a broker number that never existed (limit 2.97, dealt
+0.13), so the gate trusts the limit. This time the limit was the fiction (a typo'd strike)
+and the broker was right. At the gate both cases look the same: a large gap between limit
+and dealt.
+
+**Defense**: not fixed yet. Proposed: when the gate rejects, check dealt against the
+contract's current bid/ask. If the market agrees with dealt, accept it and alert "the limit
+was wrong". If it doesn't, stay unconfirmed and send one TG with both numbers and the
+one-line fix, instead of a silent skip every tick.
+
+**General form**: a gate that compares two numbers should say which one it believes and
+why, and look for a third source before it decides.
+
+---
+
+## 76. The average cost of what you hold is not the average of everything you bought
+
+**Symptom**: 10/22 SPXW 7620P:
+1. Bought 4 @ 3.30 and 4 @ 3.10, then sold 2.
+2. Added 4 @ 1.20, then sold 6.
+3. Added 4 @ 1.70, then sold 8.
+
+The ADD_ON path in `positions_db` computes `(qty_total*old_avg + qty*fill)/new_total`,
+weighted by every contract ever bought, including the ones already sold. It stored 2.53 and
+then 2.33. The real cost of what was still held was 2.40 and then 2.05. `pnl.py` booked
+$4,022 of cost for $3,720 spent ($302 too much). The same `avg_entry_price` sets the SL and
+TP thresholds.
+
+**Why non-obvious**: it is the textbook weighted average, and it is right until the first
+trim. Every earlier test bought, added, then sold; none trimmed between adds.
+`fill_checker`'s add-on repricing (`positions_db.py:636`) also divides by `qty_total`, so
+the two agree with each other and are both wrong.
+
+**Defense**: not fixed yet. Weight by `qty_remaining` in both places. Regression: buy 8 @
+3.20, sell 2, add 4 @ 1.20 → 2.40.
+
+**General form**: for any running average over a position, ask what the denominator is
+after a partial exit.
+
+---
+
+## 77. A sell order is an intent; the ledger booked it as a trade
+
+**Symptom**: 10/15 LLY 1285C. The TP watcher sent `SELL 1 @ 7.60`, and the ledger
+recorded `TRIM -1 @ 7.6` when the order was submitted. The order never filled and was
+cancelled at the end of the day (20:01 ET). The ledger showed the position closed; the broker still held 1
+contract. The reconciler caught it 36 minutes later (`drift broker_only … db=0 broker=1`)
+and sent one TG ("发现 3 处漂移"), then logged it hourly without re-sending. Ghost
+positions are report-only by design, and the listener did not run on 10/16, so the contract
+expired worthless. `pnl.py` booked +$292; the real result was -$468.
+
+**Why non-obvious**: `fill_checker` confirms buys only. On the sell side, submitting the
+order *is* the ledger entry, and that is usually harmless because
+a sell limit below the market fills at once. A TP limit sits **above** the market by
+design, so it is exactly the sell that may never fill.
+
+**Defense**: not fixed yet. Proposed: confirm sells the way buys are confirmed, and put the
+quantity back when the order ends unfilled. A `broker_only` drift whose cause is our own
+cancelled sell is not a ghost; restore it and its EOD handling automatically.
+
+**General form**: book a trade when it fills, not when it is sent. The orders most likely to
+stay unfilled are the ones placed away from the market on purpose.
+
+---
+
+## 78. "Only one candidate" is not the same as "the right candidate"
+
+**Symptom**: on 10/21 KC posted `trimmed the WDAY 220c for November here @ 5.10`. We held
+only the 12/18 contract; KC's open had said `220c 12/18 @ 8.80 can also work with 220c 11/20
+@ 4.40`. The close bound to our only WDAY position and sold 2 at a limit of 4.84, which is
+5.10 × 0.95, the November price. The paper account filled at the market, 9.69. It cost $0 by
+luck. With real money a sell limit below the market also fills at the bid, so the risk is
+not the price; it is selling the contract KC kept.
+
+**Why non-obvious**: the expiry filter (#71) and the side/category qualifiers (#62) run only
+when `len(positions) > 1`. A filter written to disambiguate is skipped when there is nothing
+to disambiguate, so a message about a contract we don't hold is never checked against the
+one we do. `parse_close` also has no field for `November` or `11/20`.
+
+**Defense**: not fixed yet. Proposed: drop the `len(positions) > 1` precondition for
+qualifiers the message states. Read month names and `MM/DD` near the ticker. If the only
+candidate contradicts them, skip the close and send a TG.
+
+**General form**: a check written as "which of these?" should also run as "is this one of
+them?". With a single candidate, a mismatch means the message is about something else.
+
 ## PR#25 side-effect audit (2026-10-15): what else #70/#71 and the same-batch fixes touch
 
 Each change below was checked against full history (5,591 raw messages, the positions
@@ -3293,6 +3470,13 @@ downside is priced in dollars.
 | 69 | 「一直到 X 为止」加了长度上限，就多了一道看不见的边界 | `test_overnight_1006.py::test_long_holding_list_keeps_every_listed_ticker`（PR#24 review：第三个持有标的离冒号 40 字以外）|
 | 70 | 拒绝误解析的防护，会让误解析看起来像策略 | `test_overnight_1008_1012.py::test_leading_dot_stop_parses_in_both_languages`、`::test_leading_dot_stop_is_recorded_on_open`（契约翻转，当晚原文）。**反向**：`::test_stops_with_a_leading_digit_are_unchanged`。**PR#25 review 补充**：`::test_breakeven_stop_before_the_word_stop_is_breakeven`、`::test_zh_stop_price_does_not_cross_a_comma`（10/19 AMZN 目标价被读成止损）；行权价单独更正：`::test_bare_strike_after_an_executed_open_alerts_once`、`::test_bare_strike_correction_shapes_and_limits` |
 | 71 | 开仓时分的桶，回答不了"按什么分的桶"的问题 | `test_overnight_1008_1012.py::test_weeklies_close_sells_only_this_weeks_round`（契约翻转，当晚两张 PLTR）、`::test_pct_sl_advice_is_not_the_close_pct`、`::test_week_qualifier_is_read_right_after_the_ticker`、`::test_week_scope_splits_on_this_friday`。**反向**：`::test_real_trim_pcts_are_unchanged`。同批：`::test_spx_0dte_after_cutoff_is_not_ordered`（EOD 时窗内不开当日到期；反向 `::test_spx_0dte_before_cutoff_still_orders`）、`::test_strike_only_resend_alerts_about_the_first_order` / `::test_strike_correction_needs_same_price_expiry_and_a_short_gap`（同价同到期只改行权价 = 更正，只告警）|
+| 72 | 定时任务只管"到点"，关机错过的那一晚没人管；告警要说还剩多久 | `test_overnight_1016_1022.py::test_battery_that_dies_before_start_says_so`、`::test_battery_that_dies_mid_session_says_so`、`::test_battery_that_lasts_the_night_is_a_plain_warning`、`::test_battery_without_estimate_still_reports_percent`、`::test_ac_power_sends_nothing`、`::test_launcher_outside_window_opens_nothing`、`::test_launcher_inside_window_reaches_the_running_guard`。launchd 开机 / 补放的行为测不了。**验证方法**：`logs/ops.log` 里出现 23:11–23:25 以外时刻的 `night_run: starting`，且同晚只有一个 listener |
+| 73 | 只能靠改代码解决的告警，需要的是待办队列，不是手机 | 无自动回归（**未修**）。BRK.B 正则与期权代码去点见周报 10/16–10/22 §6②。验证方法：`Parse failed (looks like signal)` 按形状计数，同一形状连续两晚出现即为待办 |
+| 74 | 跳过陈旧报价的防护，盲区恰好落在笔误上 | 无自动回归（**未修**）。现状钉在 `test_overnight_1006.py::test_stale_quote_is_treated_as_unknown`（#68）；改法见周报 §6③（有 bid/ask 就比数量级，不看 `update_time`；无报价退到正股合理性检查） |
+| 75 | 成交闸门拒绝时手里有两个数，错的可能是任何一个 | 无自动回归（**未修**）。现状：`test_fill_checker.py::test_buy_fill_rejects_absurd_dealt_price`（#26）只覆盖「券商的数是假的」那一侧 |
+| 76 | 手上仓位的平均成本 ≠ 所有买过的平均 | 无自动回归（**未修**）。改法：`positions_db` 的 ADD_ON 与 `:636` 的加仓回填都按 `qty_remaining` 加权；回归用例：买 8 @ 3.20、卖 2、加 4 @ 1.20 → 2.40 |
+| 77 | 卖单只是意图，账本却当成交记了 | 无自动回归（**未修**）。现状防线：reconciler 的 `broker_only` 漂移告警（只报一次、只报告）。改法：卖单也确认成交，未成交结束时退回张数 |
+| 78 | "只有一个候选" ≠ "就是对的那个" | 无自动回归（**未修**）。现状：限定词过滤只在 `len(positions) > 1` 时跑（`close_flow.py`）；`parse_close` 读不到月份名 / `MM/DD` |
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |
