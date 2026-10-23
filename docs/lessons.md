@@ -2681,7 +2681,7 @@ two bugs that cancel out, check what the other one does once the first is fixed.
 
 ## 72. A schedule says when to start; nothing says what happens to a night it missed
 
-**Symptom**: on 10/16 the battery ran out around 22:06 Brisbane, and the Mac powered
+**Symptom**: on 10/16 the battery ran out some time after 22:06 Brisbane, and the Mac powered
 back on at 00:47 on AC (ET 10:47). night.plist had only the 23:11–23:25 triggers and
 `RunAtLoad=false`, and both watchdogs had the same blind spot. Nothing started the
 listener, and the whole ET session was lost (about $1,500, inferred). On 10/22 the
@@ -2713,8 +2713,8 @@ noise.
 
 **Symptom**: ashley posts `:RedAlert: BRK.B - $540 CALLS …`. The template's ticker group
 is `[A-Z]{1,5}`, so the `.` makes the whole template fail in both languages. All 8 BRK.B
-opens from 10/13 to 10/21 were missed. Each one did send `Parse failed (looks like signal)`
-to Telegram. But no nightly review was written from 10/14 to 10/22, and nothing else turns
+opens from 10/13 to 10/21 were missed. Every one the listener saw (6; the other 2 came on
+10/16, when it didn't run) sent `Parse failed (looks like signal)` to Telegram. But no nightly review was written from 10/14 to 10/22, and nothing else turns
 a repeated alert into a fix. This week alone that cost about +$1,500–3,900 in gains we didn't
 make (inferred from the TP ladder; the range is wide).
 
@@ -2740,8 +2740,8 @@ not that the alarm works.
 worth about 0.91 is 5×. It let the order through because the snapshot counted as stale
 (#68). The 405C had not traded since 09:30, so `update_time` was 45 minutes old (inferred:
 the snapshot showed update_time 09:30, volume 0). 4 contracts filled at 0.91 and expire
-worthless tonight, -$364. On 10/21 GE `$210` (meant about 310) passed the same way; that
-order just never filled.
+worthless tonight, -$364. On 10/21 GE `$210` (meant about 310) passed the same way (also
+inferred: that contract had 0 volume all day); that order just never filled.
 
 **Why non-obvious**: #68 mapped stale → unknown → place the order, and priced it as
 "coverage drops when a contract hasn't printed recently". But a strike typo almost always
@@ -2813,7 +2813,7 @@ after a partial exit.
 
 **Symptom**: 10/15 LLY 1285C. The TP watcher sent `SELL 1 @ 7.60`, and the ledger
 recorded `TRIM -1 @ 7.6` when the order was submitted. The order never filled and was
-cancelled at the close. The ledger showed the position closed; the broker still held 1
+cancelled at the end of the day (20:01 ET). The ledger showed the position closed; the broker still held 1
 contract. The reconciler caught it 36 minutes later (`drift broker_only … db=0 broker=1`)
 and sent one TG ("发现 3 处漂移"), then logged it hourly without re-sending. Ghost
 positions are report-only by design, and the listener did not run on 10/16, so the contract

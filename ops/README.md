@@ -10,6 +10,7 @@ launchd 用本机时区。作者机器是 Australia/Brisbane（UTC+10，无夏�
 补启动只在 env `ONLY_BETWEEN=23:00-07:00` 窗口内生效（垫片里判断），窗口外直接退出不开窗口 ——
 所以想在 23:00 前手动起，用 `make run` 或 `zsh ops/night_run.sh`，别用 `launchctl kickstart`。
 副作用：盘中**故意**停掉 listener，半小时内会被拉起来；要停整晚就 `launchctl bootout gui/$(id -u)/com.chengqiu.autotrade.night`。
+listener 一起就退（配置坏、OpenD 没起）时也会每半小时重试一次，每次留一个 Terminal 窗口，连同 23:11–23:25 那 4 次一晚最多 18 个 —— 重试是故意的（OpenD 可能自己恢复），窗口多了就说明该看日志了。
 
 去重是**三层**，各管各的：
 
