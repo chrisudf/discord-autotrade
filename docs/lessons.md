@@ -2677,6 +2677,36 @@ against this Friday. After the filter only one position remains, so the 33% fall
 When the caller names one of those fields, filter on the field. When fixing one of
 two bugs that cancel out, check what the other one does once the first is fixed.
 
+---
+
+## 72. A schedule says when to start; nothing says what happens to a night it missed
+
+**Symptom**: on 10/16 the battery ran out around 22:06 Brisbane, and the Mac powered
+back on at 00:47 on AC (ET 10:47). night.plist had only the 23:11–23:25 triggers and
+`RunAtLoad=false`, and both watchdogs had the same blind spot. Nothing started the
+listener, and the whole ET session was lost (about $1,500, inferred). On 10/22 the
+22:30 watchdog did send "在用电池". Nobody acted, the Mac hit Low Power Sleep at 22:46,
+and the session started 68 minutes after the open.
+
+**Why non-obvious**: the four redundant triggers (#28) and the watchdog were built for
+"asleep at 23:11". launchd coalesces calendar events missed **during sleep** and fires
+them on wake, so every earlier late start looked like the design working. Events
+missed while **powered off** are dropped. Sleep and shutdown look the same until one
+of them happens. Separately, "在用电池" was true but carried no deadline. The same
+line fires on an evening at 90%, so it reads as background noise.
+
+**Defense**: the night job gets `RunAtLoad` plus a catch-up trigger every 30 minutes
+from 23:45 to 06:15. The launcher gates it with `ONLY_BETWEEN=23:00-07:00`: outside the
+window, or when the listener is already running, it opens no window. `watchdog.sh power`
+runs at 20:30, 21:30 and 22:30, reporting battery % and the time it will run out at the
+current drain. It leads with ⛔ when that time is before 23:11 or before 07:00.
+`alive` runs hourly.
+
+**General form**: for a scheduled job, write down what happens to a trigger missed
+while asleep, while powered off, and after the process died. Those are three different
+mechanisms. An alert that is true but doesn't say how much time is left gets read as
+noise.
+
 ## PR#25 side-effect audit (2026-10-15): what else #70/#71 and the same-batch fixes touch
 
 Each change below was checked against full history (5,591 raw messages, the positions
@@ -3293,6 +3323,7 @@ downside is priced in dollars.
 | 69 | 「一直到 X 为止」加了长度上限，就多了一道看不见的边界 | `test_overnight_1006.py::test_long_holding_list_keeps_every_listed_ticker`（PR#24 review：第三个持有标的离冒号 40 字以外）|
 | 70 | 拒绝误解析的防护，会让误解析看起来像策略 | `test_overnight_1008_1012.py::test_leading_dot_stop_parses_in_both_languages`、`::test_leading_dot_stop_is_recorded_on_open`（契约翻转，当晚原文）。**反向**：`::test_stops_with_a_leading_digit_are_unchanged`。**PR#25 review 补充**：`::test_breakeven_stop_before_the_word_stop_is_breakeven`、`::test_zh_stop_price_does_not_cross_a_comma`（10/19 AMZN 目标价被读成止损）；行权价单独更正：`::test_bare_strike_after_an_executed_open_alerts_once`、`::test_bare_strike_correction_shapes_and_limits` |
 | 71 | 开仓时分的桶，回答不了"按什么分的桶"的问题 | `test_overnight_1008_1012.py::test_weeklies_close_sells_only_this_weeks_round`（契约翻转，当晚两张 PLTR）、`::test_pct_sl_advice_is_not_the_close_pct`、`::test_week_qualifier_is_read_right_after_the_ticker`、`::test_week_scope_splits_on_this_friday`。**反向**：`::test_real_trim_pcts_are_unchanged`。同批：`::test_spx_0dte_after_cutoff_is_not_ordered`（EOD 时窗内不开当日到期；反向 `::test_spx_0dte_before_cutoff_still_orders`）、`::test_strike_only_resend_alerts_about_the_first_order` / `::test_strike_correction_needs_same_price_expiry_and_a_short_gap`（同价同到期只改行权价 = 更正，只告警）|
+| 72 | 定时任务只管"到点"，关机错过的那一晚没人管；告警要说还剩多久 | `test_overnight_1016_1022.py::test_battery_that_dies_before_start_says_so`、`::test_battery_that_dies_mid_session_says_so`、`::test_battery_that_lasts_the_night_is_a_plain_warning`、`::test_battery_without_estimate_still_reports_percent`、`::test_ac_power_sends_nothing`、`::test_launcher_outside_window_opens_nothing`、`::test_launcher_inside_window_reaches_the_running_guard`。launchd 开机 / 补放的行为测不了。**验证方法**：`logs/ops.log` 里出现 23:11–23:25 以外时刻的 `night_run: starting`，且同晚只有一个 listener |
 | 回补幂等（跨进程） | 重启后 `_seen` 清零，靠 `raw_signals` 水位线 | `test_overnight_0728.py::test_backfill_skips_messages_already_processed_last_run`、`::test_backfill_keeps_anchor_when_fetch_fails`、`::test_backfill_consumes_anchor_on_success`、`::test_backfill_keeps_anchor_moved_by_a_second_sleep` |
 | OPEN 年龄闸门 | 陈旧重放不下单、且不污染指纹表 | `test_overnight_0728.py::test_stale_open_signal_alerts_instead_of_ordering`、`::test_stale_open_does_not_mute_live_resend`、`::test_stale_open_bilingual_twins_alert_once`、`::test_fresh_open_signal_still_orders`、`::test_no_created_at_treated_as_realtime` |
 | 中文 Bug A | 下单失败仍写 risk DB | close 侧：`test_listener_close.py::test_broker_reject_does_not_report_no_matching`；open 侧防御是 open_flow 的早 return 语句顺序（record_order 只在 success 后），由 `test_folded_full_flow.py` 全链路间接覆盖 |

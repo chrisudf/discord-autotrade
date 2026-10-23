@@ -22,6 +22,18 @@ shift
 # 守卫前移到这一层：pgrep 不碰 TCC 保护目录，launchd 直接跑得了，命中就连
 # Terminal 都不开。**night_run.sh 里那道守卫要保留** —— 手动启动不经过本文件。
 # 模式由调用方经 env 给（night.plist 的 EnvironmentVariables），本文件不写死。
+#
+# [10/16] night 任务现在开机就跑（RunAtLoad）、整夜每半小时补一次。白天开机、或 07:00
+# 收工后才唤醒时补放的那一次不许真开窗口 —— 窗口由调用方经 env 给（如 23:00-07:00，可跨午夜）。
+if [[ -n "${ONLY_BETWEEN:-}" ]]; then
+  _hhmm() { local t=${1/:/}; echo $((10#$t)); }
+  now=$(_hhmm "$(date +%H:%M)") from=$(_hhmm "${ONLY_BETWEEN%-*}") to=$(_hhmm "${ONLY_BETWEEN#*-}")
+  if (( from <= to ? (now < from || now >= to) : (now < from && now >= to) )); then
+    echo "$(date '+%F %T') launch_in_terminal: 不在 $ONLY_BETWEEN 窗口内，不开窗口"
+    exit 0
+  fi
+fi
+
 if [[ -n "${SKIP_IF_RUNNING:-}" ]] && pgrep -f "$SKIP_IF_RUNNING" > /dev/null; then
   echo "$(date '+%F %T') launch_in_terminal: 已有进程匹配 /$SKIP_IF_RUNNING/，不开窗口"
   exit 0

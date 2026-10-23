@@ -5,7 +5,13 @@ launchd 用本机时区。作者机器是 Australia/Brisbane（UTC+10，无夏�
 换到别的时区要重新想这两个点位，改 `install.sh` 里 `emit_plist` 的时分参数。
 
 夜间有 **4 个触发点**（23:11 / 23:15 / 23:20 / 23:25）—— 这是 lesson #28 的唤醒
-窗口冗余，不是重复配置，别删。去重是**三层**，各管各的：
+窗口冗余，不是重复配置，别删。[10/16] 之后又加了 `RunAtLoad`（开机/登录就跑）和
+23:45–06:15 每半小时一次的**补启动**：关机错过的触发点 launchd 不补，listener 中途死掉也没人拉。
+补启动只在 env `ONLY_BETWEEN=23:00-07:00` 窗口内生效（垫片里判断），窗口外直接退出不开窗口 ——
+所以想在 23:00 前手动起，用 `make run` 或 `zsh ops/night_run.sh`，别用 `launchctl kickstart`。
+副作用：盘中**故意**停掉 listener，半小时内会被拉起来；要停整晚就 `launchctl bootout gui/$(id -u)/com.chengqiu.autotrade.night`。
+
+去重是**三层**，各管各的：
 
 | 层 | 位置 | 管什么 | 管不了什么 |
 |---|---|---|---|
@@ -22,10 +28,11 @@ launchd 用本机时区。作者机器是 Australia/Brisbane（UTC+10，无夏�
 
 | 时间 | 谁 | 做什么 |
 |---|---|---|
-| 22:30 | launchd → `watchdog.sh power` | 用电池或合着盖就 TG 叫人去插电（9/23、9/24 两晚晚启动都在电池上）|
+| 20:30 / 21:30 / 22:30 | launchd → `watchdog.sh power` | 用电池或合着盖就 TG 叫人去插电，带电量和按当前耗电几点没电；撑不到 23:11 或 07:00 的标 ⛔（9/23、9/24 晚启动；10/16、10/22 没电关机）|
 | 23:05 | launchd → `caffeinate -imsu -t 2400` | 拿住 sleep assertion 撑到 23:45，把机器顶在 FullWake，别让它在触发点之间睡回去 |
 | 23:11 | launchd → `night_run.sh` | 开新 Terminal 窗口跑 `caffeinate -i make run`，输出 tee 到 `logs/session_YYYY-MM-DD_HHMM.log`（按启动时刻，避免跨午夜撞名）|
-| 23:28 | launchd → `watchdog.sh alive` | listener 进程不在就 TG（9/23 夜四个触发点都"成功"，进程却没起来）|
+| 23:28 起每小时 | launchd → `watchdog.sh alive` | listener 进程不在就 TG（9/23 夜四个触发点都"成功"，进程却没起来）|
+| 23:45 起每半小时 | launchd → `night_run.sh`（补启动）| listener 不在就再拉一次；在跑就连窗口都不开 |
 | 07:00 | launchd → `morning_collect.sh` | SIGTERM 停 listener → 整晚日志存到桌面 → 从 `trades.db` 抽摘要（含 `ops/pnl.py` 生成的已实现盈亏一节）|
 
 **早上只取证，不自动复盘**（2026-08-17 起）：`morning_collect.sh` 全是纯 shell，
