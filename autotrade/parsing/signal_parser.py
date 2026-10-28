@@ -518,18 +518,23 @@ def _try_pattern_a(text: str, today: date):
         r"\b([A-Z]{1,5})\s+"
         r"(\d+(?:\.\d+)?)([cp])\s+"
         r"(\d{1,2})/(\d{1,2})"
-        r"(?:[^@\n]*?@\s*\$?(\d+(?:\.\d+)?))?",
+        # [10/27] KC 也写 "at 2.92"（SPY 770c 10/30 … here at 2.92、GLW 200c
+        # 11/20 small swing at 4.60），只认 @ 时整条落空
+        r"(?:[^@\n]*?(@|\bat\b)\s*\$?(\d+(?:\.\d+)?))?",
         re.IGNORECASE,
     )
 
     for m in pattern.finditer(text):
-        symbol, strike, cp, mm, dd, price = m.groups()
+        symbol, strike, cp, mm, dd, marker, price = m.groups()
 
         # 同 A2：小写单词不是 ticker（"but 300p 7/17" 案例，7/8）
         if not symbol.isupper():
             continue
         if symbol.upper() in {"I", "A", "THE", "AT", "ON", "IS", "DTE", "IPO"}:
             continue
+        # "stop at 2.50" / "target at 6" 不是入场价；@ 分支行为不变
+        if marker and marker.lower() == "at" and _price_qualified(text, m.start(7), m.start()):
+            price = None
 
         if price is None:
             filled = re.search(r"filled?\s*@\s*\$?(\d+(?:\.\d+)?)", text, re.I)
@@ -560,16 +565,18 @@ def _try_pattern_a(text: str, today: date):
         r"\b([A-Z]{1,5})\s+"
         r"(\d+(?:\.\d+)?)([cp])\s+"
         r"(\d+)\s*DTE\b"
-        r"(?:[^@\n]*?@\s*\$?(\d+(?:\.\d+)?))?",
+        r"(?:[^@\n]*?(@|\bat\b)\s*\$?(\d+(?:\.\d+)?))?",  # 同 A1：at 也算喊价
         re.IGNORECASE,
     )
     for m in pattern_a3.finditer(text):
-        symbol, strike, cp, dte, price = m.groups()
+        symbol, strike, cp, dte, marker, price = m.groups()
         # 同 A1/A2：小写单词不是 ticker（"but 300p ..." 案例）
         if not symbol.isupper():
             continue
         if symbol.upper() in {"I", "A", "THE", "AT", "ON", "IS", "DTE", "IPO"}:
             continue
+        if marker and marker.lower() == "at" and _price_qualified(text, m.start(6), m.start()):
+            price = None
         if price is None:
             filled = re.search(r"filled?\s*@\s*\$?(\d+(?:\.\d+)?)", text, re.I)
             if filled:
